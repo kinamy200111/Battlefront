@@ -495,7 +495,7 @@ local function split_allies(s)
     return out
 end
 
-local ALLY_PREFIX = {"villanarc", "blaster tank", "cam turret", "attacker drone", "missile rocket", "[ ai ]", "camera"}
+local ALLY_PREFIX = {"villanarc", "blaster tank", "cam turret", "attacker drone", "missile rocket", "[ ai ]", "camera", "skibidifriend:"}
 
 local function ignored_name(n, ign)
     local low = n:lower()
