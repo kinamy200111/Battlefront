@@ -1,0 +1,708 @@
+-- ============================================================
+-- Blockade FARM: авто-твин к врагам + орбита вокруг них
+-- UI: INS-ui (тест новой библиотеки)
+-- Auto vote / auto ready: заглушки, реализуем позже
+-- ============================================================
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local lp = Players.LocalPlayer
+local ws = workspace
+local rs = game:GetService("ReplicatedStorage")
+
+_G.__BC_FARM_EPOCH = (_G.__BC_FARM_EPOCH or 0) + 1
+local myEpoch = _G.__BC_FARM_EPOCH
+local function alive() return myEpoch == _G.__BC_FARM_EPOCH end
+
+if _G.blockade_farm_reg then
+    local reg = _G.blockade_farm_reg
+    if reg.stop then pcall(reg.stop) end
+    _G.blockade_farm_reg = nil
+end
+
+-- INS-ui грузим один раз (Matcha не отдаёт return у chunk, читаем глобал INSui)
+if not INSui then
+    local ok, err = pcall(function()
+        loadstring(game:HttpGet("https://raw.githubusercontent.com/neaxusxgod-png/INS-ui/main/uilib.min.lua", true))()
+    end)
+    if not ok then print("[farm] INS-ui load error: " .. tostring(err)) end
+end
+local Lib = INSui
+if not Lib then
+    print("[farm] INS-ui not found")
+    return
+end
+
+-- ============================================================
+-- состояние
+-- ============================================================
+local MODES = {"Normal", "Hard", "VeryHard", "Insane", "Nightmare", "ThunderStorm", "Zombie", "Christmas", "Hell", "DarkDimension", "Astro", "AstroV2", "ZombieV2", "BossRush", "NoLightInTheSky", "Custom", "100MVisit"}
+
+local st = {
+    on = false,
+    tween = true,
+    orbit = true,
+    speed = 600,
+    radius = 10,
+    orbitDeg = 90,
+    mode = "Nearest",
+    priority = "G-Toilet 3.0",
+    vote = false,
+    voteMode = "ZombieV2",
+    ready = false,
+    readyMethod = "Both",
+    skills = false,
+    skillKeys = "M1,E,F",
+    skillKeysOrbitOnly = false,
+    waveSkillKeys = "Z",
+    skillDelay = 0.3,
+    waveList = "2,9,17,26,29,30,31",
+    idleOn = true,
+    idleVec = nil,
+}
+
+local currentTarget = nil
+local currentIsPrio = false
+local currentIsCargo = false
+local zoneGoal = nil
+local isOrbiting = false
+local angle = 0
+local angleInit = false
+local lastHrp = nil
+local lastNamesT = 0
+local lastScanT = 0
+local mobs = {}
+
+-- движение вручную: TweenInfo в Matcha нет, TweenService не работает
+-- лицо всегда к мобу, поворот только по горизонтали (yaw, без завала)
+local function yawTo(pos, at)
+    return math.atan2(-(at.X - pos.X), -(at.Z - pos.Z))
+end
+
+local function setPosFacing(hrp, pos, facePos)
+    hrp.CFrame = CFrame.new(pos.X, pos.Y, pos.Z) * CFrame.Angles(0, yawTo(pos, facePos), 0)
+end
+
+local function moveToward(hrp, goal, facePos, dt)
+    local dist = (goal - hrp.Position).Magnitude
+    if dist <= 0.75 then
+        if (goal - facePos).Magnitude > 1 then
+            setPosFacing(hrp, goal, facePos)
+        else
+            local yaw = math.atan2(-hrp.CFrame.LookVector.X, -hrp.CFrame.LookVector.Z)
+            hrp.CFrame = CFrame.new(goal.X, goal.Y, goal.Z) * CFrame.Angles(0, yaw, 0)
+        end
+        return true
+    end
+    local step = st.speed * dt
+    local newPos
+    if step >= dist then
+        newPos = goal
+    else
+        newPos = hrp.Position + (goal - hrp.Position).Unit * step
+    end
+    setPosFacing(hrp, newPos, facePos)
+    return newPos == goal
+end
+
+-- ============================================================
+-- сканер врагов (как в main: workspace.Living, не игроки, не аи-союзники)
+-- ============================================================
+local ALLY_PREFIX = {"villanarc", "blaster tank", "cam turret", "attacker drone", "missile rocket", "[ ai ]", "[ai", "camera", "skibidifriend", "speaker pulse tank"}
+local playerNames = {}
+
+local function refreshPlayerNames()
+    local out = {}
+    local ok, pls = pcall(function() return Players:GetPlayers() end)
+    if ok then
+        for _, p in ipairs(pls) do
+            local ok2, nm = pcall(function() return p.Name end)
+            if ok2 and nm then out[nm] = true end
+        end
+    end
+    out[lp.Name] = true
+    playerNames = out
+end
+
+local function isPlayer(m)
+    -- только по имени: враги-туалеты носят headphone/Shirt и т.п., маркеры дают ложные срабатывания
+    return playerNames[m.Name] == true
+end
+
+local function isAllyName(n)
+    local low = n:lower()
+    for i = 1, #ALLY_PREFIX do
+        if low:find(ALLY_PREFIX[i], 1, true) then return true end
+    end
+    return false
+end
+
+local function dumpLiving()
+    local living = ws:FindFirstChild("Living")
+    if not living then
+        print("[dbg] Living not found")
+        return
+    end
+    local ok, children = pcall(function() return living:GetChildren() end)
+    if not ok then
+        print("[dbg] cannot read Living")
+        return
+    end
+    local count = 0
+    for _, v in ipairs(children) do
+        if v.ClassName == "Model" then
+            count = count + 1
+            local hum = v:FindFirstChildOfClass("Humanoid")
+            local hp, mx = 0, 1
+            local healthVal = "none"
+            if hum then
+                pcall(function() hp = hum.Health or 0 end)
+                pcall(function() mx = hum.MaxHealth or 1 end)
+                healthVal = "hum " .. math.floor(hp) .. "/" .. math.floor(mx)
+            else
+                for _, c in ipairs(v:GetChildren()) do
+                    if c.ClassName == "NumberValue" then
+                        local cn = c.Name:lower()
+                        if cn:find("health", 1, true) or cn:find("hp", 1, true) then
+                            healthVal = "nv " .. tostring(c.Value)
+                        end
+                    end
+                end
+            end
+            local root = v:FindFirstChild("HumanoidRootPart") or v:FindFirstChild("RootPart") or v:FindFirstChildWhichIsA("BasePart")
+            local fake = v:FindFirstChild("Fake Head")
+            local markers = {}
+            for _, mk in ipairs({"Shirt", "M1Script", "PassiveHealth", "Skin-Name", "Grade", "headphone", "SoundImprovement", "GoodAI"}) do
+                if v:FindFirstChild(mk) then markers[#markers + 1] = mk end
+            end
+            print(string.format("[dbg] %q cls=%s health=%s root=%s fakeHead=%s player=%s ally=%s markers=[%s]",
+                v.Name, v.ClassName, healthVal,
+                tostring(root ~= nil), tostring(fake ~= nil),
+                tostring(isPlayer(v)), tostring(isAllyName(v.Name)),
+                table.concat(markers, ",")))
+        else
+            print(string.format("[dbg] non-model in Living: %s (%s)", v.Name, v.ClassName))
+        end
+    end
+    print("[dbg] Living total children: " .. #children .. ", models: " .. count)
+end
+
+local function scanMobs(hrp)
+    local living = ws:FindFirstChild("Living")
+    if not living then return {} end
+    local out = {}
+    local ok, children = pcall(function() return living:GetChildren() end)
+    if not ok then return {} end
+    for _, v in ipairs(children) do
+        if v.ClassName == "Model" and not isPlayer(v) and not v:FindFirstChild("GoodAI") and not isAllyName(v.Name) then
+            local hum = v:FindFirstChildOfClass("Humanoid")
+            local mhrp = v:FindFirstChild("HumanoidRootPart") or v:FindFirstChild("RootPart") or v:FindFirstChildWhichIsA("BasePart")
+            local hp, mx = 0, 1
+            local healthSeen = false
+            if hum then
+                healthSeen = true
+                pcall(function() hp = hum.Health or 0 end)
+                pcall(function() mx = hum.MaxHealth or 1 end)
+            else
+                for _, c in ipairs(v:GetChildren()) do
+                    if c.ClassName == "NumberValue" then
+                        local cn = c.Name:lower()
+                        if cn:find("health", 1, true) or cn:find("hp", 1, true) then
+                            pcall(function() hp = c.Value or 0 end)
+                            mx = hp
+                            healthSeen = true
+                        end
+                    end
+                end
+            end
+            local noHealthEnemy = not healthSeen and (v.Name:lower():find("toilet", 1, true) ~= nil or v:FindFirstChild("Fake Head") ~= nil)
+            if mhrp and (healthSeen and hp > 0 or noHealthEnemy) then
+                    out[#out + 1] = {
+                        mob = v,
+                        name = v.Name,
+                        root = mhrp,
+                        fake = v:FindFirstChild("Fake Head"),
+                        pos = mhrp.Position,
+                        hp = hp,
+                        mx = mx,
+                        dist = (mhrp.Position - hrp.Position).Magnitude,
+                    }
+                end
+        end
+    end
+    return out
+end
+
+local function splitList(s)
+    local out = {}
+    for part in (s or ""):gmatch("[^,]+") do
+        local p = part:gsub("^%s+", ""):gsub("%s+$", "")
+        if p ~= "" then out[#out + 1] = p:lower() end
+    end
+    return out
+end
+
+local function parseVec3(s)
+    local x, y, z = (s or ""):match("([%-%d%.]+)%s*[ ,;]+([%-%d%.]+)%s*[ ,;]+([%-%d%.]+)")
+    if x and y and z then
+        return Vector3.new(tonumber(x), tonumber(y), tonumber(z))
+    end
+    return nil
+end
+
+local function waveInList(wave)
+    for _, p in ipairs(splitList(st.waveList)) do
+        if tonumber(p) == wave then return true end
+    end
+    return false
+end
+
+st.idleVec = parseVec3("-22.430267333984375 3.0063483715057373 -3.2639551162719727")
+
+local function isPriorityName(name)
+    local prio = splitList(st.priority)
+    if #prio == 0 then return false end
+    local low = name:lower()
+    for i = 1, #prio do
+        if low:find(prio[i], 1, true) then return true end
+    end
+    return false
+end
+
+local function pickTarget(list)
+    if #list == 0 then return nil end
+    local prio = splitList(st.priority)
+    if #prio > 0 then
+        local best = nil
+        for _, m in ipairs(list) do
+            local low = m.name:lower()
+            for i = 1, #prio do
+                if low:find(prio[i], 1, true) then
+                    if not best or m.dist < best.dist then best = m end
+                    break
+                end
+            end
+        end
+        if best then return best end
+    end
+    local best = nil
+    local mode = st.mode
+    for _, m in ipairs(list) do
+        local better
+        if mode == "Nearest" then
+            better = not best or m.dist < best.dist
+        elseif mode == "Lowest HP" then
+            better = not best or (m.hp / m.mx) < (best.hp / best.mx)
+        else
+            better = not best or (m.hp / m.mx) > (best.hp / best.mx)
+        end
+        if better then best = m end
+    end
+    return best
+end
+
+-- ============================================================
+-- UI (INS-ui)
+-- ============================================================
+local win = Lib:CreateWindow({
+    title = "Blockade Farm",
+    subtitle = "v0.1",
+    size = Vector2.new(620, 540),
+    menuKey = "p",
+    configName = "blockade_farm",
+    accent = Color3.fromRGB(122, 134, 255),
+    autoSave = true,
+})
+
+local tab = win:Tab("Farm", "swords")
+local ctl = tab:Section("Control", "Left")
+
+local enabled = ctl:Toggle("Enabled", false, function(on)
+    st.on = on
+    if on then
+        Lib:Notify("Farm", "started", 2, "success")
+    else
+        Lib:Notify("Farm", "stopped", 2)
+    end
+end):AddKeybind("x", "Toggle")
+
+ctl:Toggle("Tween to enemy", true, function(v) st.tween = v end)
+ctl:Toggle("Orbit around enemy", true, function(v)
+    st.orbit = v
+    if v then angleInit = false end
+end)
+ctl:Slider("Tween speed", 600, 25, 100, 4000, "", function(v) st.speed = v end)
+ctl:Slider("Orbit radius", 10, 1, 3, 40, " st", function(v) st.radius = v end)
+ctl:Slider("Orbit speed", 90, 10, 10, 360, "deg/s", function(v) st.orbitDeg = v end)
+ctl:Dropdown("Target", {"Nearest"}, {"Nearest", "Lowest HP", "Highest HP"}, false, function(v)
+    st.mode = v[1]
+end)
+ctl:Textbox("Priority targets", "G-Toilet 3.0", function(v) st.priority = v end)
+ctl:Toggle("Go to idle pos", true, function(v) st.idleOn = v end)
+ctl:Textbox("Idle position", "-22.430267333984375 3.0063483715057373 -3.2639551162719727", function(v)
+    st.idleVec = parseVec3(v)
+end)
+ctl:Button("Jump to target", function()
+    local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+    local t = currentTarget
+    if hrp and t then
+        hrp.CFrame = setPosFacing(hrp, t.pos + Vector3.new(0, 3, 0), t.pos)
+        Lib:Notify("Farm", "Jumped to " .. t.name, 2, "success")
+    else
+        Lib:Notify("Farm", "no target", 2, "warning")
+    end
+end)
+ctl:Button("Debug dump Living", function()
+    dumpLiving()
+end)
+
+local status = ctl:Label(function()
+    if not st.on then return "status: off" end
+    local t = currentTarget
+    if not t then return "status: scanning..." end
+    if currentIsPrio then return string.format("status: [PRIO] %s (%.0f st)", t.name, t.dist) end
+    return string.format("status: %s (%.0f st)", t.name, t.dist)
+end)
+ctl:Info("Tween подводит к врагу, Orbit кружит вокруг него. Меню: P (можно сменить в Settings). Keybind тумблера: X.")
+
+local sk = tab:Section("Auto Skills", "Right")
+sk:Toggle("Auto skills", false, function(v) st.skills = v end)
+sk:Textbox("Constant skills", "M1,E,F", function(v) st.skillKeys = v end)
+sk:Toggle("Constant only during orbit", false, function(v) st.skillKeysOrbitOnly = v end)
+sk:Textbox("Wave skills", "Z", function(v) st.waveSkillKeys = v end)
+sk:Textbox("Wave list", "2,9,17,26,29,30,31", function(v) st.waveList = v end)
+sk:Slider("Spam interval", 0.3, 0.05, 0.05, 2, "s", function(v) st.skillDelay = v end)
+sk:Info("Constant — спам всегда (или только на орбите); Wave — дополнительно на волнах из списка. M1 = левый клик")
+
+local lob = win:Tab("Lobby", "users")
+local lobSec = lob:Section("Auto Lobby", "Left")
+lobSec:Toggle("Auto vote", false, function(v) st.vote = v end)
+lobSec:Dropdown("Vote mode", {"ZombieV2"}, MODES, false, function(v)
+    st.voteMode = v[1]
+end)
+lobSec:Toggle("Auto ready", false, function(v) st.ready = v end)
+lobSec:Dropdown("Ready method", {"Both"}, {"Both", "Zone (TP)", "GUI (button)"}, false, function(v)
+    st.readyMethod = v[1]
+end)
+lobSec:Info("Работает в лобби (волна 0): голосует за режим и жмёт Ready — телепорт в зону и/или клик по кнопке")
+
+win:AddSettingsTab("cog")
+
+-- ============================================================
+-- лобби: авто-голосование + авто-готовность
+-- ============================================================
+local function pressComma()
+    keypress(44)
+    task.wait(0.05)
+    keyrelease(44)
+end
+
+local function readReadyButton(cg)
+    local fr = cg:FindFirstChild("Frame-Ready")
+    local menu = fr and fr:FindFirstChild("Menu")
+    local rdy = menu and menu:FindFirstChild("Ready")
+    local btn = rdy and rdy:FindFirstChild("Button")
+    local text = "?"
+    if btn then
+        local lab = btn:FindFirstChildOfClass("TextLabel")
+        if lab then
+            pcall(function() text = lab.Text end)
+        end
+    end
+    local vis = false
+    local sx, sy = 0, 0
+    if btn then
+        local okS, sX, sY = pcall(function()
+            local s = btn.AbsoluteSize
+            return s.X, s.Y
+        end)
+        vis = okS and sX > 0 and sY > 0
+        sx, sy = sX or 0, sY or 0
+    end
+    return btn, text, vis, sx, sy
+end
+
+task.spawn(function()
+    local lastVote = 0
+    local lastReady = 0
+    local votedLobby = false
+    local lastErr = 0
+    while alive() do
+        task.wait(0.4)
+        if st.on then
+        local now = tick()
+        local ok, err = pcall(function()
+            local votingNow = ws.Voteing and ws.Voteing.Value == true
+            local wave = ws.Wave and ws.Wave.Value or 0
+
+            -- голосование
+            if st.vote and votingNow and (not votedLobby or now - lastVote > 30) then
+                lastVote = now
+                votedLobby = true
+                pcall(function() rs.Vote:FireServer(st.voteMode) end)
+                Lib:Notify("Farm", "voted " .. st.voteMode, 2, "success")
+                print("[farm] voted " .. st.voteMode)
+            end
+            if wave > 0 then votedLobby = false end
+
+            -- готовность
+            if st.ready and (votingNow or wave == 0) and now - lastReady > 1.5 then
+                local method = st.readyMethod
+                if method ~= "GUI (button)" then
+                    local ar2 = ws:FindFirstChild("AutoReady")
+                    local char = lp.Character
+                    local root = char and char:FindFirstChild("HumanoidRootPart")
+                    if ar2 and root then
+                        local d2 = (ar2.Position - root.Position).Magnitude
+                        if d2 > 8 then
+                            zoneGoal = ar2.Position + Vector3.new(0, 3, 0)
+                            print("[farm] zone move (dist " .. math.floor(d2) .. ")")
+                        end
+                    end
+                end
+
+                if method ~= "Zone (TP)" then
+                    local cg = lp.PlayerGui and lp.PlayerGui:FindFirstChild("ChrGUI")
+                    if cg then
+                        local btn, btnText, vis, sx, sy = readReadyButton(cg)
+                        if btnText ~= "READY" then
+                            if not vis then
+                                pressComma()
+                                task.wait(0.8)
+                                btn, btnText, vis, sx, sy = readReadyButton(cg)
+                            end
+                            local slot = nil
+                            for i = 1, 3 do
+                                local bv = cg:FindFirstChild("GetReady" .. i)
+                                if bv then
+                                    pcall(function() if bv.Value == true then slot = tostring(i) end end)
+                                end
+                            end
+                            if not slot then slot = "3" end
+                            pcall(function() rs.GetReadyRemote:FireServer(slot, true) end)
+                            for i = 1, 3 do
+                                local bv = cg:FindFirstChild("GetReady" .. i)
+                                if bv then
+                                    pcall(function() bv.Value = true end)
+                                end
+                            end
+                            if vis and btn and sx > 0 and sy > 0 then
+                                local posOk, px, py = pcall(function()
+                                    local p = btn.AbsolutePosition
+                                    return p.X, p.Y
+                                end)
+                                if posOk then
+                                    mousemoveabs(px + sx / 2, py + sy / 2)
+                                    task.wait(0.1)
+                                    mouse1click()
+                                    task.wait(0.4)
+                                    print("[farm] ready clicked")
+                                end
+                            end
+                            pressComma()
+                            print("[farm] ready sent (slot " .. slot .. ")")
+                            Lib:Notify("Farm", "ready (slot " .. slot .. ")", 2, "success")
+                        else
+                            if vis then pressComma() end
+                        end
+                    end
+                end
+                lastReady = now
+            end
+        end)
+        if not ok and now - lastErr > 5 then
+            lastErr = now
+            print("[farm-lobby] " .. tostring(err))
+        end
+        end
+    end
+end)
+
+-- ============================================================
+-- авто-скиллы: постоянные + только на волнах из списка
+-- ============================================================
+local function pressKeys(list)
+    for _, k in ipairs(splitList(list)) do
+        local kk = k:lower()
+        if kk == "m1" or kk == "lmb" then
+            mouse1click()
+        else
+            local u = k:upper()
+            local vk = #u == 1 and u:byte() or nil
+            if vk then
+                keypress(vk)
+                task.wait(0.03)
+                keyrelease(vk)
+            end
+        end
+        task.wait(0.03)
+    end
+end
+
+task.spawn(function()
+    local lastErrS = 0
+    while alive() do
+        task.wait(st.skillDelay)
+        if st.on and st.skills then
+            local now = tick()
+            local ok, err = pcall(function()
+                if not st.skillKeysOrbitOnly or isOrbiting then
+                    pressKeys(st.skillKeys)
+                end
+                local wave = ws.Wave and ws.Wave.Value or 0
+                if waveInList(wave) then
+                    pressKeys(st.waveSkillKeys)
+                end
+            end)
+            if not ok and now - lastErrS > 5 then
+                lastErrS = now
+                print("[farm-skills] " .. tostring(err))
+            end
+        end
+    end
+end)
+
+-- ============================================================
+-- главный цикл: твин + орбита
+-- ============================================================
+local lastErrT = 0
+RunService.Heartbeat:Connect(function(dt)
+    if not alive() then return end
+    if not st.on then return end
+
+    local ok, err = pcall(function()
+        local char = lp.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if not hrp then return end
+        if hrp ~= lastHrp then
+            lastHrp = hrp
+            angleInit = false
+        end
+
+        local now = tick()
+        if now - lastNamesT >= 0.5 then
+            lastNamesT = now
+            refreshPlayerNames()
+        end
+        if now - lastScanT >= 0.25 then
+            lastScanT = now
+            mobs = scanMobs(hrp)
+        end
+
+        local target = pickTarget(mobs)
+        if not target then
+            currentTarget = nil
+            isOrbiting = false
+            if zoneGoal then
+                if moveToward(hrp, zoneGoal, zoneGoal, dt) then zoneGoal = nil end
+            elseif st.idleOn and st.idleVec and (ws.Wave and ws.Wave.Value or 0) > 0 then
+                moveToward(hrp, st.idleVec, st.idleVec, dt)
+            end
+            return
+        end
+        if not currentTarget or currentTarget.mob ~= target.mob then
+            currentTarget = target
+            currentIsPrio = isPriorityName(target.name)
+            currentIsCargo = target.name:lower():find("cargo cleaner", 1, true) ~= nil
+            angleInit = false
+            Lib:Notify("Farm", "target: " .. target.name, 2)
+        end
+
+        -- живая позиция цели каждый кадр: HumanoidRootPart
+        local tpos
+        pcall(function()
+            tpos = target.root.Position
+        end)
+        if not tpos then tpos = target.pos end
+        target.pos = tpos
+        local ppos = hrp.Position
+        local flatT = Vector3.new(tpos.X, ppos.Y, tpos.Z)
+        local dist = (flatT - ppos).Magnitude
+
+        if currentIsCargo and target.fake and target.fake.Parent then
+            -- Cargo Cleaner: подъём до высоты FakeHead, потом орбита вокруг неё (центр убивает)
+            local fpos = target.fake.Position
+            local flatH = Vector3.new(fpos.X, ppos.Y, fpos.Z)
+            local fDist = (flatH - ppos).Magnitude
+            if fDist > st.radius + 3 then
+                isOrbiting = false
+                if math.abs(ppos.Y - fpos.Y) > 2 then
+                    -- фаза 1: вертикальный подъём на высоту головы
+                    moveToward(hrp, Vector3.new(ppos.X, fpos.Y, ppos.Z), fpos, dt)
+                else
+                    -- фаза 2: подход к кольцу вокруг головы
+                    local dir = (ppos - flatH).Unit
+                    local goal = flatH + dir * st.radius
+                    moveToward(hrp, Vector3.new(goal.X, fpos.Y, goal.Z), fpos, dt)
+                end
+            else
+                -- фаза 3: орбита вокруг FakeHead
+                isOrbiting = true
+                if not angleInit then
+                    local off = ppos - fpos
+                    angle = math.atan2(off.Z, off.X)
+                    angleInit = true
+                end
+                angle = angle + math.rad(st.orbitDeg) * dt
+                local orb = fpos + Vector3.new(math.cos(angle) * st.radius, 0, math.sin(angle) * st.radius)
+                orb = Vector3.new(orb.X, fpos.Y, orb.Z)
+                setPosFacing(hrp, orb, fpos)
+            end
+        elseif st.orbit then
+            if dist > st.radius + 3 then
+                -- подход к кольцу (летим к центру цели)
+                isOrbiting = false
+                local dir = (ppos - flatT).Unit
+                local goal = flatT + dir * st.radius
+                goal = Vector3.new(goal.X, tpos.Y, goal.Z)
+                if st.tween then
+                    moveToward(hrp, goal, tpos, dt)
+                else
+                    setPosFacing(hrp, goal, tpos)
+                end
+            else
+                -- орбита
+                isOrbiting = true
+                if not angleInit then
+                    local off = ppos - tpos
+                    angle = math.atan2(off.Z, off.X)
+                    angleInit = true
+                end
+                angle = angle + math.rad(st.orbitDeg) * dt
+                local orb = tpos + Vector3.new(math.cos(angle) * st.radius, 0, math.sin(angle) * st.radius)
+                orb = Vector3.new(orb.X, tpos.Y, orb.Z)
+                setPosFacing(hrp, orb, tpos)
+            end
+        elseif st.tween and dist > 6 then
+            -- без орбиты: летим в центр цели
+            isOrbiting = false
+            moveToward(hrp, tpos, tpos, dt)
+        else
+            isOrbiting = false
+        end
+    end)
+
+    if not ok then
+        local now = tick()
+        if now - lastErrT > 5 then
+            lastErrT = now
+            print("[farm] " .. tostring(err))
+        end
+    end
+end)
+
+-- ============================================================
+-- STOP / REG
+-- ============================================================
+local function farmStop()
+    if win then
+        pcall(function() win:Destroy() end)
+        win = nil
+    end
+end
+
+_G.blockade_farm_reg = {
+    stop = farmStop,
+}
+
+print("[farm] v0.1 loaded (INS-ui)")
