@@ -270,6 +270,7 @@ local win = Lib:CreateWindow({
     size = Vector2.new(620, 540),
     menuKey = "del",
     configName = "blockade_farm",
+    icon = "https://raw.githubusercontent.com/kinamy200111/Battlefront/main/STBB-AutoFarmICON.png",
     accent = Color3.fromRGB(122, 134, 255),
     autoSave = true,
     backgroundEffect = "Snow",
