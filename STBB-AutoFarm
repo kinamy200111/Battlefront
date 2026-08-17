@@ -1,6 +1,6 @@
 -- ============================================================
 -- Blockade FARM: авто-твин к врагам + орбита вокруг них
--- UI: INS-ui (тест новой библиотеки)
+-- UI: NonUI
 -- Auto vote / auto ready: заглушки, реализуем позже
 -- ============================================================
 
@@ -20,16 +20,25 @@ if _G.blockade_farm_reg then
     _G.blockade_farm_reg = nil
 end
 
--- INS-ui грузим один раз (Matcha не отдаёт return у chunk, читаем глобал INSui)
-if not INSui then
-    local ok, err = pcall(function()
-        loadstring(game:HttpGet("https://raw.githubusercontent.com/neaxusxgod-png/INS-ui/main/uilib.min.lua", true))()
+-- NonUI грузим один раз: сперва из локального файла, фолбэк на GitHub
+if not _G.NonUI then
+    local src = nil
+    pcall(function()
+        if isfile("NonUI.lua") then src = readfile("NonUI.lua") end
     end)
-    if not ok then print("[farm] INS-ui load error: " .. tostring(err)) end
+    if not src or src == "" then
+        pcall(function()
+            src = game:HttpGet("https://raw.githubusercontent.com/neaxusxgod-png/NonUI/main/NonUI.lua", true)
+        end)
+    end
+    if src and src ~= "" then
+        local ok, err = pcall(function() loadstring(src)() end)
+        if not ok then print("[farm] NonUI load error: " .. tostring(err)) end
+    end
 end
-local Lib = INSui
-if not Lib then
-    print("[farm] INS-ui not found")
+local Non = _G.NonUI
+if not Non then
+    print("[farm] NonUI not found")
     return
 end
 
@@ -48,7 +57,7 @@ local st = {
     mode = "Nearest",
     priority = "G-Toilet 3.0",
     vote = false,
-    voteMode = "ZombieV2",
+    voteMode = "Astro",
     ready = false,
     readyMethod = "Both",
     lmb = true,
@@ -262,86 +271,159 @@ local function pickTarget(list)
 end
 
 -- ============================================================
--- UI (INS-ui)
+-- UI (NonUI)
 -- ============================================================
-local win = Lib:CreateWindow({
-    title = "RATHUB",
-    subtitle = "v0.1",
-    size = Vector2.new(620, 540),
-    menuKey = "del",
-    configName = "blockade_farm",
-    icon = "https://raw.githubusercontent.com/kinamy200111/Battlefront/main/STBB-AutoFarmICON.png",
-    accent = Color3.fromRGB(122, 134, 255),
-    autoSave = true,
-    backgroundEffect = "Snow",
-    backgroundEffectColor = Color3.fromRGB(170, 220, 255),
+local function Notify(title, body, dur, icon)
+    Non:Notify({
+        Title = title,
+        Content = body or "",
+        Icon = icon == "success" and "circle-check"
+            or icon == "warning" and "triangle-alert"
+            or "info",
+        Duration = dur or 2,
+    })
+end
+
+local win = Non:CreateWindow({
+    Title = "RATHUB",
+    Folder = "RATHUB-Farm",
+    Theme = "Dark",
+    Size = { 620, 540 },
+    Icon = "https://raw.githubusercontent.com/kinamy200111/Battlefront/main/STBB-AutoFarmICON.png",
+})
+win:SetToggleKey("m")
+
+local Main = win:Section({ Title = "Main" })
+local tab = Main:Tab({ Title = "Farm", Icon = "crosshair" })
+local lob = Main:Tab({ Title = "Lobby", Icon = "user" })
+local gc = Main:Tab({ Title = "Gacha", Icon = "star" })
+local sttab = Main:Tab({ Title = "Settings", Icon = "settings" })
+
+tab:Section("Farm")
+local enabled = tab:Toggle({
+    Title = "Enabled",
+    Flag = "farm_on",
+    Default = false,
+    Callback = function(on)
+        st.on = on
+        if on then
+            Notify("Farm", "started", 2, "success")
+        else
+            Notify("Farm", "stopped", 2)
+        end
+    end,
+})
+tab:Keybind({
+    Title = "Toggle farm",
+    Default = "x",
+    Callback = function() Non:Set("farm_on", not Non:Get("farm_on")) end,
+})
+tab:Toggle({ Title = "Tween to enemy", Default = true, Callback = function(v) st.tween = v end })
+tab:Toggle({
+    Title = "Orbit around enemy",
+    Default = true,
+    Callback = function(v)
+        st.orbit = v
+        if v then angleInit = false end
+    end,
+})
+tab:Slider({ Title = "Tween speed", Min = 100, Max = 4000, Default = 600, Step = 25, Callback = function(v) st.speed = v end })
+tab:Slider({ Title = "Orbit radius", Min = 3, Max = 40, Default = 10, Suffix = " st", Callback = function(v) st.radius = v end })
+tab:Slider({ Title = "Orbit speed", Min = 10, Max = 360, Default = 90, Suffix = " deg/s", Callback = function(v) st.orbitDeg = v end })
+tab:Input({ Title = "Priority targets", Default = "G-Toilet 3.0", Callback = function(v) st.priority = v end })
+
+tab:Section("Auto Skills")
+tab:Toggle({ Title = "Auto skills", Default = false, Callback = function(v) st.skills = v end })
+tab:Input({ Title = "Constant skills", Default = "M1,E,F", Callback = function(v) st.skillKeys = v end })
+tab:Toggle({ Title = "Constant only during orbit", Default = false, Callback = function(v) st.skillKeysOrbitOnly = v end })
+tab:Input({ Title = "Wave skills", Default = "Z", Callback = function(v) st.waveSkillKeys = v end })
+tab:Input({ Title = "Wave list", Default = "2,9,17,26,29,30,31", Callback = function(v) st.waveList = v end })
+tab:Slider({ Title = "Spam interval", Min = 0.05, Max = 2, Default = 0.3, Rounding = 2, Suffix = " s", Callback = function(v) st.skillDelay = v end })
+tab:Toggle({ Title = "M1 (LMB remote, hybrid)", Default = true, Callback = function(v) st.lmb = v end })
+tab:Toggle({ Title = "Remote skills (hybrid)", Default = true, Callback = function(v) st.remoteSkills = v end })
+tab:Toggle({ Title = "Remote only during orbit", Default = false, Callback = function(v) st.remoteSkillsOrbitOnly = v end })
+
+lob:Section("Auto Lobby")
+lob:Toggle({ Title = "Auto vote", Default = false, Callback = function(v) st.vote = v end })
+lob:Dropdown({
+    Title = "Vote mode",
+    Values = MODES,
+    Default = "Astro",
+    Callback = function(v) st.voteMode = v end,
+})
+lob:Toggle({ Title = "Auto ready", Default = false, Callback = function(v) st.ready = v end })
+lob:Dropdown({
+    Title = "Ready method",
+    Values = { "Both", "Zone (TP)", "GUI (button)" },
+    Default = "Both",
+    Callback = function(v) st.readyMethod = v end,
 })
 
-local tab = win:Tab("Farm", "swords")
-local farmSec = tab:Section("Farm", "Left")
+gc:Section("Auto Gacha")
+local gachaEn = gc:Toggle({
+    Title = "Gacha enabled",
+    Flag = "gacha_on",
+    Default = false,
+    Callback = function(on)
+        st.gachaOn = on
+        if on then
+            Notify("Gacha", "enabled", 2, "success")
+        else
+            Notify("Gacha", "disabled", 2)
+        end
+    end,
+})
+gc:Keybind({
+    Title = "Toggle gacha",
+    Default = "l",
+    Callback = function() Non:Set("gacha_on", not Non:Get("gacha_on")) end,
+})
+gc:Toggle({ Title = "Auto-open gacha", Default = false, Callback = function(v) st.gachaAuto = v end })
+gc:Dropdown({
+    Title = "Page",
+    Values = { "Characters", "Skins" },
+    Default = "Characters",
+    Callback = function(v) st.gachaType = v == "Skins" and "GachaSkins" or "GachaCharacter" end,
+})
+gc:Dropdown({
+    Title = "Spin",
+    Values = { "1Spin", "10Spins", "100Spins", "1SpinLucky", "10SpinLucky" },
+    Default = "100Spins",
+    Callback = function(v) st.gachaSpin = v end,
+})
+gc:Slider({ Title = "Interval", Min = 0.05, Max = 5, Default = 0.5, Rounding = 2, Suffix = " s", Callback = function(v) st.gachaInterval = v end })
+gc:Slider({ Title = "Max spins (0 = unlimited)", Min = 0, Max = 1000, Default = 0, Callback = function(v) st.gachaMax = v end })
 
-local enabled = farmSec:Toggle("Enabled", false, function(on)
-    st.on = on
-    if on then
-        Lib:Notify("Farm", "started", 2, "success")
-    else
-        Lib:Notify("Farm", "stopped", 2)
-    end
-end):AddKeybind("x", "Toggle")
+sttab:Section("Appearance")
+sttab:Dropdown({
+    Title = "Theme",
+    Values = Non:GetThemes(),
+    Default = "Dark",
+    Callback = function(name) Non:SetTheme(name) end,
+})
+sttab:Slider({
+    Title = "Scale",
+    Min = 70,
+    Max = 130,
+    Default = 100,
+    Suffix = "%",
+    Callback = function(v) win:SetUIScale(v / 100) end,
+})
+sttab:Slider({
+    Title = "Transparency",
+    Min = 0,
+    Max = 60,
+    Default = 0,
+    Suffix = "%",
+    Callback = function(v) Non:SetTransparency(v / 100) end,
+})
+sttab:Toggle({
+    Title = "Panel background",
+    Default = true,
+    Callback = function(on) win:SetPanelBackground(on) end,
+})
 
-farmSec:Toggle("Tween to enemy", true, function(v) st.tween = v end)
-farmSec:Toggle("Orbit around enemy", true, function(v)
-    st.orbit = v
-    if v then angleInit = false end
-end)
-farmSec:Slider("Tween speed", 600, 25, 100, 4000, "", function(v) st.speed = v end)
-farmSec:Slider("Orbit radius", 10, 1, 3, 40, " st", function(v) st.radius = v end)
-farmSec:Slider("Orbit speed", 90, 10, 10, 360, "deg/s", function(v) st.orbitDeg = v end)
-farmSec:Textbox("Priority targets", "G-Toilet 3.0", function(v) st.priority = v end)
-
-local sk = tab:Section("Auto Skills", "Right")
-sk:Toggle("Auto skills", false, function(v) st.skills = v end)
-sk:Textbox("Constant skills", "M1,E,F", function(v) st.skillKeys = v end)
-sk:Toggle("Constant only during orbit", false, function(v) st.skillKeysOrbitOnly = v end)
-sk:Textbox("Wave skills", "Z", function(v) st.waveSkillKeys = v end)
-sk:Textbox("Wave list", "2,9,17,26,29,30,31", function(v) st.waveList = v end)
-sk:Slider("Spam interval", 0.3, 0.05, 0.05, 2, "s", function(v) st.skillDelay = v end)
-sk:Toggle("M1 (LMB remote, hybrid)", true, function(v) st.lmb = v end)
-sk:Toggle("Remote skills (hybrid)", true, function(v) st.remoteSkills = v end)
-sk:Toggle("Remote only during orbit", false, function(v) st.remoteSkillsOrbitOnly = v end)
-
-local lob = win:Tab("Lobby", "users")
-local lobSec = lob:Section("Auto Lobby", "Left")
-lobSec:Toggle("Auto vote", false, function(v) st.vote = v end)
-lobSec:Dropdown("Vote mode", {"ZombieV2"}, MODES, false, function(v)
-    st.voteMode = v[1]
-end)
-lobSec:Toggle("Auto ready", false, function(v) st.ready = v end)
-lobSec:Dropdown("Ready method", {"Both"}, {"Both", "Zone (TP)", "GUI (button)"}, false, function(v)
-    st.readyMethod = v[1]
-end)
-
-local gc = win:Tab("Gacha", "star")
-local gcSec = gc:Section("Auto Gacha", "Left")
-local gachaEn = gcSec:Toggle("Gacha enabled", false, function(on)
-    st.gachaOn = on
-    if on then
-        Lib:Notify("Gacha", "enabled", 2, "success")
-    else
-        Lib:Notify("Gacha", "disabled", 2)
-    end
-end):AddKeybind("l", "Toggle")
-gcSec:Toggle("Auto-open gacha", false, function(v) st.gachaAuto = v end)
-gcSec:Dropdown("Page", {"Characters"}, {"Characters", "Skins"}, false, function(v)
-    st.gachaType = v[1] == "Skins" and "GachaSkins" or "GachaCharacter"
-end)
-gcSec:Dropdown("Spin", {"100Spins"}, {"1Spin", "10Spins", "100Spins", "1SpinLucky", "10SpinLucky"}, false, function(v)
-    st.gachaSpin = v[1]
-end)
-gcSec:Slider("Interval", 0.5, 0.05, 0.05, 5, "s", function(v) st.gachaInterval = v end)
-gcSec:Slider("Max spins (0 = unlimited)", 0, 0, 0, 1000, "", function(v) st.gachaMax = v end)
-
-win:AddSettingsTab("cog")
+tab:Select()
 
 -- ============================================================
 -- лобби: авто-голосование + авто-готовность
@@ -412,7 +494,7 @@ task.spawn(function()
     local bugFixActive = false
     while alive() do
         task.wait(0.4)
-        if st.on then
+        if st.vote or st.ready then
         local now = tick()
         local ok, err = pcall(function()
             local votingNow = ws.Voteing and ws.Voteing.Value == true
@@ -423,7 +505,7 @@ task.spawn(function()
                 lastVote = now
                 votedLobby = true
                 pcall(function() rs.Vote:FireServer(st.voteMode) end)
-                Lib:Notify("Farm", "voted " .. st.voteMode, 2, "success")
+                Notify("Farm", "voted " .. st.voteMode, 2, "success")
                 print("[farm] voted " .. st.voteMode)
             end
             if wave > 0 then votedLobby = false end
@@ -483,7 +565,7 @@ task.spawn(function()
                             end
                             pressComma()
                             print("[farm] ready sent (slot " .. slot .. ")")
-                            Lib:Notify("Farm", "ready (slot " .. slot .. ")", 2, "success")
+                            Notify("Farm", "ready (slot " .. slot .. ")", 2, "success")
                         else
                             if vis then pressComma() end
                         end
@@ -627,7 +709,7 @@ task.spawn(function()
                     print("[farm] gacha " .. st.gachaType .. " " .. st.gachaSpin .. " (total " .. opened .. ")")
                     if st.gachaMax > 0 and opened >= st.gachaMax then
                         st.gachaAuto = false
-                        Lib:Notify("Farm", "gacha limit: " .. opened, 3, "success")
+                        Notify("Farm", "gacha limit: " .. opened, 3, "success")
                     end
                 elseif now - lastErrG > 5 then
                     lastErrG = now
@@ -656,11 +738,11 @@ RunService.Heartbeat:Connect(function(dt)
         end
 
         local now = tick()
-        if now - lastNamesT >= 0.5 then
+        if now - lastNamesT >= 1 then
             lastNamesT = now
             refreshPlayerNames()
         end
-        if now - lastScanT >= 0.25 then
+        if now - lastScanT >= 0.5 then
             lastScanT = now
             mobs = scanMobs(hrp)
         end
@@ -681,7 +763,9 @@ RunService.Heartbeat:Connect(function(dt)
             currentIsPrio = isPriorityName(target.name)
             currentIsCargo = target.name:lower():find("cargo cleaner", 1, true) ~= nil
             angleInit = false
-            Lib:Notify("Farm", "target: " .. target.name, 2)
+            if currentIsPrio then
+                Notify("Farm", "target: " .. target.name, 2)
+            end
         end
 
         -- M1-гибрид: атака ремоутом, когда есть цель и персонаж свободен
@@ -794,4 +878,4 @@ _G.blockade_farm_reg = {
     stop = farmStop,
 }
 
-print("[farm] v0.1 loaded (INS-ui)")
+print("[farm] v0.2 loaded (NonUI)")
