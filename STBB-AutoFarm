@@ -1,8 +1,4 @@
--- ============================================================
--- Blockade FARM: авто-твин к врагам + орбита вокруг них
--- UI: NonUI
--- Auto vote / auto ready: заглушки, реализуем позже
--- ============================================================
+
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -20,7 +16,7 @@ if _G.blockade_farm_reg then
     _G.blockade_farm_reg = nil
 end
 
--- NonUI грузим один раз: сперва из локального файла, фолбэк на GitHub
+
 if not _G.NonUI then
     local src = nil
     pcall(function()
@@ -42,9 +38,7 @@ if not Non then
     return
 end
 
--- ============================================================
--- состояние
--- ============================================================
+
 local MODES = {"Normal", "Hard", "VeryHard", "Insane", "Nightmare", "ThunderStorm", "Zombie", "Christmas", "Hell", "DarkDimension", "Astro", "AstroV2", "ZombieV2", "BossRush", "NoLightInTheSky", "Custom", "100MVisit"}
 
 local st = {
@@ -58,8 +52,11 @@ local st = {
     priority = "G-Toilet 3.0",
     vote = false,
     voteMode = "Astro",
+    voteMethod = "NoHybrid",
     ready = false,
     readyMethod = "Both",
+    heal = false,
+    healHP = 100,
     lmb = true,
     skills = false,
     skillKeys = "M1,E,F",
@@ -92,8 +89,12 @@ local lastLmbT = 0
 
 local mobs = {}
 
--- движение вручную: TweenInfo в Matcha нет, TweenService не работает
--- лицо всегда к мобу, поворот только по горизонтали (yaw, без завала)
+local SHOP_POS = Vector3.new(39.84444046020508, 2.7063474655151367, -24.393577575683594)
+local isHealing = false
+local healRequested = false
+local lastHealT = 0
+
+
 local function yawTo(pos, at)
     return math.atan2(-(at.X - pos.X), -(at.Z - pos.Z))
 end
@@ -124,9 +125,7 @@ local function moveToward(hrp, goal, facePos, dt)
     return newPos == goal
 end
 
--- ============================================================
--- сканер врагов (как в main: workspace.Living, не игроки, не аи-союзники)
--- ============================================================
+
 local ALLY_PREFIX = {"villanarc", "blaster tank", "cam turret", "attacker drone", "missile rocket", "[ ai ]", "[ai", "camera", "skibidifriend", "speaker pulse tank"}
 local playerNames = {}
 
@@ -144,7 +143,7 @@ local function refreshPlayerNames()
 end
 
 local function isPlayer(m)
-    -- только по имени: враги-туалеты носят headphone/Shirt и т.п., маркеры дают ложные срабатывания
+
     return playerNames[m.Name] == true
 end
 
@@ -270,9 +269,6 @@ local function pickTarget(list)
     return best
 end
 
--- ============================================================
--- UI (NonUI)
--- ============================================================
 local function Notify(title, body, dur, icon)
     Non:Notify({
         Title = title,
@@ -343,6 +339,24 @@ tab:Toggle({ Title = "M1 (LMB remote, hybrid)", Default = true, Callback = funct
 tab:Toggle({ Title = "Remote skills (hybrid)", Default = true, Callback = function(v) st.remoteSkills = v end })
 tab:Toggle({ Title = "Remote only during orbit", Default = false, Callback = function(v) st.remoteSkillsOrbitOnly = v end })
 
+tab:Section("Auto Heal (Shop)")
+tab:Toggle({
+    Title = "Auto heal at shop",
+    Default = false,
+    Callback = function(v)
+        st.heal = v
+        if v then healRequested = true end
+    end,
+})
+tab:Slider({
+    Title = "Heal below HP%",
+    Min = 1,
+    Max = 100,
+    Default = 100,
+    Suffix = "%",
+    Callback = function(v) st.healHP = v end,
+})
+
 lob:Section("Auto Lobby")
 lob:Toggle({ Title = "Auto vote", Default = false, Callback = function(v) st.vote = v end })
 lob:Dropdown({
@@ -350,6 +364,12 @@ lob:Dropdown({
     Values = MODES,
     Default = "Astro",
     Callback = function(v) st.voteMode = v end,
+})
+lob:Dropdown({
+    Title = "Vote method",
+    Values = { "NoHybrid", "Hybrid" },
+    Default = "NoHybrid",
+    Callback = function(v) st.voteMethod = v end,
 })
 lob:Toggle({ Title = "Auto ready", Default = false, Callback = function(v) st.ready = v end })
 lob:Dropdown({
@@ -425,9 +445,248 @@ sttab:Toggle({
 
 tab:Select()
 
--- ============================================================
--- лобби: авто-голосование + авто-готовность
--- ============================================================
+
+local VOTE_PAGES = {
+    { "Normal", "Hard", "VeryHard", "Insane", "Nightmare" },
+    { "BossRush", "ThunderStorm", "Zombie", "Christmas", "Hell" },
+    { "DarkDimension", "Astro", "AstroV2", "ZombieV2" },
+}
+local VOTE_MODE_SET = {}
+for _, pg in ipairs(VOTE_PAGES) do
+    for _, m in ipairs(pg) do VOTE_MODE_SET[m] = true end
+end
+
+local voteCurPage = nil
+local function voteLog(msg) print("[farm-vote] " .. msg) end
+
+local function voteGui()
+    local pg = lp and lp.PlayerGui
+    return pg and pg:FindFirstChild("Play")
+end
+local function voteMain()
+    local play = voteGui()
+    return play and play:FindFirstChild("Main")
+end
+local function voteCenter(inst)
+    local x, y = nil, nil
+    local ok = pcall(function()
+        local ap = inst.AbsolutePosition
+        local as = inst.AbsoluteSize
+        x, y = ap.X + as.X / 2, ap.Y + as.Y / 2
+    end)
+    if ok and x and y and x > 0 and y > 0 then return x, y end
+    return nil
+end
+local function voteSoundCount(kind)
+    local n = 0
+    for _, c in ipairs(ws:GetChildren()) do
+        if c.ClassName == "Sound" and c.Name == kind then n = n + 1 end
+    end
+    return n
+end
+local function voteClick(inst, kind)
+    local x, y = voteCenter(inst)
+    if not x then return false end
+    local before = voteSoundCount(kind)
+    mousemoveabs(x, y)
+    task.wait(0.05)
+    for i = 1, 4 do
+        mousemoverel(i % 2 == 0 and 2 or -2, i % 2 == 0 and -1 or 1)
+        task.wait(0.02)
+    end
+    mousemoveabs(x, y)
+    task.wait(0.05)
+    mouse1click()
+    task.wait(0.4)
+    return voteSoundCount(kind) > before
+end
+local function voteClickRetry(inst, tries, label, kind)
+    for i = 1, tries do
+        if voteClick(inst, kind) then return true end
+        task.wait(0.3)
+    end
+    voteLog(label .. " click failed after " .. tries .. " tries")
+    return false
+end
+local function voteClickNav(dir)
+    local main = voteMain()
+    local b = main and main:FindFirstChild(dir > 0 and "Next" or "Previous")
+    if not b then return false end
+    for i = 1, 3 do
+        local ox, oy, osx, osy = nil, nil, nil, nil
+        pcall(function()
+            local ap = b.AbsolutePosition
+            local as = b.AbsoluteSize
+            ox, oy, osx, osy = ap.X, ap.Y, as.X, as.Y
+        end)
+        local cx, cy = nil, nil
+        if ox and oy and osx and osy and osx > 0 and osy > 0 then
+            cx, cy = ox + osx / 2, oy + osy / 2
+        end
+        local before = voteSoundCount("ui4")
+        if cx then
+            local nsx, nsy = math.max(osx, 300), math.max(osy, 90)
+            local enlarged = pcall(function()
+                b.AbsoluteSize = Vector2.new(nsx, nsy)
+                b.AbsolutePosition = Vector2.new(cx - nsx / 2, cy - nsy / 2)
+            end)
+            task.wait(0.1)
+            mousemoveabs(cx, cy)
+            task.wait(0.05)
+            for j = 1, 4 do
+                mousemoverel(j % 2 == 0 and 2 or -2, j % 2 == 0 and -1 or 1)
+                task.wait(0.02)
+            end
+            mousemoveabs(cx, cy)
+            task.wait(0.05)
+            mouse1click()
+            task.wait(0.4)
+            if enlarged then
+                pcall(function()
+                    b.AbsoluteSize = Vector2.new(osx, osy)
+                    b.AbsolutePosition = Vector2.new(ox, oy)
+                end)
+            end
+        else
+            task.wait(0.3)
+        end
+        if voteSoundCount("ui4") > before then
+            task.wait(0.6)
+            return true
+        end
+        task.wait(0.3)
+    end
+    return false
+end
+local function voteOpenPlay()
+    local pg = lp and lp.PlayerGui
+    local ov = pg and pg:FindFirstChild("OpenVoteUI")
+    local ob = ov and ov:FindFirstChild("OPEN UI")
+    if not ob then return false end
+    local ok = voteClick(ob)
+    task.wait(0.6)
+    return ok
+end
+local function voteMyVotedMode()
+    local v = ws:FindFirstChild("Vote")
+    if not v then return nil end
+    for _, mode in ipairs(v:GetChildren()) do
+        if VOTE_MODE_SET[mode.Name] and #mode:GetChildren() > 0 then
+            return mode.Name
+        end
+    end
+    return nil
+end
+local function voteNormalize()
+    local main = voteMain()
+    if not main then return nil end
+    for _ = 1, 3 do
+        if not voteClickNav(-1) then break end
+    end
+    if voteClickNav(-1) then
+        voteLog("sync: Previous still sounds after 3 back-clicks, GUI broken?")
+        return nil
+    end
+    voteCurPage = 1
+    return true
+end
+local function voteGotoPage(target)
+    if voteCurPage == nil then
+        local ok = voteNormalize()
+        if not ok then return false end
+    end
+    if target < voteCurPage then
+        voteLog("target " .. target .. " < cur " .. voteCurPage .. ", re-sync")
+        voteCurPage = nil
+        local ok = voteNormalize()
+        if not ok then return false end
+        if target < voteCurPage then return false end
+    end
+    local diff = target - voteCurPage
+    for _ = 1, diff do
+        if not voteClickNav(1) then
+            voteLog("Next failed on page " .. voteCurPage)
+            voteCurPage = nil
+            return false
+        end
+        voteCurPage = voteCurPage + 1
+    end
+    return true
+end
+local function votePageOf(name)
+    for i, pg in ipairs(VOTE_PAGES) do
+        for _, m in ipairs(pg) do
+            if m == name then return i end
+        end
+    end
+    return nil
+end
+local function voteSelectMode(name)
+    local p = votePageOf(name)
+    if not p then
+        voteLog("unknown mode " .. name)
+        return false
+    end
+    if not voteGotoPage(p) then
+        voteLog("failed to reach page " .. p .. " for " .. name)
+        return false
+    end
+    local main = voteMain()
+    local b = main and main:FindFirstChild(name)
+    if not b then
+        voteLog("mode button missing: " .. name)
+        return false
+    end
+    for i = 1, 3 do
+        if voteClickRetry(b, 2, "mode:" .. name, "ui4") then
+            return true
+        end
+        task.wait(0.3)
+    end
+    voteLog("could not click mode " .. name)
+    return false
+end
+local function voteDoVote(mode)
+    voteCurPage = nil
+    for attempt = 1, 3 do
+        local mine = voteMyVotedMode()
+        if mine == mode then return true end
+        if mine then voteLog("voted for " .. mine .. ", switching to " .. mode) end
+        if voteSelectMode(mode) then
+            local main = voteMain()
+            local vb = main and main:FindFirstChild("VoteButton")
+            if vb and voteClickRetry(vb, 3, "VoteButton", "ui2") then
+                local wrong = false
+                for _ = 1, 4 do
+                    task.wait(0.5)
+                    mine = voteMyVotedMode()
+                    if mine == mode then return true end
+                    if mine and mine ~= mode then
+                        wrong = true
+                        break
+                    end
+                end
+                if wrong then
+                    voteLog("voted WRONG mode " .. mine .. ", page was off — re-sync")
+                else
+                    voteLog("vote click fired but folder not updated, retry")
+                end
+            else
+                voteLog("VoteButton click NOT registered")
+            end
+        end
+        voteCurPage = nil
+        local ok = voteNormalize()
+        if not ok then
+            if not voteOpenPlay() then
+                task.wait(1.0)
+            end
+        end
+    end
+    return false
+end
+
+
 local function pressComma()
     keypress(44)
     task.wait(0.05)
@@ -459,7 +718,7 @@ local function readReadyButton(cg)
     return btn, text, vis, sx, sy
 end
 
--- статус готовности по надписи SelectCharacter > Main > JustText3
+
 local function isNotReady()
     local pg = lp.PlayerGui
     local sc = pg and pg:FindFirstChild("SelectCharacter")
@@ -471,7 +730,6 @@ local function isNotReady()
     return t:lower():find("not ready", 1, true) ~= nil
 end
 
--- телепорт на верхнюю точку AutoReady — игрок падает вниз прямо на зону
 local function hoverTarget()
     local ar2 = ws:FindFirstChild("AutoReady")
     if not ar2 then return nil end
@@ -492,6 +750,8 @@ task.spawn(function()
     local lastErr = 0
     local lastBugFixT = 0
     local bugFixActive = false
+    local votePhaseStart = 0
+    local READY_VOTE_DELAY = 10
     while alive() do
         task.wait(0.4)
         if st.vote or st.ready then
@@ -500,18 +760,38 @@ task.spawn(function()
             local votingNow = ws.Voteing and ws.Voteing.Value == true
             local wave = ws.Wave and ws.Wave.Value or 0
 
-            -- голосование
+
+            if votingNow then
+                if votePhaseStart == 0 then votePhaseStart = now end
+            else
+                votePhaseStart = 0
+            end
+
             if st.vote and votingNow and (not votedLobby or now - lastVote > 30) then
                 lastVote = now
-                votedLobby = true
-                pcall(function() rs.Vote:FireServer(st.voteMode) end)
-                Notify("Farm", "voted " .. st.voteMode, 2, "success")
-                print("[farm] voted " .. st.voteMode)
+                local okV
+                if st.voteMethod == "Hybrid" then
+                    okV = pcall(function() rs.Vote:FireServer(st.voteMode) end)
+                else
+                    okV = voteDoVote(st.voteMode)
+                end
+                if okV then
+                    votedLobby = true
+                    Notify("Farm", "voted " .. st.voteMode .. " (" .. (st.voteMethod == "Hybrid" and "remote" or "clicks") .. ")", 2, "success")
+                    print("[farm] voted " .. st.voteMode)
+                else
+                    Notify("Farm", "vote click failed: " .. st.voteMode, 2, "warning")
+                    print("[farm] vote click failed: " .. st.voteMode)
+                end
             end
             if wave > 0 then votedLobby = false end
 
-            -- готовность
-            if st.ready and (votingNow or wave == 0) and now - lastReady > 1.5 then
+            local voteGUIOpen = voteGui() ~= nil
+            local readyBlocked = (votingNow or voteGUIOpen) and not (votedLobby or voteMyVotedMode())
+            if (votingNow or voteGUIOpen) and votePhaseStart > 0 and now - votePhaseStart < READY_VOTE_DELAY then
+                readyBlocked = true
+            end
+            if st.ready and not readyBlocked and (votingNow or wave == 0) and now - lastReady > 1.5 then
                 local method = st.readyMethod
                 if method ~= "GUI (button)" then
                     local ar2 = ws:FindFirstChild("AutoReady")
@@ -574,13 +854,13 @@ task.spawn(function()
                 lastReady = now
             end
 
-            -- детект бага зоны: сброс при готовности
-            if st.ready and (votingNow or wave == 0) then
+
+            if st.ready and not readyBlocked and (votingNow or wave == 0) then
                 local nr = isNotReady()
                 if nr == false then
                     bugFixActive = false
                 end
-                -- ре-телепорт над зоной каждые 30s (игрок падает на зону между ними)
+
                 if bugFixActive and now - lastBugFixT >= 30 then
                     lastBugFixT = now
                     local root = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
@@ -602,9 +882,146 @@ task.spawn(function()
     end
 end)
 
--- ============================================================
--- авто-скиллы: постоянные + только на волнах из списка
--- ============================================================
+
+local function gotoShop()
+    local root = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+    if not root then return false end
+    root.CFrame = CFrame.new(SHOP_POS.X, SHOP_POS.Y, SHOP_POS.Z)
+    return true
+end
+
+
+local function healButton()
+    local pg = lp and lp.PlayerGui
+    local a3 = pg and pg:FindFirstChild("003-A")
+    local main = a3 and a3:FindFirstChild("Main")
+    return main and main:FindFirstChild("Heal")
+end
+
+
+local function clickHeal()
+    local btn = healButton()
+    if not btn then
+        print("[farm-heal] Heal button not found")
+        return false
+    end
+    local hum = lp.Character and lp.Character:FindFirstChild("Humanoid")
+    local before = hum and hum.Health or 0
+
+    local ox, oy, osx, osy = nil, nil, nil, nil
+    pcall(function()
+        local ap = btn.AbsolutePosition
+        local as = btn.AbsoluteSize
+        ox, oy, osx, osy = ap.X, ap.Y, as.X, as.Y
+    end)
+    local cx, cy = nil, nil
+    if ox and oy and osx and osy and osx > 0 and osy > 0 then
+        cx, cy = ox + osx / 2, oy + osy / 2
+    end
+    if not cx then return false end
+
+    local nsx, nsy = math.max(osx, 300), math.max(osy, 90)
+    local enlarged = pcall(function()
+        btn.AbsoluteSize = Vector2.new(nsx, nsy)
+        btn.AbsolutePosition = Vector2.new(cx - nsx / 2, cy - nsy / 2)
+    end)
+    task.wait(0.1)
+    mousemoveabs(cx, cy)
+    task.wait(0.05)
+    for i = 1, 4 do
+        mousemoverel(i % 2 == 0 and 2 or -2, i % 2 == 0 and -1 or 1)
+        task.wait(0.02)
+    end
+    mousemoveabs(cx, cy)
+    task.wait(0.05)
+    mouse1click()
+    task.wait(1.0)
+    if enlarged then
+        pcall(function()
+            btn.AbsoluteSize = Vector2.new(osx, osy)
+            btn.AbsolutePosition = Vector2.new(ox, oy)
+        end)
+    end
+    hum = lp.Character and lp.Character:FindFirstChild("Humanoid")
+    local after = hum and hum.Health or 0
+    if after > before + 1 then
+        print("[farm-heal] healed " .. math.floor(before) .. " -> " .. math.floor(after))
+        return true
+    end
+    return false
+end
+
+local function canUseShop()
+    local cus = ws:FindFirstChild("CanUseShop")
+    if not cus then return false end
+    local okC, v = pcall(function() return cus.Value end)
+    return okC and v == true
+end
+
+local function doHeal()
+
+    if not gotoShop() then return false end
+    print("[farm-heal] at shop, waiting 8s for landing...")
+    task.wait(8)
+
+
+    local guiWait = tick()
+    while alive() do
+        local btn = healButton()
+        if btn then break end
+        if tick() - guiWait > 10 then
+            print("[farm-heal] shop GUI timeout")
+            return false
+        end
+        task.wait(0.3)
+    end
+
+    for i = 1, 3 do
+        if clickHeal() then
+            return true
+        end
+        task.wait(0.5)
+    end
+    print("[farm-heal] heal click NOT registered")
+    return false
+end
+
+task.spawn(function()
+    while alive() do
+        task.wait(0.5)
+        if st.heal and st.on then
+            local now = tick()
+            local hum = lp.Character and lp.Character:FindFirstChild("Humanoid")
+            if hum then
+                local hp, mx = hum.Health, hum.MaxHealth
+
+                local needHeal = healRequested or (mx > 0 and hp / mx * 100 < st.healHP)
+                if needHeal and not isHealing and now - lastHealT > 5 then
+
+                    if not canUseShop() then
+                        lastHealT = now
+                        print("[farm-heal] shop not ready yet, staying on farm")
+                    else
+                        isHealing = true
+                        local okH = doHeal()
+                        isHealing = false
+                        healRequested = false
+                        if okH then
+                            lastHealT = tick()
+                            Notify("Farm", "healed at shop", 2, "success")
+                        else
+
+                            lastHealT = tick() + 25
+                            print("[farm-heal] heal attempt failed, cooldown 30s")
+                        end
+                    end
+                end
+            end
+        end
+    end
+end)
+
+
 local function pressKeys(list)
     for _, k in ipairs(splitList(list)) do
         local kk = k:lower()
@@ -691,9 +1108,7 @@ task.spawn(function()
     end
 end)
 
--- ============================================================
--- гача: авто-открытие
--- ============================================================
+
 task.spawn(function()
     local opened = 0
     local lastErrG = 0
@@ -720,9 +1135,7 @@ task.spawn(function()
     end
 end)
 
--- ============================================================
--- главный цикл: твин + орбита
--- ============================================================
+
 local lastErrT = 0
 RunService.Heartbeat:Connect(function(dt)
     if not alive() then return end
@@ -735,6 +1148,13 @@ RunService.Heartbeat:Connect(function(dt)
         if hrp ~= lastHrp then
             lastHrp = hrp
             angleInit = false
+        end
+
+        if isHealing then
+            if (hrp.Position - SHOP_POS).Magnitude > 2 then
+                hrp.CFrame = CFrame.new(SHOP_POS.X, SHOP_POS.Y, SHOP_POS.Z)
+            end
+            return
         end
 
         local now = tick()
@@ -768,7 +1188,6 @@ RunService.Heartbeat:Connect(function(dt)
             end
         end
 
-        -- M1-гибрид: атака ремоутом, когда есть цель и персонаж свободен
         if st.lmb then
             if now - lastLmbT >= 0.1 then
                 lastLmbT = now
@@ -781,7 +1200,7 @@ RunService.Heartbeat:Connect(function(dt)
             end
         end
 
-        -- живая позиция цели каждый кадр: HumanoidRootPart
+
         local tpos
         pcall(function()
             tpos = target.root.Position
@@ -793,23 +1212,23 @@ RunService.Heartbeat:Connect(function(dt)
         local dist = (flatT - ppos).Magnitude
 
         if currentIsCargo and target.fake and target.fake.Parent then
-            -- Cargo Cleaner: подъём до высоты FakeHead, потом орбита вокруг неё (центр убивает)
+
             local fpos = target.fake.Position
             local flatH = Vector3.new(fpos.X, ppos.Y, fpos.Z)
             local fDist = (flatH - ppos).Magnitude
             if fDist > st.radius + 3 then
                 isOrbiting = false
                 if math.abs(ppos.Y - fpos.Y) > 2 then
-                    -- фаза 1: вертикальный подъём на высоту головы
+
                     moveToward(hrp, Vector3.new(ppos.X, fpos.Y, ppos.Z), fpos, dt)
                 else
-                    -- фаза 2: подход к кольцу вокруг головы
+
                     local dir = (ppos - flatH).Unit
                     local goal = flatH + dir * st.radius
                     moveToward(hrp, Vector3.new(goal.X, fpos.Y, goal.Z), fpos, dt)
                 end
             else
-                -- фаза 3: орбита вокруг FakeHead
+
                 isOrbiting = true
                 if not angleInit then
                     local off = ppos - fpos
@@ -823,7 +1242,7 @@ RunService.Heartbeat:Connect(function(dt)
             end
         elseif st.orbit then
             if dist > st.radius + 3 then
-                -- подход к кольцу (летим к центру цели)
+
                 isOrbiting = false
                 local dir = (ppos - flatT).Unit
                 local goal = flatT + dir * st.radius
@@ -834,7 +1253,7 @@ RunService.Heartbeat:Connect(function(dt)
                     setPosFacing(hrp, goal, tpos)
                 end
             else
-                -- орбита
+
                 isOrbiting = true
                 if not angleInit then
                     local off = ppos - tpos
@@ -847,7 +1266,7 @@ RunService.Heartbeat:Connect(function(dt)
                 setPosFacing(hrp, orb, tpos)
             end
         elseif st.tween and dist > 6 then
-            -- без орбиты: летим в центр цели
+
             isOrbiting = false
             moveToward(hrp, tpos, tpos, dt)
         else
@@ -864,9 +1283,7 @@ RunService.Heartbeat:Connect(function(dt)
     end
 end)
 
--- ============================================================
--- STOP / REG
--- ============================================================
+
 local function farmStop()
     if win then
         pcall(function() win:Destroy() end)
