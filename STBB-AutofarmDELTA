@@ -1,0 +1,2754 @@
+--[[
+================================================================
+  RATHUB - Blockade Front (Farm + Astro)  |  injector build
+================================================================
+  * UI      : WindUI
+  * Transport: remotes only (no Hybrid / NoHybrid, no GUI clicking
+    for vote / ready). Always remotes.
+  * Merged   : blockade_farm.lua + blockade_astro.lua
+  * Extra   : Vote  -> rs.Vote:FireServer(mode)
+              Ready -> rs.GetReadyRemote:FireServer(slot, true)
+              Skills-> rs.SoundWave / rs.Swing / rs.SpeakerCarrier /
+                       rs.BuffSpeakerMan / rs.Buff
+              M1    -> rs.LMB
+              Gacha -> rs.GachaCharacter / rs.GachaSkins
+  Shop heal uses firesignal on the real Heal button (executor side),
+  it is NOT the vote/ready flow.
+================================================================
+]]
+
+-- top-level boot marker: printed even if __RATHUB_MAIN fails to
+-- parse/attach, so "no output at all" means the paste itself broke
+print("[RATHUB] script loaded")
+
+-- on-screen boot indicator (Delta hides its console, so errors
+-- must be visible on the GUI itself)
+local bootGui
+do
+	local ok = pcall(function()
+		bootGui = Instance.new("ScreenGui")
+		bootGui.Name = "RATHUB_Boot"
+		bootGui.ResetOnSpawn = false
+		bootGui.DisplayOrder = 999999
+		local frame = Instance.new("Frame")
+		frame.Size = UDim2.new(0, 360, 0, 44)
+		frame.Position = UDim2.new(0.5, -180, 0, 10)
+		frame.BackgroundColor3 = Color3.fromRGB(18, 18, 26)
+		frame.BackgroundTransparency = 0.1
+		frame.BorderSizePixel = 0
+		frame.Parent = bootGui
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0, 8)
+		corner.Parent = frame
+		local label = Instance.new("TextLabel")
+		label.Name = "T"
+		label.Size = UDim2.new(1, -16, 1, 0)
+		label.Position = UDim2.new(0, 8, 0, 0)
+		label.BackgroundTransparency = 1
+		label.Font = Enum.Font.GothamBold
+		label.TextSize = 14
+		label.TextColor3 = Color3.fromRGB(255, 255, 255)
+		label.TextXAlignment = Enum.TextXAlignment.Left
+		label.TextTruncate = Enum.TextTruncate.AtEnd
+		label.Text = "RATHUB: loading..."
+		label.Parent = frame
+		local holder = (type(gethui) == "function" and gethui())
+			or game:GetService("CoreGui")
+		bootGui.Parent = holder
+	end)
+	if not ok then
+		pcall(function()
+			local pg = game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui")
+			bootGui.Parent = pg
+		end)
+	end
+end
+
+local function bootSet(text, r, g, b)
+	print("[RATHUB] boot: " .. text)
+	if bootGui then
+		pcall(function()
+			local t = bootGui:FindFirstChild("T", true)
+			if t then
+				t.Text = "RATHUB: " .. text
+				if r then
+					t.TextColor3 = Color3.fromRGB(r, g or 80, b or 80)
+				end
+			end
+		end)
+	end
+end
+
+local function bootOk()
+	if bootGui then
+		pcall(function()
+			bootGui:Destroy()
+		end)
+		bootGui = nil
+	end
+end
+
+bootSet("loaded")
+
+-- ============================================================
+-- runtime flags
+-- ============================================================
+local ALIVE = true
+local function alive()
+	return ALIVE
+end
+local function now()
+	return tick()
+end
+
+-- ============================================================
+-- services
+-- ============================================================
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local lp = Players.LocalPlayer
+local ws = workspace
+local rs = game:GetService("ReplicatedStorage")
+
+-- everything below lives inside __RATHUB_MAIN so that ANY uncaught
+-- error is reported via warn instead of dying silently
+local function __RATHUB_MAIN()
+
+print("[RATHUB] executor: " .. tostring(
+	(getexecutor and getexecutor())
+	or (identifyexecutor and identifyexecutor())
+	or (syn and syn.getexecutor and syn.getexecutor())
+	or "unknown"
+))
+
+-- ============================================================
+-- WindUI
+-- ============================================================
+-- executor request first (Delta/Madium/Synapse variants), then HttpGet.
+-- Delta quirks: request may return a bare string, use lowercase `body`,
+-- or only expose syn.request; HttpGet may be disabled in Delta settings.
+local function httpGet(url)
+	local candidates = {}
+	if type(request) == "function" then
+		candidates[#candidates + 1] = request
+	end
+	if type(http_request) == "function" then
+		candidates[#candidates + 1] = http_request
+	end
+	if type(syn) == "table" and type(syn.request) == "function" then
+		candidates[#candidates + 1] = syn.request
+	end
+	for _, req in ipairs(candidates) do
+		local ok, res = pcall(function()
+			return req({ Url = url, Method = "GET" })
+		end)
+		if ok then
+			if type(res) == "string" and res ~= "" then
+				return res
+			end
+			if type(res) == "table" then
+				local body = res.Body or res.body
+				if type(body) == "string" and body ~= "" then
+					return body
+				end
+			end
+		end
+	end
+	local ok2, body = pcall(function()
+		return game:HttpGet(url)
+	end)
+	if ok2 and type(body) == "string" and body ~= "" then
+		return body
+	end
+	return nil
+end
+
+-- NOTE: the previous instance is torn down *after* this library loads
+-- (see below); destroying its screens earlier races with the new window.
+
+local WINDUI_URLS = {
+	"https://cdn.jsdelivr.net/gh/Footagesus/WindUI@main/dist/main.lua",
+	"https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua",
+	"https://github.com/Footagesus/WindUI/releases/latest/download/main.lua",
+}
+
+local windBody
+bootSet("downloading WindUI...")
+for _, url in ipairs(WINDUI_URLS) do
+	windBody = httpGet(url)
+	if windBody then
+		break
+	end
+end
+if not windBody then
+	warn("[RATHUB] WindUI download failed (no CDN reachable)")
+	bootSet("ERR: WindUI download failed - enable Http in Delta settings", 255, 80, 80)
+	return
+end
+bootSet("loading WindUI...")
+
+-- ----------------------------------------------------------
+-- 1) WindUI downloads its icon sets from raw.githubusercontent.com,
+--    which stalls on networks where GitHub raw is blocked -> mirror
+--    every icon URL onto jsDelivr (identical files).
+-- ----------------------------------------------------------
+local ICON_RAW = "https://raw.githubusercontent.com/Footagesus/Icons/refs/heads/main/"
+local ICON_CDN = "https://cdn.jsdelivr.net/gh/Footagesus/Icons@main/"
+windBody = windBody:gsub(ICON_RAW, ICON_CDN)
+
+-- ----------------------------------------------------------
+-- 2) Redirect WindUI's HTTP through our own fetch (executor request).
+--    game:HttpGet can stall; unknown hosts are never contacted.
+-- ----------------------------------------------------------
+windBody = windBody:gsub("game:HttpGet", "__RATHUB_HG")
+windBody = windBody:gsub("game%.HttpGet", "__RATHUB_HG")
+
+-- ----------------------------------------------------------
+-- 3) CreateWindow() waits on GetUserThumbnailAsync, which blocks
+--    forever when the thumbnail service is throttled -> stub it out.
+-- ----------------------------------------------------------
+local thumbPatched = 0
+windBody = windBody:gsub("([%w_%.]+):GetUserThumbnailAsync%(", function()
+	thumbPatched = thumbPatched + 1
+	return "__RATHUB_THUMB("
+end)
+if thumbPatched == 0 then
+	warn("[RATHUB] WindUI thumbnail call not found (library layout changed?)")
+end
+
+local windCache = {}
+local windReq = request or http_request or (type(syn) == "table" and syn.request) or nil
+local function windHttpGet(url)
+	if type(url) ~= "string" then
+		return ""
+	end
+	local hit = windCache[url]
+	if hit then
+		return hit
+	end
+	if windReq and url:sub(1, #ICON_CDN) == ICON_CDN then
+		local ok, res = pcall(function()
+			return windReq({ Url = url, Method = "GET" })
+		end)
+		local body = nil
+		if ok and type(res) == "string" then
+			body = res
+		elseif ok and type(res) == "table" then
+			body = res.Body or res.body
+		end
+		if type(body) == "string" and body ~= "" then
+			-- only hand back something that can actually be parsed as Lua,
+			-- otherwise return "" so WindUI falls back to bundled icons
+			if not body:find("<html", 1, true) and body:find("return", 1, true) then
+				windCache[url] = body
+				return body
+			end
+		end
+	end
+	return ""
+end
+
+_G.__RATHUB_HG = windHttpGet
+_G.__RATHUB_THUMB = function()
+	return ""
+end
+
+local windChunk = (loadstring or load)(windBody)
+if not windChunk then
+	warn("[RATHUB] WindUI parse failed")
+	bootSet("ERR: WindUI parse failed - enable Loadstring in Delta", 255, 80, 80)
+	return
+end
+if type(getfenv) == "function" then
+	local okEnv, windEnv = pcall(getfenv, windChunk)
+	if okEnv and type(windEnv) == "table" then
+		windEnv.__RATHUB_HG = windHttpGet
+		windEnv.__RATHUB_THUMB = _G.__RATHUB_THUMB
+	end
+end
+
+local windOk, windRes = pcall(function()
+	return windChunk()
+end)
+
+if not windOk or not windRes then
+	warn("[RATHUB] WindUI load failed: " .. tostring(windRes))
+	bootSet("ERR: WindUI load failed: " .. tostring(windRes):sub(1, 80), 255, 80, 80)
+	return
+end
+local WindUI = windRes
+
+-- stop a previous instance only once the library is ready,
+-- so a failed load never leaves the user without a UI.
+-- Detached: a previous window whose screen was already swept away can
+-- hang inside Destroy(), and that must never block the new UI.
+if _G.__RATHUB_REG and _G.__RATHUB_REG.stop then
+	task.spawn(function()
+		pcall(_G.__RATHUB_REG.stop)
+	end)
+end
+
+-- ============================================================
+-- state
+-- ============================================================
+local MODES = {
+	"Normal", "Hard", "VeryHard", "Insane", "Nightmare",
+	"ThunderStorm", "Zombie", "Christmas", "Hell", "DarkDimension",
+	"Astro", "AstroV2", "ZombieV2", "BossRush", "NoLightInTheSky",
+	"Custom", "100MVisit",
+}
+
+local st = {
+	-- farm
+	farm = false,
+	tween = true,
+	orbit = true,
+	speed = 600,
+	radius = 10,
+	orbitDeg = 90,
+	mode = "Nearest",
+	priority = "G-Toilet 3.0",
+	fakeBoss = "cargo cleaner",
+	allyList = "villanarc, blaster tank, cam turret, attacker drone, missile rocket, [ ai ], [ai, camera drone, skibidifriend, speaker pulse tank",
+	m1 = true,
+	m1Spam = false,
+	skills = false,
+	skillCombatList = "SoundWave | SoundWave_Cooldown | SoundImprovement\nSwing | Swing_Cooldown",
+	skillWaveList = "SpeakerCarrier | SpeakerCarrier_Cooldown\nBuffSpeakerMan | Buff_Cooldown",
+	skillBusy = true,
+	skillOrbitOnly = false,
+	skillDelay = 0.3,
+	waveList = "2,9,17,26,29,30,31",
+	heal = false,
+	healHP = 100,
+	loot = true,
+	lootRange = 1000,
+	lootDelay = 0.35,
+	resetWave = false,
+	resetWaveNum = 5,
+	idleVec = nil,
+	-- astro
+	astro = false,
+	astroSpeed = 600,
+	astroHeal = true,
+	-- lobby
+	vote = false,
+	voteMode = "Astro",
+	ready = false,
+	readySlot = "1",
+	readyHover = true,
+	-- gacha
+	gacha = false,
+	gachaAuto = false,
+	gachaType = "GachaCharacter",
+	gachaSpin = "100Spins",
+	gachaInterval = 0.5,
+	gachaMax = 0,
+	-- mastery path
+	mastery = false,
+	masteryList = "Camera man | 30\nTv man | 80\nTV woman | 80\nLarge Speaker man | 80\nSpeaker Strider | 80\nDark Speakerman | 80\nEngineer Camera Man | 10\nScientist TV Man | 80\nLarge TV man | 80",
+	masteryDefault = 80,
+	masteryDelay = 3,
+	-- safety
+	god = false,
+	godHP = 800,
+	godSkipTimer0 = true,
+	antiAfk = true,
+	-- webhook
+	webhook = false,
+	webhookUrl = "",
+	webhookDelay = 60,
+	-- heal tuning
+	healTry = 12,
+}
+
+local masterySkipped = {}
+
+local currentTarget = nil
+local zoneGoal = nil
+local isOrbiting = false
+local angle = 0
+local angleInit = false
+local lastHrp = nil
+local mobs = {}
+local isHealing = false
+local healRequested = false
+local lastHealT = 0
+local resetDone = false
+local godBusy = false
+local sendWebhook -- defined at the bottom (webhook block), used by Settings UI
+
+-- ============================================================
+-- helpers
+-- ============================================================
+local function splitList(s)
+	local out = {}
+	for part in tostring(s or ""):gmatch("[^,;]+") do
+		local p = part:gsub("^%s+", ""):gsub("%s+$", "")
+		if p ~= "" then
+			out[#out + 1] = p:lower()
+		end
+	end
+	return out
+end
+
+local function parseVec3(s)
+	local x, y, z = tostring(s or ""):match("([%-%d%.]+)%s*[ ,;]+([%-%d%.]+)%s*[ ,;]+([%-%d%.]+)")
+	if x and y and z then
+		return Vector3.new(tonumber(x), tonumber(y), tonumber(z))
+	end
+	return nil
+end
+
+local function waveInList(wave)
+	for _, p in ipairs(splitList(st.waveList)) do
+		if tonumber(p) == wave then
+			return true
+		end
+	end
+	return false
+end
+
+-- Skill config line: "Remote | Cooldown | RequireChild | arg1,arg2"
+--   Remote       required, name (or dotted path) under ReplicatedStorage
+--   Cooldown     optional bool in CooldownFolder; skip while Value == true
+--   RequireChild optional child that must exist on the character
+--   args         optional comma-separated arguments passed to FireServer
+local function resolveRemote(path)
+	if not path or path == "" then
+		return nil
+	end
+	local cur = rs
+	for seg in tostring(path):gmatch("[^%.]+") do
+		if not cur then
+			return nil
+		end
+		cur = cur:FindFirstChild(seg)
+	end
+	return cur
+end
+
+local function parseSkillList(text)
+	local out = {}
+	for line in tostring(text or ""):gmatch("[^\r\n]+") do
+		local cleaned = line:gsub("^%s+", ""):gsub("%s+$", "")
+		if cleaned ~= "" and cleaned:sub(1, 1) ~= "#" then
+			local parts = {}
+			for p in (cleaned .. "|"):gmatch("([^|]*)|") do
+				parts[#parts + 1] = p:gsub("^%s+", ""):gsub("%s+$", "")
+			end
+			local name = parts[1]
+			if name and name ~= "" then
+				local args = {}
+				if parts[4] and parts[4] ~= "" then
+					for a in parts[4]:gmatch("[^,]+") do
+						a = a:gsub("^%s+", ""):gsub("%s+$", "")
+						if a ~= "" then
+							args[#args + 1] = tonumber(a) or a
+						end
+					end
+				end
+				out[#out + 1] = {
+					remote = name,
+					cooldown = (parts[2] and parts[2] ~= "") and parts[2] or nil,
+					require = (parts[3] and parts[3] ~= "") and parts[3] or nil,
+					args = args,
+				}
+			end
+		end
+	end
+	return out
+end
+
+local function runSkillList(list, char, cdf, busy)
+	for _, s in ipairs(list) do
+		local rem = resolveRemote(s.remote)
+		if rem then
+			local ok = not busy
+			if ok and s.cooldown then
+				local cd = cdf and cdf:FindFirstChild(s.cooldown)
+				if cd and cd.Value == true then
+					ok = false
+				end
+			end
+			if ok and s.require and not char:FindFirstChild(s.require) then
+				ok = false
+			end
+			if ok then
+				pcall(function()
+					rem:FireServer(table.unpack(s.args))
+				end)
+			end
+		end
+	end
+end
+
+local function yawTo(pos, at)
+	return math.atan2(-(at.X - pos.X), -(at.Z - pos.Z))
+end
+
+-- writes the position and kills the residual velocity, otherwise the
+-- character keeps falling for a frame and bounces up/down between writes
+local function setPosFacing(hrp, pos, facePos)
+	hrp.CFrame = CFrame.new(pos.X, pos.Y, pos.Z) * CFrame.Angles(0, yawTo(pos, facePos), 0)
+	pcall(function()
+		hrp.AssemblyLinearVelocity = Vector3.zero
+		hrp.AssemblyAngularVelocity = Vector3.zero
+	end)
+end
+
+local function moveToward(hrp, goal, facePos, dt)
+	local dist = (goal - hrp.Position).Magnitude
+	if dist <= 0.75 then
+		if (goal - facePos).Magnitude > 1 then
+			setPosFacing(hrp, goal, facePos)
+		else
+			local yaw = math.atan2(-hrp.CFrame.LookVector.X, -hrp.CFrame.LookVector.Z)
+			hrp.CFrame = CFrame.new(goal.X, goal.Y, goal.Z) * CFrame.Angles(0, yaw, 0)
+		end
+		return true
+	end
+	local step = st.speed * dt
+	local newPos
+	if step >= dist then
+		newPos = goal
+	else
+		newPos = hrp.Position + (goal - hrp.Position).Unit * step
+	end
+	setPosFacing(hrp, newPos, facePos)
+	return newPos == goal
+end
+
+st.idleVec = parseVec3("-22.430267333984375 3.0063483715057373 -3.2639551162719727")
+
+-- ============================================================
+-- UI
+-- ============================================================
+local function ele(parent, name, opts)
+	if not parent then
+		return nil
+	end
+	local ok, obj = pcall(function()
+		return parent[name](parent, opts)
+	end)
+	if not ok then
+		warn("[RATHUB] UI " .. tostring(name) .. " failed: " .. tostring(obj))
+		return nil
+	end
+	return obj
+end
+
+local function notify(title, content, icon, dur)
+	pcall(function()
+		WindUI:Notify({
+			Title = title,
+			Content = content or "",
+			Icon = icon,
+			Duration = dur or 3,
+		})
+	end)
+end
+
+local function idxOf(list, val)
+	for i, v in ipairs(list) do
+		if v == val then
+			return i
+		end
+	end
+	return 1
+end
+
+local function setToggle(tgl, v)
+	if tgl then
+		pcall(function()
+			tgl:Set(v)
+		end)
+	end
+end
+
+bootSet("building UI...")
+
+local Window = ele(WindUI, "CreateWindow", {
+	Title = "RATHUB | Blockade",
+	Folder = "RATHUB-Blockade",
+	Icon = "star",
+	Size = UDim2.fromOffset(700, 520),
+	NewElements = true,
+	OpenButton = {
+		Title = "Open RATHUB",
+		Enabled = true,
+		Draggable = true,
+		Scale = 0.5,
+	},
+	Topbar = {
+		Height = 44,
+		ButtonsType = "Mac",
+	},
+})
+if not Window then
+	warn("[RATHUB] window not created")
+	pcall(function()
+		WindUI:Notify({
+			Title = "RATHUB",
+			Content = "WindUI loaded but the window could not be created",
+			Icon = "triangle-alert",
+			Duration = 6,
+		})
+	end)
+	return
+end
+pcall(function()
+	Window:SetToggleKey(Enum.KeyCode.M)
+end)
+
+local FarmTab = ele(Window, "Tab", { Title = "Farm", Icon = "crosshair", Border = true })
+local AstroTab = ele(Window, "Tab", { Title = "Astro", Icon = "star", Border = true })
+local LobbyTab = ele(Window, "Tab", { Title = "Lobby", Icon = "user", Border = true })
+local MasteryTab = ele(Window, "Tab", { Title = "Mastery", Icon = "target", Border = true })
+local GachaTab = ele(Window, "Tab", { Title = "Gacha", Icon = "gift", Border = true })
+local SettingsTab = ele(Window, "Tab", { Title = "Settings", Icon = "settings", Border = true })
+
+-- ---------------- Farm ----------------
+local FarmSec = ele(FarmTab, "Section", { Title = "Farm" })
+local farmToggle
+farmToggle = ele(FarmSec, "Toggle", {
+	Title = "Enabled",
+	Desc = "Auto attack: approach, orbit and skills",
+	Value = false,
+	Flag = "farm",
+	Callback = function(on)
+		st.farm = on
+		if on then
+			notify("Farm", "started", "check", 2)
+		else
+			notify("Farm", "stopped", "info", 2)
+		end
+	end,
+})
+ele(FarmSec, "Keybind", {
+	Title = "Toggle farm",
+	Value = "X",
+	Callback = function()
+		local nv = not st.farm
+		st.farm = nv
+		setToggle(farmToggle, nv)
+	end,
+})
+ele(FarmSec, "Slider", {
+	Title = "Tween speed",
+	Step = 25,
+	Value = { Min = 100, Max = 4000, Default = 600 },
+	Callback = function(v)
+		st.speed = v
+	end,
+})
+ele(FarmSec, "Slider", {
+	Title = "Orbit radius",
+	Step = 1,
+	Value = { Min = 3, Max = 40, Default = 10 },
+	Callback = function(v)
+		st.radius = v
+	end,
+})
+ele(FarmSec, "Slider", {
+	Title = "Orbit speed",
+	Step = 1,
+	Value = { Min = 10, Max = 360, Default = 90 },
+	Callback = function(v)
+		st.orbitDeg = v
+	end,
+})
+ele(FarmSec, "Input", {
+	Title = "Priority targets",
+	Value = "G-Toilet 3.0",
+	Placeholder = "name1, name2",
+	Callback = function(v)
+		st.priority = v
+	end,
+})
+ele(FarmSec, "Toggle", {
+	Title = "M1 remote attack",
+	Desc = "rs.LMB when a target is alive",
+	Value = true,
+	Callback = function(v)
+		st.m1 = v
+	end,
+})
+ele(FarmSec, "Toggle", {
+	Title = "Spam M1 remote (0.05s)",
+	Value = false,
+	Callback = function(v)
+		st.m1Spam = v
+	end,
+})
+
+local SkillSec = ele(FarmTab, "Section", { Title = "Auto Skills (remote)" })
+ele(SkillSec, "Toggle", {
+	Title = "Auto skills",
+	Value = false,
+	Callback = function(v)
+		st.skills = v
+	end,
+})
+ele(SkillSec, "Input", {
+	Title = "Combat skills",
+	Desc = "Remote | Cooldown | RequireChild | args  (one per line)",
+	Type = "Textarea",
+	Value = "SoundWave | SoundWave_Cooldown | SoundImprovement\nSwing | Swing_Cooldown",
+	Callback = function(v)
+		st.skillCombatList = v
+	end,
+})
+ele(SkillSec, "Input", {
+	Title = "Wave skills",
+	Desc = "Fired on waves from the wave list",
+	Type = "Textarea",
+	Value = "SpeakerCarrier | SpeakerCarrier_Cooldown\nBuffSpeakerMan | Buff_Cooldown",
+	Callback = function(v)
+		st.skillWaveList = v
+	end,
+})
+ele(SkillSec, "Toggle", { Title = "Respect ActiveM1 busy", Value = true, Callback = function(v)
+	st.skillBusy = v
+end })
+ele(SkillSec, "Toggle", { Title = "Only while orbiting", Value = false, Callback = function(v)
+	st.skillOrbitOnly = v
+end })
+ele(SkillSec, "Slider", {
+	Title = "Spam interval",
+	Step = 0.05,
+	Value = { Min = 0.05, Max = 2, Default = 0.3 },
+	Callback = function(v)
+		st.skillDelay = v
+	end,
+})
+ele(SkillSec, "Input", {
+	Title = "Wave list",
+	Value = "2,9,17,26,29,30,31",
+	Callback = function(v)
+		st.waveList = v
+	end,
+})
+
+local HealSec = ele(FarmTab, "Section", { Title = "Auto Heal (Shop)" })
+ele(HealSec, "Toggle", {
+	Title = "Auto heal at shop",
+	Value = false,
+	Callback = function(v)
+		st.heal = v
+		if v then
+			healRequested = true
+		end
+	end,
+})
+ele(HealSec, "Slider", {
+	Title = "Heal below HP",
+	Step = 1,
+	Value = { Min = 1, Max = 100, Default = 100 },
+	Callback = function(v)
+		st.healHP = v
+	end,
+})
+ele(HealSec, "Slider", {
+	Title = "Heal attempt (sec)",
+	Desc = "Spams Buy/FillHP every 0.18s for this long (covers the helicopter ride)",
+	Step = 1,
+	Value = { Min = 4, Max = 30, Default = 12 },
+	Callback = function(v)
+		st.healTry = v
+	end,
+})
+
+local LootSec = ele(FarmTab, "Section", { Title = "Auto Loot (Gears)" })
+ele(LootSec, "Toggle", {
+	Title = "Loot when no enemies",
+	Desc = "Runs with Farm on or off (full hold interaction)",
+	Value = true,
+	Callback = function(v)
+		st.loot = v
+	end,
+})
+ele(LootSec, "Slider", {
+	Title = "Loot range (studs)",
+	Step = 50,
+	Value = { Min = 25, Max = 2000, Default = 1000 },
+	Callback = function(v)
+		st.lootRange = v
+	end,
+})
+ele(LootSec, "Slider", {
+	Title = "Rescan delay (sec)",
+	Step = 5,
+	Value = { Min = 10, Max = 300, Default = 35 },
+	Callback = function(v)
+		st.lootDelay = v / 100
+	end,
+})
+
+local ResetSec = ele(FarmTab, "Section", { Title = "Reset wave" })
+ele(ResetSec, "Toggle", {
+	Title = "Reset on wave",
+	Value = false,
+	Callback = function(v)
+		st.resetWave = v
+		if v then
+			notify("Farm", "reset on wave " .. tostring(st.resetWaveNum), "check", 2)
+		end
+	end,
+})
+ele(ResetSec, "Slider", {
+	Title = "Wave to reset",
+	Step = 1,
+	Value = { Min = 1, Max = 200, Default = 5 },
+	Callback = function(v)
+		st.resetWaveNum = v
+	end,
+})
+
+local GodSec = ele(FarmTab, "Section", { Title = "God mode (forced reset)" })
+local godToggle
+godToggle = ele(GodSec, "Toggle", {
+	Title = "Reset before death",
+	Desc = "Respawns the character when HP drops below the value below",
+	Value = false,
+	Callback = function(v)
+		st.god = v
+		notify("God", v and "auto reset armed" or "auto reset off", v and "check" or "info", 2)
+	end,
+})
+ele(GodSec, "Slider", {
+	Title = "Reset below HP",
+	Desc = "Above your max HP it falls back to half of max HP",
+	Step = 50,
+	Value = { Min = 200, Max = 10000, Default = 800 },
+	Callback = function(v)
+		st.godHP = v
+	end,
+})
+ele(GodSec, "Toggle", {
+	Title = "Skip when timer = 0",
+	Desc = "Resetting on timer 0 bugs the run (guaranteed fail)",
+	Value = true,
+	Callback = function(v)
+		st.godSkipTimer0 = v
+	end,
+})
+
+-- ---------------- Astro ----------------
+local AstroSec = ele(AstroTab, "Section", { Title = "Astro Token Route" })
+local astroToggle
+astroToggle = ele(AstroSec, "Toggle", {
+	Title = "Route enabled",
+	Value = false,
+	Flag = "astro",
+	Callback = function(on)
+		st.astro = on
+		if on then
+			notify("Astro", "route started", "check", 2)
+		else
+			notify("Astro", "route stopped", "info", 2)
+		end
+	end,
+})
+ele(AstroSec, "Keybind", {
+	Title = "Toggle route",
+	Value = "K",
+	Callback = function()
+		local nv = not st.astro
+		st.astro = nv
+		setToggle(astroToggle, nv)
+	end,
+})
+ele(AstroSec, "Slider", {
+	Title = "Fly speed",
+	Step = 10,
+	Value = { Min = 100, Max = 2000, Default = 600 },
+	Callback = function(v)
+		st.astroSpeed = v
+	end,
+})
+ele(AstroSec, "Toggle", {
+	Title = "Heal skill (Buff) at 50% HP",
+	Value = true,
+	Callback = function(v)
+		st.astroHeal = v
+	end,
+})
+ele(AstroSec, "Toggle", {
+	Title = "Reset before death (God mode)",
+	Desc = "Same switch as Farm > God mode: respawns below the HP threshold",
+	Value = false,
+	Callback = function(v)
+		st.god = v
+		setToggle(godToggle, v)
+	end,
+})
+ele(AstroSec, "Slider", {
+	Title = "Reset below HP",
+	Desc = "Shared with Farm > God mode: respawns below this HP",
+	Step = 50,
+	Value = { Min = 200, Max = 10000, Default = 800 },
+	Callback = function(v)
+		st.godHP = v
+	end,
+})
+ele(AstroSec, "Paragraph", {
+	Title = "Recommended characters",
+	Desc = "Best: Mini UTCM, Speaker Strider, Espada.\nAlso good: any character with 2500+ HP.",
+})
+local astroParagraph = ele(AstroSec, "Paragraph", {
+	Title = "Astro Tokens",
+	Desc = "waiting...",
+})
+
+-- live token counter
+task.spawn(function()
+	local base = nil
+	while alive() do
+		task.wait(1)
+		if st.astro then
+			local data = lp:FindFirstChild("_Data")
+			local items = data and data:FindFirstChild("Items")
+			local tok = items and items:FindFirstChild("Astro Token")
+			if tok then
+				local ok, val = pcall(function()
+					return tok.Value
+				end)
+				if ok and val then
+					if base == nil then
+						base = val
+					end
+					local gained = math.floor(val - base)
+					local txt = tostring(val) .. (gained > 0 and (" (+" .. tostring(gained) .. ")") or "")
+					pcall(function()
+						astroParagraph:SetDesc(txt)
+					end)
+				end
+			end
+		end
+	end
+end)
+
+-- ---------------- Lobby ----------------
+local LobbySec = ele(LobbyTab, "Section", { Title = "Auto Lobby (remote)" })
+ele(LobbySec, "Toggle", { Title = "Auto vote", Value = false, Callback = function(v)
+	st.vote = v
+end })
+ele(LobbySec, "Dropdown", {
+	Title = "Vote mode",
+	Values = MODES,
+	Value = idxOf(MODES, "Astro"),
+	Callback = function(v)
+		st.voteMode = v
+	end,
+})
+ele(LobbySec, "Toggle", { Title = "Auto ready", Value = false, Callback = function(v)
+	st.ready = v
+end })
+
+-- ---------------- Mastery ----------------
+local MasterySec = ele(MasteryTab, "Section", { Title = "Mastery path" })
+local masteryToggle
+masteryToggle = ele(MasterySec, "Toggle", {
+	Title = "Auto switch character",
+	Desc = "Switches to the next character when its mastery target is reached",
+	Value = false,
+	Callback = function(v)
+		st.mastery = v
+		table.clear(masterySkipped)
+		if v then
+			notify("Mastery", "path started", "check", 2)
+		end
+	end,
+})
+ele(MasterySec, "Keybind", {
+	Title = "Toggle mastery path",
+	Value = "P",
+	Callback = function()
+		local nv = not st.mastery
+		st.mastery = nv
+		table.clear(masterySkipped)
+		setToggle(masteryToggle, nv)
+		notify("Mastery", nv and "path started" or "path stopped", "info", 2)
+	end,
+})
+ele(MasterySec, "Input", {
+	Title = "Path (Name | target mastery)",
+	Desc = "One per line, missing target uses the default below",
+	Type = "Textarea",
+	Value = st.masteryList,
+	Callback = function(v)
+		st.masteryList = v
+	end,
+})
+ele(MasterySec, "Slider", {
+	Title = "Default target mastery",
+	Step = 5,
+	Value = { Min = 10, Max = 200, Default = 80 },
+	Callback = function(v)
+		st.masteryDefault = v
+	end,
+})
+ele(MasterySec, "Slider", {
+	Title = "Check interval (sec)",
+	Step = 1,
+	Value = { Min = 1, Max = 30, Default = 3 },
+	Callback = function(v)
+		st.masteryDelay = v
+	end,
+})
+
+-- ---------------- Gacha ----------------
+local GachaSec = ele(GachaTab, "Section", { Title = "Auto Gacha" })
+local gachaToggle
+gachaToggle = ele(GachaSec, "Toggle", {
+	Title = "Gacha enabled",
+	Value = false,
+	Flag = "gacha",
+	Callback = function(on)
+		st.gacha = on
+		if on then
+			notify("Gacha", "enabled", "check", 2)
+		else
+			notify("Gacha", "disabled", "info", 2)
+		end
+	end,
+})
+ele(GachaSec, "Keybind", {
+	Title = "Toggle gacha",
+	Value = "L",
+	Callback = function()
+		local nv = not st.gacha
+		st.gacha = nv
+		setToggle(gachaToggle, nv)
+	end,
+})
+ele(GachaSec, "Toggle", { Title = "Auto-open gacha", Value = false, Callback = function(v)
+	st.gachaAuto = v
+end })
+ele(GachaSec, "Dropdown", {
+	Title = "Page",
+	Values = { "Characters", "Skins" },
+	Value = 1,
+	Callback = function(v)
+		st.gachaType = (v == "Skins") and "GachaSkins" or "GachaCharacter"
+	end,
+})
+ele(GachaSec, "Dropdown", {
+	Title = "Spin",
+	Values = { "1Spin", "10Spins", "100Spins", "1SpinLucky", "10SpinLucky" },
+	Value = idxOf({ "1Spin", "10Spins", "100Spins", "1SpinLucky", "10SpinLucky" }, "100Spins"),
+	Callback = function(v)
+		st.gachaSpin = v
+	end,
+})
+ele(GachaSec, "Slider", {
+	Title = "Interval",
+	Step = 0.05,
+	Value = { Min = 0.05, Max = 5, Default = 0.5 },
+	Callback = function(v)
+		st.gachaInterval = v
+	end,
+})
+ele(GachaSec, "Slider", {
+	Title = "Max spins (0 = unlimited)",
+	Step = 1,
+	Value = { Min = 0, Max = 1000, Default = 0 },
+	Callback = function(v)
+		st.gachaMax = v
+	end,
+})
+
+-- ---------------- Settings ----------------
+local SetSec = ele(SettingsTab, "Section", { Title = "Appearance" })
+ele(SetSec, "Keybind", {
+	Title = "UI toggle key",
+	Value = "M",
+	Callback = function(v)
+		local ok = pcall(function()
+			Window:SetToggleKey(Enum.KeyCode[v])
+		end)
+		if not ok then
+			warn("[RATHUB] bad key: " .. tostring(v))
+		end
+	end,
+})
+ele(SetSec, "Slider", {
+	Title = "Scale",
+	Step = 5,
+	Value = { Min = 70, Max = 130, Default = 100 },
+	Callback = function(v)
+		pcall(function()
+			Window:SetUIScale(v / 100)
+		end)
+	end,
+})
+ele(SetSec, "Toggle", {
+	Title = "Panel background",
+	Value = true,
+	Callback = function(on)
+		pcall(function()
+			Window:SetPanelBackground(on)
+		end)
+	end,
+})
+
+local AfkSec = ele(SettingsTab, "Section", { Title = "Anti AFK" })
+ele(AfkSec, "Toggle", {
+	Title = "Anti AFK",
+	Desc = "Clears the idle state with VirtualUser (fires on Player.Idled)",
+	Value = true,
+	Callback = function(v)
+		st.antiAfk = v
+		if v then
+			notify("Anti-AFK", "enabled", "check", 2)
+		end
+	end,
+})
+
+local HookSec = ele(SettingsTab, "Section", { Title = "Webhook (Discord)" })
+ele(HookSec, "Input", {
+	Title = "Webhook URL",
+	Desc = "https://discord.com/api/webhooks/...",
+	Value = st.webhookUrl,
+	Callback = function(v)
+		st.webhookUrl = v
+	end,
+})
+ele(HookSec, "Toggle", {
+	Title = "Send status periodically",
+	Desc = "Character, wave, HP, money and inventory",
+	Value = false,
+	Callback = function(v)
+		st.webhook = v
+		if v then
+			notify("Webhook", "status sender enabled", "check", 2)
+		end
+	end,
+})
+ele(HookSec, "Slider", {
+	Title = "Interval (sec)",
+	Step = 5,
+	Value = { Min = 10, Max = 600, Default = 60 },
+	Callback = function(v)
+		st.webhookDelay = v
+	end,
+})
+ele(HookSec, "Button", {
+	Title = "Send now",
+	Color = Color3.fromHex("#4f8cff"),
+	Callback = function()
+		task.spawn(function()
+			if sendWebhook then
+				sendWebhook(false)
+			end
+		end)
+	end,
+})
+
+local actionsSec = ele(SettingsTab, "Section", { Title = "Actions" })
+ele(actionsSec, "Button", {
+	Title = "Destroy UI",
+	Color = Color3.fromHex("#ff4830"),
+	Callback = function()
+		if _G.__RATHUB_REG and _G.__RATHUB_REG.stop then
+			pcall(_G.__RATHUB_REG.stop)
+		end
+	end,
+})
+
+pcall(function()
+	Window:SelectTab(1)
+end)
+
+-- ============================================================
+-- LOBBY: vote + ready via remotes only
+-- ============================================================
+local VOTE_PAGES = {
+	{ "Normal", "Hard", "VeryHard", "Insane", "Nightmare" },
+	{ "BossRush", "ThunderStorm", "Zombie", "Christmas", "Hell" },
+	{ "DarkDimension", "Astro", "AstroV2", "ZombieV2" },
+}
+local VOTE_MODE_SET = {}
+for _, pg in ipairs(VOTE_PAGES) do
+	for _, m in ipairs(pg) do
+		VOTE_MODE_SET[m] = true
+	end
+end
+VOTE_MODE_SET["NoLightInTheSky"] = true
+VOTE_MODE_SET["Custom"] = true
+VOTE_MODE_SET["100MVisit"] = true
+
+local function voteRemote()
+	return rs:FindFirstChild("Vote")
+end
+local function readyRemote()
+	return rs:FindFirstChild("GetReadyRemote")
+end
+local function autoReadyZone()
+	return ws:FindFirstChild("AutoReady")
+end
+
+local function currentVote()
+	local v = ws:FindFirstChild("Vote")
+	if not v then
+		return nil
+	end
+	for _, mode in ipairs(v:GetChildren()) do
+		if VOTE_MODE_SET[mode.Name] and #mode:GetChildren() > 0 then
+			return mode.Name
+		end
+	end
+	return nil
+end
+
+local function fireVote(mode)
+	local r = voteRemote()
+	if not r then
+		return false
+	end
+	return (pcall(function()
+		r:FireServer(mode)
+	end))
+end
+
+local function chooseSlot()
+	local slot = st.readySlot
+	if slot == "Auto" then
+		slot = nil
+		local cg = lp.PlayerGui and lp.PlayerGui:FindFirstChild("ChrGUI")
+		if cg then
+			for i = 1, 3 do
+				local bv = cg:FindFirstChild("GetReady" .. i)
+				if bv then
+					local ok, v = pcall(function()
+						return bv.Value
+					end)
+					if ok and v == true then
+						slot = tostring(i)
+					end
+				end
+			end
+		end
+		if not slot then
+			slot = "3"
+		end
+	end
+	return slot
+end
+
+local function fireReady()
+	local r = readyRemote()
+	if not r then
+		return false
+	end
+	local slot = chooseSlot()
+	return (pcall(function()
+		r:FireServer(slot, true)
+	end))
+end
+
+local function isNotReady()
+	local pg = lp.PlayerGui
+	local sc = pg and pg:FindFirstChild("SelectCharacter")
+	local main = sc and sc:FindFirstChild("Main")
+	local l = main and main:FindFirstChild("JustText3")
+	if not l then
+		return nil
+	end
+	local ok, t = pcall(function()
+		return l.Text
+	end)
+	if not ok or not t then
+		return nil
+	end
+	return t:lower():find("not ready", 1, true) ~= nil
+end
+
+local function hoverReadyZone()
+	local root = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+	local ar = autoReadyZone()
+	if not root or not ar then
+		return false
+	end
+	local p = ar.Position
+	local s = ar.Size
+	root.CFrame = CFrame.new(p.X, p.Y + s.Y / 2, p.Z)
+	return true
+end
+
+task.spawn(function()
+	local lastVote = 0
+	local lastReady = 0
+	local lastReadyFire = 0
+	local votedPhase = false
+	local phaseStart = 0
+	local lastErr = 0
+	local READY_VOTE_DELAY = 10
+
+	while alive() do
+		task.wait(0.4)
+		if st.vote or st.ready then
+			local t = now()
+			local ok, err = pcall(function()
+				local votingNow = ws:FindFirstChild("Voteing") and ws.Voteing.Value == true
+				local wave = ws:FindFirstChild("Wave") and ws.Wave.Value or 0
+
+				if votingNow then
+					if phaseStart == 0 then
+						phaseStart = t
+					end
+				else
+					phaseStart = 0
+					votedPhase = false
+				end
+				if wave > 0 then
+					votedPhase = false
+				end
+
+				-- VOTE (remote)
+				if st.vote and votingNow then
+					local mine = currentVote()
+					if mine == st.voteMode then
+						votedPhase = true
+					elseif not votedPhase or (t - lastVote > 20) then
+						lastVote = t
+						if fireVote(st.voteMode) then
+							votedPhase = true
+							notify("Lobby", "voted " .. st.voteMode, "check", 2)
+							print("[rathub] voted " .. st.voteMode)
+						else
+							notify("Lobby", "vote remote failed", "triangle-alert", 2)
+						end
+					end
+				end
+
+				-- READY (remote)
+				local readyBlocked = votingNow and not votedPhase
+				if (votingNow or (ws:FindFirstChild("OpenVoteUI") ~= nil)) and phaseStart > 0 then
+					if (t - phaseStart) < READY_VOTE_DELAY and not votedPhase then
+						readyBlocked = true
+					end
+				end
+				if st.ready and not readyBlocked and wave == 0 then
+					local nr = isNotReady()
+					if nr ~= false then
+						if st.readyHover and t - lastReady > 1.5 then
+							lastReady = t
+							hoverReadyZone()
+						end
+						if t - lastReadyFire > 2 then
+							lastReadyFire = t
+							if fireReady() then
+								print("[rathub] ready sent (slot " .. tostring(chooseSlot()) .. ")")
+							end
+						end
+					end
+				end
+			end)
+			if not ok and t - lastErr > 5 then
+				lastErr = t
+				print("[rathub-lobby] " .. tostring(err))
+			end
+		end
+	end
+end)
+
+-- ============================================================
+-- SHOP HEAL (remote: ShopSystem "Buy" / "FillHP")
+-- ============================================================
+local function canUseShop()
+	local cus = ws:FindFirstChild("CanUseShop")
+	if not cus then
+		return false
+	end
+	local ok, v = pcall(function()
+		return cus.Value
+	end)
+	return ok and v == true
+end
+
+local ShopRem
+local function shopRemote()
+	if not ShopRem or not ShopRem.Parent then
+		ShopRem = rs:FindFirstChild("ShopSystem")
+	end
+	return ShopRem
+end
+
+local function buyFillHP()
+	local rem = shopRemote()
+	if not rem then
+		return false
+	end
+	local ok = pcall(function()
+		rem:FireServer("Buy", "FillHP")
+	end)
+	return ok
+end
+
+local function hpNow()
+	local hum = lp.Character and lp.Character:FindFirstChild("Humanoid")
+	return hum and hum.Health or 0
+end
+
+-- The shop window (workspace.CanUseShop) opens for a short time while the
+-- helicopter is at the pad, so Buy/FillHP is spammed for the whole attempt
+-- instead of a few quick shots: the buy lands the moment the window opens.
+-- No teleport: the character stays wherever the farm left it.
+local function doHeal()
+	if not shopRemote() then
+		print("[rathub-heal] ReplicatedStorage.ShopSystem missing")
+		return false
+	end
+	local before = hpNow()
+	local t0 = now()
+	local shots = 0
+	local limit = math.max(tonumber(st.healTry) or 12, 3)
+	while alive() and now() - t0 < limit do
+		if buyFillHP() then
+			shots = shots + 1
+		end
+		task.wait(0.18)
+		local hp = hpNow()
+		if hp > before + 1 then
+			print(string.format("[rathub-heal] healed %d -> %d (%d shots, %.1fs)", before, hp, shots, now() - t0))
+			return true
+		end
+	end
+	print(string.format("[rathub-heal] no heal after %d shots (%.0fs, CanUseShop=%s)", shots, now() - t0, tostring(canUseShop())))
+	return false
+end
+
+task.spawn(function()
+	while alive() do
+		task.wait(0.5)
+		if st.heal and st.farm then
+			local t = now()
+			local hum = lp.Character and lp.Character:FindFirstChild("Humanoid")
+			if hum then
+				local hp, mx = hum.Health, hum.MaxHealth
+				local needHeal = healRequested or (mx > 0 and hp / mx * 100 < st.healHP)
+				if needHeal and not isHealing and t - lastHealT > 4 then
+					isHealing = true
+					local okH = doHeal()
+					isHealing = false
+					healRequested = false
+					if okH then
+						lastHealT = now()
+						notify("Farm", "healed at shop", "check", 2)
+					else
+						lastHealT = now() + 15
+						print("[rathub-heal] failed, cooldown 15s")
+					end
+				end
+			end
+		end
+	end
+end)
+
+-- ============================================================
+-- M1 (remote)
+-- ============================================================
+local function fireLMB()
+	pcall(function()
+		rs.LMB:FireServer()
+	end)
+end
+
+task.spawn(function()
+	while alive() do
+		task.wait(0.05)
+		if st.m1Spam and st.farm then
+			fireLMB()
+		end
+	end
+end)
+
+-- ============================================================
+-- REMOTE SKILLS
+-- ============================================================
+task.spawn(function()
+	local lastErr = 0
+	while alive() do
+		task.wait(st.skillDelay)
+		if st.farm and st.skills then
+			local t = now()
+			local ok, err = pcall(function()
+				if st.skillOrbitOnly and not isOrbiting then
+					return
+				end
+				local char = lp.Character
+				local cdf = char and char:FindFirstChild("CooldownFolder")
+				if not cdf then
+					return
+				end
+				local am1 = cdf:FindFirstChild("ActiveM1")
+				local busy = (st.skillBusy and am1 and am1.Value == true) and true or false
+				local wave = ws:FindFirstChild("Wave") and ws.Wave.Value or 0
+				runSkillList(parseSkillList(st.skillCombatList), char, cdf, busy)
+				if waveInList(wave) then
+					runSkillList(parseSkillList(st.skillWaveList), char, cdf, busy)
+				end
+			end)
+			if not ok and t - lastErr > 5 then
+				lastErr = t
+				print("[rathub-skills] " .. tostring(err))
+			end
+		end
+	end
+end)
+
+-- ============================================================
+-- GACHA
+-- ============================================================
+task.spawn(function()
+	local opened = 0
+	local lastErr = 0
+	while alive() do
+		task.wait(st.gachaInterval)
+		if st.gacha and st.gachaAuto then
+			local t = now()
+			local rem = rs:FindFirstChild(st.gachaType)
+			if rem then
+				local ok, err = pcall(function()
+					rem:FireServer(st.gachaSpin)
+				end)
+				if ok then
+					opened = opened + 1
+					if st.gachaMax > 0 and opened >= st.gachaMax then
+						st.gachaAuto = false
+						notify("Gacha", "limit reached: " .. opened, "check", 3)
+					end
+				elseif t - lastErr > 5 then
+					lastErr = t
+					print("[rathub-gacha] " .. tostring(err))
+				end
+			end
+		end
+	end
+end)
+
+-- ============================================================
+-- ENEMY SCANNER
+-- ============================================================
+local playerNames = {}
+
+local function refreshPlayerNames()
+	local out = {}
+	local ok, pls = pcall(function()
+		return Players:GetPlayers()
+	end)
+	if ok then
+		for _, p in ipairs(pls) do
+			local ok2, nm = pcall(function()
+				return p.Name
+			end)
+			if ok2 and nm then
+				out[nm] = true
+			end
+		end
+	end
+	out[lp.Name] = true
+	playerNames = out
+end
+
+local function isPlayer(m)
+	return playerNames[m.Name] == true
+end
+
+local function isAllyName(n)
+	local low = n:lower()
+	for _, p in ipairs(splitList(st.allyList)) do
+		if low:find(p, 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+local function scanMobs(hrp)
+	local living = ws:FindFirstChild("Living")
+	if not living then
+		return {}
+	end
+	local out = {}
+	local ok, children = pcall(function()
+		return living:GetChildren()
+	end)
+	if not ok then
+		return {}
+	end
+	for _, v in ipairs(children) do
+		if v.ClassName == "Model" and not isPlayer(v) and not v:FindFirstChild("GoodAI") and not isAllyName(v.Name) then
+			local hum = v:FindFirstChildOfClass("Humanoid")
+			local mhrp = v:FindFirstChild("HumanoidRootPart") or v:FindFirstChild("RootPart") or v:FindFirstChildWhichIsA("BasePart")
+			local hp, mx = 0, 1
+			local healthSeen = false
+			if hum then
+				healthSeen = true
+				pcall(function()
+					hp = hum.Health or 0
+				end)
+				pcall(function()
+					mx = hum.MaxHealth or 1
+				end)
+			else
+				for _, c in ipairs(v:GetChildren()) do
+					if c.ClassName == "NumberValue" then
+						local cn = c.Name:lower()
+						if cn:find("health", 1, true) or cn:find("hp", 1, true) then
+							pcall(function()
+								hp = c.Value or 0
+							end)
+							mx = hp
+							healthSeen = true
+						end
+					end
+				end
+			end
+			local noHealthEnemy = not healthSeen
+				and (v.Name:lower():find("toilet", 1, true) ~= nil or v:FindFirstChild("Fake Head") ~= nil)
+			if mhrp and ((healthSeen and hp > 0) or noHealthEnemy) then
+				out[#out + 1] = {
+					mob = v,
+					name = v.Name,
+					root = mhrp,
+					fake = v:FindFirstChild("Fake Head"),
+					pos = mhrp.Position,
+					hp = hp,
+					mx = mx,
+					dist = (mhrp.Position - hrp.Position).Magnitude,
+				}
+			end
+		end
+	end
+	return out
+end
+
+local function isPriorityName(name)
+	local prio = splitList(st.priority)
+	if #prio == 0 then
+		return false
+	end
+	local low = name:lower()
+	for i = 1, #prio do
+		if low:find(prio[i], 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+local function pickTarget(list)
+	if #list == 0 then
+		return nil
+	end
+	local prio = splitList(st.priority)
+	if #prio > 0 then
+		local best = nil
+		for _, m in ipairs(list) do
+			local low = m.name:lower()
+			for i = 1, #prio do
+				if low:find(prio[i], 1, true) then
+					if not best or m.dist < best.dist then
+						best = m
+					end
+					break
+				end
+			end
+		end
+		if best then
+			return best
+		end
+	end
+	local best = nil
+	local mode = st.mode
+	for _, m in ipairs(list) do
+		local better
+		if mode == "Nearest" then
+			better = not best or m.dist < best.dist
+		elseif mode == "Lowest HP" then
+			better = not best or (m.hp / m.mx) < (best.hp / best.mx)
+		else
+			better = not best or (m.hp / m.mx) > (best.hp / best.mx)
+		end
+		if better then
+			best = m
+		end
+	end
+	return best
+end
+
+-- ============================================================
+-- AUTO LOOT (Gears templates spawn in workspace with a ProximityPrompt)
+-- ============================================================
+local RF = game:GetService("ReplicatedFirst")
+local VIM
+pcall(function()
+	VIM = game:GetService("VirtualInputManager")
+end)
+local gearKeys = {}
+
+-- spawned gears do not always carry the exact template name
+-- ("Flash Drive" vs "Flash Drive #2"), so match on letters/digits only
+local function normKey(s)
+	return tostring(s):lower():gsub("[^%a%d]+", "")
+end
+
+-- used when ReplicatedFirst.Gears is not there (or empty)
+local GEAR_FALLBACK = {
+	"BlackGear", "BlueGear", "GreenGear", "RedGear", "WhiteGear",
+	"PurpleGear", "YellowGear", "OrangeGear", "Flash Drive",
+}
+
+local function refreshGearNames()
+	table.clear(gearKeys)
+	for _, n in ipairs(GEAR_FALLBACK) do
+		local k = normKey(n)
+		if #k >= 3 then
+			gearKeys[k] = true
+		end
+	end
+	for _, folderName in ipairs({ "Gears", "Gear" }) do
+		local g = RF:FindFirstChild(folderName) or game:GetService("ReplicatedStorage"):FindFirstChild(folderName)
+		if g then
+			for _, c in ipairs(g:GetChildren()) do
+				local k = normKey(c.Name)
+				if #k >= 3 then
+					gearKeys[k] = true
+				end
+			end
+		end
+	end
+end
+refreshGearNames()
+
+local function isGearName(name)
+	local nk = normKey(name)
+	if #nk < 3 then
+		return false
+	end
+	if gearKeys[nk] then
+		return true
+	end
+	for gk in pairs(gearKeys) do
+		if nk:find(gk, 1, true) or gk:find(nk, 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+local function itemPrompt(item)
+	if item:IsA("ProximityPrompt") then
+		return item
+	end
+	local ok, p = pcall(function()
+		return item:FindFirstChildWhichIsA("ProximityPrompt", true)
+	end)
+	if ok then
+		return p
+	end
+	return nil
+end
+
+local function itemPos(item)
+	local ok, pos = pcall(function()
+		if item:IsA("BasePart") then
+			return item.Position
+		end
+		return item:GetPivot().Position
+	end)
+	if ok and type(pos) == "Vector3" then
+		return pos
+	end
+	local pr = itemPrompt(item)
+	if pr and pr.Parent then
+		local par = pr.Parent
+		if par:IsA("BasePart") then
+			return par.Position
+		elseif par:IsA("Model") then
+			local ok2, p2 = pcall(function()
+				return par:GetPivot().Position
+			end)
+			if ok2 then
+				return p2
+			end
+		end
+	end
+	return nil
+end
+
+-- gears can be nested anywhere under workspace (even under a BasePart), so
+-- scan for the prompt itself and for gear-named instances. Bounded by node
+-- count + time; a partial scan is merged into the cache instead of dropping
+-- targets, and only a complete scan replaces it.
+local LOOT_SCAN_NODES = 40000
+local LOOT_SCAN_TIME = 0.025
+
+local lootCache = {}
+local lootScanRound = 0
+
+local function promptPos(pr)
+	local par = pr.Parent
+	if not par then
+		return nil
+	end
+	if par:IsA("BasePart") then
+		return par.Position
+	end
+	if par:IsA("Attachment") then
+		local ok, p = pcall(function()
+			return par.WorldPosition
+		end)
+		if ok then
+			return p
+		end
+	end
+	return itemPos(par)
+end
+
+local function promptOwner(pr)
+	local p = pr
+	for _ = 1, 6 do
+		p = p.Parent
+		if not p or p == ws then
+			break
+		end
+		if isGearName(p.Name) then
+			return p
+		end
+	end
+	return nil
+end
+
+-- simple full scan: no cache / rotation / time budget (old behaviour)
+local function listLoot(hrp)
+	if next(gearKeys) == nil then
+		refreshGearNames()
+	end
+	local ppos = hrp.Position
+	local nodes = LOOT_SCAN_NODES
+	local deadline = os.clock() + LOOT_SCAN_TIME
+	local complete = true
+	local found = {}
+	local seen = {}
+
+	local function consider(inst, pr)
+		if seen[inst] then
+			return
+		end
+		seen[inst] = true
+		if not (pr and pr.Parent and pr.Enabled) then
+			return
+		end
+		local pos = promptPos(pr) or itemPos(inst)
+		if not pos then
+			return
+		end
+		found[inst] = { inst = inst, prompt = pr, pos = pos, dist = (ppos - pos).Magnitude }
+	end
+
+	local function walk(container, rotate)
+		local kids = container:GetChildren()
+		local n = #kids
+		local first = 1
+		if rotate and n > 1 then
+			lootScanRound = lootScanRound + 1
+			first = (lootScanRound % n) + 1
+		end
+		for i = 1, n do
+			if not complete then
+				return
+			end
+			local idx = first + i - 1
+			if idx > n then
+				idx = idx - n
+			end
+			local w = kids[idx]
+			if nodes <= 0 or os.clock() > deadline then
+				complete = false
+				return
+			end
+			nodes = nodes - 1
+			if w:IsA("ProximityPrompt") then
+				local owner = promptOwner(w)
+				if owner then
+					consider(owner, w)
+				end
+			elseif isGearName(w.Name) then
+				local pr = itemPrompt(w)
+				if pr then
+					consider(w, pr)
+				end
+			end
+			if not w:IsA("ProximityPrompt") and #w:GetChildren() > 0 then
+				walk(w, false)
+			end
+		end
+	end
+	walk(ws, true)
+
+	-- keep entries found by earlier (partial) scans while they still exist
+	for inst, e in pairs(lootCache) do
+		if not found[inst] and inst.Parent and e.prompt and e.prompt.Parent then
+			local pos = promptPos(e.prompt) or itemPos(inst)
+			if pos then
+				found[inst] = { inst = inst, prompt = e.prompt, pos = pos, dist = (ppos - pos).Magnitude }
+			end
+		end
+	end
+	lootCache = found
+
+	local out = {}
+	for _, e in pairs(found) do
+		out[#out + 1] = e
+	end
+	table.sort(out, function(a, b)
+		return a.dist < b.dist
+	end)
+	return out
+end
+
+local function pressE(hold, prompt)
+	local usedVIM = false
+	if VIM then
+		usedVIM = pcall(function()
+			VIM:SendKeyEvent(true, Enum.KeyCode.E, false, lp)
+		end)
+	end
+	-- mobile executors (Delta/Android): VIM keycodes often do nothing;
+	-- drive the ProximityPrompt itself, which works everywhere
+	if not usedVIM and prompt then
+		pcall(function()
+			prompt:InputHoldBegin()
+		end)
+	end
+	task.wait(math.max(hold or 0.2, 0.15))
+	if usedVIM then
+		pcall(function()
+			VIM:SendKeyEvent(false, Enum.KeyCode.E, false, lp)
+		end)
+	elseif prompt then
+		pcall(function()
+			prompt:InputHoldEnd()
+		end)
+	end
+	task.wait(0.25)
+end
+
+local lootBusy = false
+local lootTarget = nil
+local lootLastT = 0
+
+local function lootPick(entry, hrp)
+	if lootBusy then
+		return
+	end
+	lootBusy = true
+	task.spawn(function()
+		local inst, pr = entry.inst, entry.prompt
+		local ok, err = pcall(function()
+			if not (inst and inst.Parent and pr and pr.Parent) then
+				return
+			end
+			local oldHold = pr.HoldDuration or 0
+			pcall(function()
+				pr.RequiresLineOfSight = false
+			end)
+			for attempt = 1, 3 do
+				if not st.loot then
+					break
+				end
+				if not (inst.Parent and pr.Parent) then
+					break
+				end
+				if st.farm and #scanMobs(hrp) > 0 then
+					break
+				end
+				local pos = promptPos(pr) or itemPos(inst)
+				if not pos then
+					break
+				end
+				local maxD = pr.MaxActivationDistance or 10
+				if (hrp.Position - pos).Magnitude > maxD then
+					-- drifted out of range: stop, lootStep will walk back in
+					break
+				end
+				pressE(oldHold + 0.8, pr)
+				task.wait(0.3)
+			end
+		end)
+		if not ok then
+			print("[rathub-loot] error: " .. tostring(err))
+		end
+		lootBusy = false
+		lootTarget = nil
+		lootLastT = (inst and inst.Parent) and (now() + 1.0) or now()
+	end)
+end
+
+local function lootRefresh(hrp)
+	lootLastT = now()
+	local range = st.lootRange
+	for _, e in ipairs(listLoot(hrp)) do
+		if e.dist <= range then
+			lootTarget = e
+			return true
+		end
+	end
+	lootTarget = nil
+	return false
+end
+
+local function lootStep(hrp, dt)
+	if not st.loot then
+		lootTarget = nil
+		return false
+	end
+	local pr = lootTarget and lootTarget.prompt
+	if lootBusy then
+		local pos = lootTarget and (promptPos(lootTarget.prompt) or itemPos(lootTarget.inst))
+		if pos then
+			setPosFacing(hrp, pos, pos)
+			return true
+		end
+		return false
+	end
+	if not lootTarget or not (pr and pr.Parent and pr.Enabled) then
+		lootTarget = nil
+		pr = nil
+	end
+	local pos = lootTarget and (promptPos(pr) or itemPos(lootTarget.inst))
+	if lootTarget and pos then
+		lootTarget.pos = pos
+	end
+	if not pos then
+		if now() - lootLastT < st.lootDelay then
+			return false
+		end
+		if not lootRefresh(hrp) then
+			return false
+		end
+		pr = lootTarget.prompt
+		pos = lootTarget.pos
+	end
+	local maxD = (pr and pr.MaxActivationDistance) or 10
+	local standDist = math.min(3, math.max(maxD - 2, 1))
+	if (hrp.Position - pos).Magnitude > standDist then
+		moveToward(hrp, pos, pos, dt)
+		return true
+	end
+	setPosFacing(hrp, pos, pos)
+	lootPick(lootTarget, hrp)
+	return true
+end
+
+-- ============================================================
+-- FARM MAIN LOOP
+-- ============================================================
+local lastNamesT = 0
+local lastScanT = 0
+local lastLmbT = 0
+local lastErrT = 0
+
+RunService.Heartbeat:Connect(function(dt)
+	if not alive() or not (st.farm or st.loot) then
+		return
+	end
+	local ok, err = pcall(function()
+		local char = lp.Character
+		local hrp = char and char:FindFirstChild("HumanoidRootPart")
+		if not hrp then
+			return
+		end
+		if hrp ~= lastHrp then
+			lastHrp = hrp
+			angleInit = false
+		end
+
+		if godBusy then
+			return
+		end
+
+		-- the astro route owns the character: nothing else may write CFrame
+		-- (loot/idle movement here would fight the route and cause the bounce)
+		if st.astro then
+			return
+		end
+
+		-- loot can run on its own (farm off): only pick gears up
+		if not st.farm then
+			lootStep(hrp, dt)
+			return
+		end
+
+		local wave = ws:FindFirstChild("Wave") and ws.Wave.Value or 0
+		if st.resetWave then
+			if wave == st.resetWaveNum and not resetDone then
+				hrp.CFrame = CFrame.new(hrp.Position.X, -175, hrp.Position.Z)
+				resetDone = true
+				print("[rathub] reset: under map (wave " .. tostring(wave) .. ")")
+				return
+			elseif wave ~= st.resetWaveNum then
+				resetDone = false
+			end
+		end
+
+		local t = now()
+		if t - lastNamesT >= 1 then
+			lastNamesT = t
+			refreshPlayerNames()
+		end
+		if t - lastScanT >= 0.5 then
+			lastScanT = t
+			mobs = scanMobs(hrp)
+		end
+
+		local target = pickTarget(mobs)
+		if not target then
+			currentTarget = nil
+			isOrbiting = false
+			if lootStep(hrp, dt) then
+				-- looting owns movement
+			elseif zoneGoal then
+				if moveToward(hrp, zoneGoal, zoneGoal, dt) then
+					zoneGoal = nil
+				end
+			elseif st.idleVec and wave > 0 then
+				moveToward(hrp, st.idleVec, st.idleVec, dt)
+			end
+			return
+		end
+		if not currentTarget or currentTarget.mob ~= target.mob then
+			currentTarget = target
+			angleInit = false
+			if isPriorityName(target.name) then
+				notify("Farm", "target: " .. target.name, "crosshair", 2)
+			end
+		end
+
+		if st.m1 and t - lastLmbT >= 0.1 then
+			lastLmbT = t
+			local cdf = lp.Character and lp.Character:FindFirstChild("CooldownFolder")
+			local am1 = cdf and cdf:FindFirstChild("ActiveM1")
+			local lb = cdf and cdf:FindFirstChild("LMBActive")
+			if not ((am1 and am1.Value == true) or (lb and lb.Value == true)) then
+				fireLMB()
+			end
+		end
+
+		local tpos
+		pcall(function()
+			tpos = target.root.Position
+		end)
+		if not tpos then
+			tpos = target.pos
+		end
+		target.pos = tpos
+		local ppos = hrp.Position
+		local flatT = Vector3.new(tpos.X, ppos.Y, tpos.Z)
+		local dist = (flatT - ppos).Magnitude
+
+		local fakeBoss = (st.fakeBoss and st.fakeBoss ~= "") and st.fakeBoss:lower() or nil
+		local isCargo = fakeBoss ~= nil and target.name:lower():find(fakeBoss, 1, true) ~= nil
+		if isCargo and target.fake and target.fake.Parent then
+			local fpos = target.fake.Position
+			local flatH = Vector3.new(fpos.X, ppos.Y, fpos.Z)
+			local fDist = (flatH - ppos).Magnitude
+			if fDist > st.radius + 3 then
+				isOrbiting = false
+				if math.abs(ppos.Y - fpos.Y) > 2 then
+					moveToward(hrp, Vector3.new(ppos.X, fpos.Y, ppos.Z), fpos, dt)
+				else
+					local dir = (ppos - flatH).Unit
+					local goal = flatH + dir * st.radius
+					moveToward(hrp, Vector3.new(goal.X, fpos.Y, goal.Z), fpos, dt)
+				end
+			else
+				isOrbiting = true
+				if not angleInit then
+					local off = ppos - fpos
+					angle = math.atan2(off.Z, off.X)
+					angleInit = true
+				end
+				angle = angle + math.rad(st.orbitDeg) * dt
+				local orb = fpos + Vector3.new(math.cos(angle) * st.radius, 0, math.sin(angle) * st.radius)
+				setPosFacing(hrp, Vector3.new(orb.X, fpos.Y, orb.Z), fpos)
+			end
+		elseif st.orbit then
+			if dist > st.radius + 3 then
+				isOrbiting = false
+				local dir = (ppos - flatT).Unit
+				local goal = flatT + dir * st.radius
+				goal = Vector3.new(goal.X, tpos.Y, goal.Z)
+				if st.tween then
+					moveToward(hrp, goal, tpos, dt)
+				else
+					setPosFacing(hrp, goal, tpos)
+				end
+			else
+				isOrbiting = true
+				if not angleInit then
+					local off = ppos - tpos
+					angle = math.atan2(off.Z, off.X)
+					angleInit = true
+				end
+				angle = angle + math.rad(st.orbitDeg) * dt
+				local orb = tpos + Vector3.new(math.cos(angle) * st.radius, 0, math.sin(angle) * st.radius)
+				setPosFacing(hrp, Vector3.new(orb.X, tpos.Y, orb.Z), tpos)
+			end
+		elseif st.tween and dist > 6 then
+			isOrbiting = false
+			moveToward(hrp, tpos, tpos, dt)
+		else
+			isOrbiting = false
+		end
+	end)
+	if not ok then
+		local t = now()
+		if t - lastErrT > 5 then
+			lastErrT = t
+			print("[rathub-farm] " .. tostring(err))
+		end
+	end
+end)
+
+-- ============================================================
+-- ASTRO ROUTE
+-- ============================================================
+local ASTRO_POINTS = {
+	Vector3.new(-646.6834106445312, 276.7692565917969, 453.2442321777344),
+	Vector3.new(472.2657470703125, 263.6273193359375, 473.229736328125),
+	Vector3.new(476.88702392578125, 232.55911254882812, -487.9678955078125),
+	Vector3.new(-617.1134033203125, 235.73419189453125, -504.64910888671875),
+	Vector3.new(-90.46699523925781, 202.52032470703125, -60.813568115234375),
+	Vector3.new(173.809814453125, 120.79937744140625, 157.86643981933594),
+	Vector3.new(244.82159423828125, 156.243896484375, -249.98114013671875),
+	Vector3.new(-270.1070861816406, 179.34710693359375, -278.6469421386719),
+	Vector3.new(-293.5099182128906, 174.0532684326172, 122.78317260742188),
+}
+
+-- movement runs on Heartbeat (once per rendered frame) with a dt-based step:
+-- the old 0.05s timer wrote the position less often than physics pulled the
+-- character down, which showed up as the up/down bounce at every waypoint
+local idx = 1
+local teleported = false
+local lastHeal = 0
+local lastErrA = 0
+
+RunService.Heartbeat:Connect(function(dt)
+	if not alive() or not st.astro then
+		return
+	end
+	local t = now()
+	local ok, err = pcall(function()
+		local char = lp.Character
+		local hrp = char and char:FindFirstChild("HumanoidRootPart")
+		if not hrp then
+			return
+		end
+		if godBusy then
+			return
+		end
+
+		local tw = ws:FindFirstChild("TimerWave")
+		local timeLeft = tw and tw.Value or -1
+		local wave = ws:FindFirstChild("Wave") and ws.Wave.Value or 0
+		if wave <= 0 then
+			return
+		end
+
+		if teleported then
+			if timeLeft > 100 then
+				teleported = false
+				idx = 1
+				print("[rathub] new round, flying again")
+			end
+			return
+		end
+
+		if timeLeft <= 0 then
+			local goal = st.idleVec
+			if goal then
+				setPosFacing(hrp, goal, goal)
+				print("[rathub] timer 0, teleported to circle")
+				notify("Astro", "timer 0: standing on circle", "check", 3)
+			end
+			teleported = true
+			return
+		end
+
+		if st.astroHeal and t - lastHeal > 1 then
+			local hum = char:FindFirstChild("Humanoid")
+			if hum then
+				local hp, mx = hum.Health, hum.MaxHealth
+				if mx > 0 and hp / mx <= 0.5 then
+					local okB = pcall(function()
+						rs.Buff:FireServer()
+					end)
+					if not okB then
+						pcall(function()
+							VIM:SendKeyEvent(true, Enum.KeyCode.Y, false, lp)
+						end)
+						task.wait(0.05)
+						pcall(function()
+							VIM:SendKeyEvent(false, Enum.KeyCode.Y, false, lp)
+						end)
+					end
+					lastHeal = t
+					print("[rathub] astro heal, hp " .. math.floor(hp) .. "/" .. math.floor(mx))
+				end
+			end
+		end
+
+		local goal = ASTRO_POINTS[idx]
+		local pos = hrp.Position
+		local dist = (goal - pos).Magnitude
+		if dist <= 3 then
+			idx = idx % #ASTRO_POINTS + 1
+			goal = ASTRO_POINTS[idx]
+			dist = (goal - pos).Magnitude
+		end
+		local step = math.min(st.astroSpeed * dt, dist)
+		local np = pos + (goal - pos).Unit * step
+		setPosFacing(hrp, np, goal)
+	end)
+	if not ok and t - lastErrA > 5 then
+		lastErrA = t
+		print("[rathub-astro] " .. tostring(err))
+	end
+end)
+
+-- reset the route state when it is switched off
+task.spawn(function()
+	while alive() do
+		task.wait(0.5)
+		if not st.astro then
+			teleported = false
+			idx = 1
+		end
+	end
+end)
+
+-- ============================================================
+-- MASTERY PATH (ReplicatedStorage.ForChangeCharacter)
+-- ============================================================
+local function parseMasteryList(text)
+	local out = {}
+	for line in (text or ""):gmatch("[^\r\n]+") do
+		line = line:gsub("^%s+", ""):gsub("%s+$", "")
+		if line ~= "" and line:sub(1, 1) ~= "#" then
+			local name, cap = line:match("^(.-)%s*|%s*(%d+)%s*$")
+			if name and name ~= "" then
+				out[#out + 1] = { name = name, cap = tonumber(cap) }
+			else
+				out[#out + 1] = { name = line, cap = nil }
+			end
+		end
+	end
+	return out
+end
+
+local function dataFolder()
+	return lp:FindFirstChild("_Data")
+end
+
+local function masteryOf(name)
+	local d = dataFolder()
+	local f = d and d:FindFirstChild("Mastery")
+	if not f then
+		return nil
+	end
+	local v = f:FindFirstChild(name .. ":Mastery")
+	if not v then
+		for _, c in ipairs(f:GetChildren()) do
+			if c.Name:gsub(":Mastery$", "") == name then
+				v = c
+				break
+			end
+		end
+	end
+	if not v then
+		return nil
+	end
+	local n = tostring(v.Value):match("^(%-?%d+)")
+	return n and tonumber(n) or nil
+end
+
+local function isUnlocked(name)
+	local d = dataFolder()
+	local u = d and d:FindFirstChild("UnlockedCharacter")
+	if not u then
+		return true
+	end
+	return u:FindFirstChild(name) ~= nil
+end
+
+local function switchCharacter(name)
+	local d = dataFolder()
+	local cv = d and d:FindFirstChild("Character")
+	if not cv then
+		return false
+	end
+	if cv.Value == name then
+		return true
+	end
+	local rem = rs:FindFirstChild("ForChangeCharacter")
+	if not rem then
+		return false
+	end
+	pcall(function()
+		rem:FireServer(name, 0)
+	end)
+	for _ = 1, 24 do
+		task.wait(0.25)
+		if cv.Value == name then
+			return true
+		end
+	end
+	return false
+end
+
+task.spawn(function()
+	local lastErr = 0
+	local lastSwitch = 0
+	while alive() do
+		task.wait(st.masteryDelay)
+		if st.mastery then
+			local t = now()
+			local ok, err = pcall(function()
+				local d = dataFolder()
+				local cv = d and d:FindFirstChild("Character")
+				if not cv then
+					return
+				end
+				local list = parseMasteryList(st.masteryList)
+				if #list == 0 then
+					return
+				end
+				local cur = cv.Value
+				local items = {}
+				local curIdx = 0
+				local todo, unknown = 0, 0
+				for i, e in ipairs(list) do
+					local target = e.cap or st.masteryDefault
+					local m = masteryOf(e.name)
+					local state
+					if masterySkipped[e.name] or not isUnlocked(e.name) then
+						state = "skip"
+					elseif m == nil then
+						state = "unknown"
+						unknown = unknown + 1
+					elseif m >= target then
+						state = "done"
+					else
+						state = "todo"
+						todo = todo + 1
+					end
+					items[i] = { name = e.name, target = target, m = m, state = state }
+					if e.name == cur then
+						curIdx = i
+					end
+				end
+
+				if todo == 0 and unknown == 0 then
+					st.mastery = false
+					pcall(function()
+						setToggle(masteryToggle, false)
+					end)
+					notify("Mastery", "path complete: all characters reached target", "check", 6)
+					return
+				end
+				if todo == 0 then
+					return
+				end
+
+				local curItem = curIdx > 0 and items[curIdx] or nil
+				if curItem and (curItem.state == "todo" or curItem.state == "unknown") then
+					return
+				end
+
+				local pick = nil
+				if curIdx > 0 then
+					for i = curIdx + 1, #items do
+						if items[i].state == "todo" then
+							pick = items[i]
+							break
+						end
+					end
+				end
+				if not pick then
+					for i = 1, #items do
+						if items[i].state == "todo" then
+							pick = items[i]
+							break
+						end
+					end
+				end
+				if not pick or t - lastSwitch < 3 then
+					return
+				end
+
+				notify(
+					"Mastery",
+					(cur ~= "" and (cur .. " " .. tostring(curItem and curItem.m or "?") .. "/" .. tostring(curItem and curItem.target or "?") .. " -> ") or "")
+						.. pick.name,
+					"info",
+					3
+				)
+				local switched = switchCharacter(pick.name)
+				lastSwitch = now()
+				if not switched then
+					masterySkipped[pick.name] = true
+					notify("Mastery", "could not switch to " .. pick.name, "triangle-alert", 4)
+				end
+			end)
+			if not ok and t - lastErr > 5 then
+				lastErr = t
+				notify("Mastery", "error: " .. tostring(err):sub(1, 140), "triangle-alert", 5)
+			end
+		end
+	end
+end)
+
+-- ============================================================
+-- GOD MODE (forced respawn before death)
+--   Humanoid.Health / Player:LoadCharacter are server side only,
+--   so the character is dropped below FallenPartsDestroyHeight and
+--   the server kills it (verified: death in ~2-3s, then respawn).
+-- ============================================================
+local godLastT = 0
+local lastErrGod = 0
+task.spawn(function()
+	while alive() do
+		task.wait(0.25)
+		if st.god and not godBusy then
+			local t = now()
+			local ok, err = pcall(function()
+				local char = lp.Character
+				local hum = char and char:FindFirstChildOfClass("Humanoid")
+				if not hum or not hum.Parent then
+					return
+				end
+				local hp, mx = hum.Health, hum.MaxHealth or 0
+				if mx <= 0 then
+					return
+				end
+				-- a threshold above the max HP makes no sense (it would reset on
+				-- every hit), so half of the max HP is used in that case
+				local limit = st.godHP >= mx and (mx * 0.5) or st.godHP
+				if not (hp < limit and hp < mx) then
+					return
+				end
+				local tw = ws:FindFirstChild("TimerWave")
+				if st.godSkipTimer0 and tw and tw.Value <= 0 then
+					return
+				end
+				if t - godLastT < 3 then
+					return
+				end
+				godLastT = t
+				godBusy = true
+				local hrp = char:FindFirstChild("HumanoidRootPart")
+				if hrp then
+					-- dropped above the destroy height: the body has to fall
+					-- through it (a placement below it gets rescued, not killed)
+					local killY = (ws.FallenPartsDestroyHeight or -1000) + 300
+					hrp.CFrame = CFrame.new(hrp.Position.X, killY, hrp.Position.Z)
+				end
+				notify("God", "reset before death (hp " .. math.floor(hp) .. ")", "info", 3)
+				-- phase 1: wait for the kill (max ~6s)
+				for _ = 1, 24 do
+					task.wait(0.25)
+					local c = lp.Character
+					local h = c and c:FindFirstChildOfClass("Humanoid")
+					local r = c and c:FindFirstChild("HumanoidRootPart")
+					if not h or h.Health <= 0 or not r then
+						break
+					end
+				end
+				-- phase 2: wait until the body is usable again (respawn takes
+				-- the game's RespawnTime, 20s here, so allow ~25s)
+				for _ = 1, 100 do
+					task.wait(0.25)
+					local c = lp.Character
+					local h = c and c:FindFirstChildOfClass("Humanoid")
+					local r = c and c:FindFirstChild("HumanoidRootPart")
+					if h and r and h.Health > 0 then
+						break
+					end
+				end
+				task.wait(0.4)
+				godBusy = false
+			end)
+			if not ok and t - lastErrGod > 5 then
+				lastErrGod = t
+				notify("God", "error: " .. tostring(err):sub(1, 120), "triangle-alert", 4)
+			end
+		end
+	end
+end)
+
+-- ============================================================
+-- ANTI AFK
+-- ============================================================
+pcall(function()
+	local vu = game:GetService("VirtualUser")
+	lp.Idled:Connect(function()
+		if not st.antiAfk then
+			return
+		end
+		local okA = pcall(function()
+			vu:CaptureController()
+			vu:ClickButton2(Vector2.new(0, 0))
+		end)
+		if okA then
+			notify("Anti-AFK", "idle state cleared", "info", 2)
+		end
+	end)
+end)
+
+-- ============================================================
+-- WEBHOOK (Discord status)
+-- ============================================================
+local HttpService = game:GetService("HttpService")
+
+local function webhookFields()
+	local d = lp:FindFirstChild("_Data")
+	local fields = {}
+	local function add(name, value, inline)
+		if value ~= nil and tostring(value) ~= "" then
+			fields[#fields + 1] = {
+				name = tostring(name),
+				value = tostring(value):sub(1, 1024),
+				inline = inline ~= false,
+			}
+		end
+	end
+
+	local cv = d and d:FindFirstChild("Character")
+	local charName = cv and cv.Value or "?"
+	add("Character", charName)
+	add("Mastery", masteryOf(charName) or "", true)
+
+	local wv = ws:FindFirstChild("Wave")
+	local tw = ws:FindFirstChild("TimerWave")
+	add("Wave", wv and tostring(wv.Value) or "?", true)
+	add("Timer", tw and tostring(math.floor(tw.Value)) .. "s" or "?", true)
+
+	local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
+	if hum then
+		add("HP", math.floor(hum.Health) .. " / " .. math.floor(hum.MaxHealth or 0), true)
+	end
+
+	local money = d and d:FindFirstChild("Money") and d.Money:FindFirstChild("Moneys")
+	if money then
+		add("Money", tostring(money.Value), true)
+	end
+
+	local items = d and d:FindFirstChild("Items")
+	if items then
+		local t = {}
+		for _, c in ipairs(items:GetChildren()) do
+			local n = tonumber(c.Value)
+			t[#t + 1] = c.Name .. (n and (" x" .. n) or "")
+		end
+		add("Inventory", table.concat(t, "\n"))
+	end
+	return fields
+end
+
+sendWebhook = function(quiet)
+	local url = tostring(st.webhookUrl or ""):gsub("^%s+", ""):gsub("%s+$", "")
+	if url == "" or not url:match("^https://") then
+		if not quiet then
+			notify("Webhook", "set a valid https:// URL first", "triangle-alert", 4)
+		end
+		return false
+	end
+	local payload = {
+		username = "RATHUB Blockade",
+		embeds = {
+			{
+				title = "Blockade status",
+				color = 3447003,
+				fields = webhookFields(),
+				timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+			},
+		},
+	}
+	local body = HttpService:JSONEncode(payload)
+	local req = request or http_request
+	if not req then
+		notify("Webhook", "executor has no request()", "triangle-alert", 4)
+		return false
+	end
+	local ok, res = pcall(function()
+		return req({
+			Url = url,
+			Method = "POST",
+			Headers = { ["Content-Type"] = "application/json" },
+			Body = body,
+		})
+	end)
+	if not ok then
+		if not quiet then
+			notify("Webhook", "send failed: " .. tostring(res):sub(1, 120), "triangle-alert", 4)
+		end
+		return false
+	end
+	local code = type(res) == "table" and tonumber(res.StatusCode) or nil
+	if code and code >= 300 then
+		if not quiet then
+			notify("Webhook", "HTTP " .. tostring(code), "triangle-alert", 4)
+		end
+		return false
+	end
+	if not quiet then
+		notify("Webhook", "sent", "check", 2)
+	end
+	return true
+end
+
+task.spawn(function()
+	while alive() do
+		task.wait(math.max(tonumber(st.webhookDelay) or 60, 5))
+		if st.webhook then
+			local ok, err = pcall(function()
+				sendWebhook(true)
+			end)
+			if not ok then
+				print("[rathub-webhook] " .. tostring(err))
+			end
+		end
+	end
+end)
+
+-- ============================================================
+-- REG / STOP
+-- ============================================================
+_G.__RATHUB_REG = {
+	stop = function()
+		ALIVE = false
+		pcall(function()
+			if Window then
+				Window:Destroy()
+			end
+		end)
+	end,
+}
+
+print("[RATHUB] Blockade loaded (WindUI, remote-only)")
+bootOk()
+
+end -- __RATHUB_MAIN
+
+local ok, err = xpcall(__RATHUB_MAIN, function(e)
+	return tostring(e) .. "\n" .. (debug and debug.traceback and debug.traceback("", 2) or "")
+end)
+if not ok then
+	warn("[RATHUB] runtime error: " .. tostring(err))
+	bootSet("ERR: " .. tostring(err):sub(1, 100), 255, 80, 80)
+end
