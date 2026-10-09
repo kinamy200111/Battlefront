@@ -1979,27 +1979,31 @@ local function listLoot(hrp)
 end
 
 local function pressE(hold, prompt)
-	local usedVIM = false
-	if VIM then
-		usedVIM = pcall(function()
-			VIM:SendKeyEvent(true, Enum.KeyCode.E, false, lp)
-		end)
-	end
-	-- mobile executors (Delta/Android): VIM keycodes often do nothing;
-	-- drive the ProximityPrompt itself, which works everywhere
-	if not usedVIM and prompt then
-		pcall(function()
+	local h = math.max(tonumber(hold) or 0.2, 0.15)
+	-- ProximityPrompt:InputHoldBegin/End is the reliable way to hold
+	-- (VIM SendKeyEvent on Delta/Android often registers as a single
+	-- click and never holds for HoldDuration)
+	if prompt then
+		local okB = pcall(function()
 			prompt:InputHoldBegin()
 		end)
+		if okB then
+			task.wait(h)
+			pcall(function()
+				prompt:InputHoldEnd()
+			end)
+			task.wait(0.25)
+			return
+		end
 	end
-	task.wait(math.max(hold or 0.2, 0.15))
-	if usedVIM then
+	-- fallback: VIM key event (desktop executors)
+	if VIM then
+		pcall(function()
+			VIM:SendKeyEvent(true, Enum.KeyCode.E, false, lp)
+		end)
+		task.wait(h)
 		pcall(function()
 			VIM:SendKeyEvent(false, Enum.KeyCode.E, false, lp)
-		end)
-	elseif prompt then
-		pcall(function()
-			prompt:InputHoldEnd()
 		end)
 	end
 	task.wait(0.25)
