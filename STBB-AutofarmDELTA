@@ -497,6 +497,57 @@ local function setPosFacing(hrp, pos, facePos)
 	end)
 end
 
+-- Infinite Yield style respawn: swap Player.Character for a fake model
+-- with a Humanoid so the engine thinks the character left and respawns.
+local function iyRespawn()
+	local M = Instance.new("Model")
+	M.Name = "RATHUB_respawn"
+	Instance.new("Humanoid", M)
+	local T = Instance.new("Part")
+	T.Name = "Torso"
+	T.CanCollide = false
+	T.Transparency = 1
+	T.Parent = M
+	M.Parent = ws
+	lp.Character = M
+	return M
+end
+
+-- multi-method reset (fastest first). returns method name used or nil
+local function respawnNow()
+	-- 1) LoadCharacter (works on many executors / games)
+	local okLC = pcall(function()
+		lp:LoadCharacter()
+	end)
+	if okLC then
+		local c = lp.Character
+		local h = c and c:FindFirstChildOfClass("Humanoid")
+		if h and h.Health > 0 then
+			return "LoadCharacter"
+		end
+	end
+	-- 2) Infinite Yield fake-character swap
+	pcall(iyRespawn)
+	local t0 = now()
+	while now() - t0 < 8 do
+		local c = lp.Character
+		local h = c and c:FindFirstChildOfClass("Humanoid")
+		local r = c and c:FindFirstChild("HumanoidRootPart")
+		if h and r and h.Health > 0 and c.Name ~= "RATHUB_respawn" then
+			return "IY"
+		end
+		task.wait(0.1)
+	end
+	-- 3) void drop (server kill via FallenPartsDestroyHeight)
+	local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+	if hrp then
+		local killY = (ws.FallenPartsDestroyHeight or -1000) + 300
+		hrp.CFrame = CFrame.new(hrp.Position.X, killY, hrp.Position.Z)
+		return "void"
+	end
+	return nil
+end
+
 local function moveToward(hrp, goal, facePos, dt)
 	local dist = (goal - hrp.Position).Magnitude
 	if dist <= 0.75 then
@@ -831,6 +882,22 @@ ele(GodSec, "Toggle", {
 	Value = true,
 	Callback = function(v)
 		st.godSkipTimer0 = v
+	end,
+})
+ele(GodSec, "Keybind", {
+	Title = "Instant respawn now",
+	Value = "R",
+	Callback = function()
+		if godBusy then
+			return
+		end
+		godBusy = true
+		task.spawn(function()
+			local m = respawnNow()
+			notify("God", "respawn: " .. tostring(m or "failed"), "info", 2)
+			task.wait(1.5)
+			godBusy = false
+		end)
 	end,
 })
 
@@ -2515,9 +2582,9 @@ end)
 
 -- ============================================================
 -- GOD MODE (forced respawn before death)
---   Humanoid.Health / Player:LoadCharacter are server side only,
---   so the character is dropped below FallenPartsDestroyHeight and
---   the server kills it (verified: death in ~2-3s, then respawn).
+--   Uses IY-style reset (LoadCharacter / fake character / void drop).
+--   Health and LoadCharacter are often server-restricted, so respawnNow
+--   falls back through methods until a living character appears.
 -- ============================================================
 local godLastT = 0
 local lastErrGod = 0
@@ -2551,26 +2618,9 @@ task.spawn(function()
 				end
 				godLastT = t
 				godBusy = true
-				local hrp = char:FindFirstChild("HumanoidRootPart")
-				if hrp then
-					-- dropped above the destroy height: the body has to fall
-					-- through it (a placement below it gets rescued, not killed)
-					local killY = (ws.FallenPartsDestroyHeight or -1000) + 300
-					hrp.CFrame = CFrame.new(hrp.Position.X, killY, hrp.Position.Z)
-				end
-				notify("God", "reset before death (hp " .. math.floor(hp) .. ")", "info", 3)
-				-- phase 1: wait for the kill (max ~6s)
-				for _ = 1, 24 do
-					task.wait(0.25)
-					local c = lp.Character
-					local h = c and c:FindFirstChildOfClass("Humanoid")
-					local r = c and c:FindFirstChild("HumanoidRootPart")
-					if not h or h.Health <= 0 or not r then
-						break
-					end
-				end
-				-- phase 2: wait until the body is usable again (respawn takes
-				-- the game's RespawnTime, 20s here, so allow ~25s)
+				local method = respawnNow()
+				notify("God", "reset (hp " .. math.floor(hp) .. ", " .. tostring(method or "fail") .. ")", "info", 3)
+				-- wait until the body is usable again
 				for _ = 1, 100 do
 					task.wait(0.25)
 					local c = lp.Character
