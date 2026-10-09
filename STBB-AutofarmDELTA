@@ -497,52 +497,68 @@ local function setPosFacing(hrp, pos, facePos)
 	end)
 end
 
--- Infinite Yield respawn (exact IY command logic):
---   Humanoid:ChangeState(15)=Dead + ClearAllChildren + temp character
---   swap. Client owns the character, so clearing children replicates
---   the kill and the game respawns a real body.
-local function iyRespawn()
+-- Infinite Yield ;reset (exact body from IY source):
+--   Humanoid:ChangeState(Dead)  — или BreakJoints если нет Humanoid.
+--   Roblox-движок сам заспавнит новое тело после смерти.
+local function iyReset()
 	local char = lp.Character
 	if not char then
 		return false
 	end
-	pcall(function()
-		local hum = char:FindFirstChildOfClass("Humanoid")
+	local ok = pcall(function()
+		local hum = char:FindFirstChildWhichIsA("Humanoid")
 		if hum then
 			hum:ChangeState(Enum.HumanoidStateType.Dead)
+		else
+			char:BreakJoints()
 		end
 	end)
-	pcall(function()
-		char:ClearAllChildren()
-	end)
-	local newChar = Instance.new("Model")
-	newChar.Name = "RATHUB_tmp"
-	newChar.Parent = ws
-	lp.Character = newChar
-	task.wait()
-	lp.Character = char
-	pcall(function()
-		newChar:Destroy()
-	end)
-	return true
+	return ok
 end
 
--- pure IY-style reset; returns true when a living character is back
+local function cameraOnCharacter()
+	pcall(function()
+		local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
+		if hum then
+			workspace.CurrentCamera.CameraSubject = hum
+		end
+	end)
+end
+
+-- kill current body via IY reset, then wait for the natural respawn
 local function respawnNow()
-	if not iyRespawn() then
+	if not lp.Character then
+		pcall(function()
+			lp:LoadCharacter()
+		end)
+		task.wait(0.5)
+		cameraOnCharacter()
+		return true
+	end
+	if not iyReset() then
 		return false
 	end
 	local t0 = now()
-	while now() - t0 < 25 do
+	while now() - t0 < 20 do
 		local c = lp.Character
-		local h = c and c:FindFirstChildOfClass("Humanoid")
-		local r = c and c:FindFirstChild("HumanoidRootPart")
-		if c and c.Name ~= "RATHUB_tmp" and h and r and h.Health > 0 then
-			return true
+		if c then
+			local h = c:FindFirstChildWhichIsA("Humanoid")
+			local r = c:FindFirstChild("HumanoidRootPart")
+			if h and r and h.Health > 0 then
+				cameraOnCharacter()
+				return true
+			end
 		end
 		task.wait(0.1)
 	end
-	return false
+	pcall(function()
+		lp:LoadCharacter()
+	end)
+	task.wait(0.8)
+	cameraOnCharacter()
+	local c = lp.Character
+	local h = c and c:FindFirstChildWhichIsA("Humanoid")
+	return (h and h.Health > 0) or false
 end
 
 local function moveToward(hrp, goal, facePos, dt)
