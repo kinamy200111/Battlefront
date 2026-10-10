@@ -1,28 +1,5 @@
---[[
-================================================================
-  RATHUB - Blockade Front (Farm + Astro)  |  injector build
-================================================================
-  * UI      : WindUI
-  * Transport: remotes only (no Hybrid / NoHybrid, no GUI clicking
-    for vote / ready). Always remotes.
-  * Merged   : blockade_farm.lua + blockade_astro.lua
-  * Extra   : Vote  -> rs.Vote:FireServer(mode)
-              Ready -> rs.GetReadyRemote:FireServer(slot, true)
-              Skills-> rs.SoundWave / rs.Swing / rs.SpeakerCarrier /
-                       rs.BuffSpeakerMan / rs.Buff
-              M1    -> rs.LMB
-              Gacha -> rs.GachaCharacter / rs.GachaSkins
-  Shop heal uses firesignal on the real Heal button (executor side),
-  it is NOT the vote/ready flow.
-================================================================
-]]
-
--- top-level boot marker: printed even if __RATHUB_MAIN fails to
--- parse/attach, so "no output at all" means the paste itself broke
 print("[RATHUB] script loaded")
 
--- on-screen boot indicator (Delta hides its console, so errors
--- must be visible on the GUI itself)
 local bootGui
 do
 	local ok = pcall(function()
@@ -90,9 +67,6 @@ end
 
 bootSet("loaded")
 
--- ============================================================
--- runtime flags
--- ============================================================
 local ALIVE = true
 local function alive()
 	return ALIVE
@@ -101,17 +75,12 @@ local function now()
 	return tick()
 end
 
--- ============================================================
--- services
--- ============================================================
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local lp = Players.LocalPlayer
 local ws = workspace
 local rs = game:GetService("ReplicatedStorage")
 
--- everything below lives inside __RATHUB_MAIN so that ANY uncaught
--- error is reported via warn instead of dying silently
 local function __RATHUB_MAIN()
 
 print("[RATHUB] executor: " .. tostring(
@@ -121,12 +90,6 @@ print("[RATHUB] executor: " .. tostring(
 	or "unknown"
 ))
 
--- ============================================================
--- WindUI
--- ============================================================
--- executor request first (Delta/Madium/Synapse variants), then HttpGet.
--- Delta quirks: request may return a bare string, use lowercase `body`,
--- or only expose syn.request; HttpGet may be disabled in Delta settings.
 local function httpGet(url)
 	local candidates = {}
 	if type(request) == "function" then
@@ -163,9 +126,6 @@ local function httpGet(url)
 	return nil
 end
 
--- NOTE: the previous instance is torn down *after* this library loads
--- (see below); destroying its screens earlier races with the new window.
-
 local WINDUI_URLS = {
 	"https://cdn.jsdelivr.net/gh/Footagesus/WindUI@main/dist/main.lua",
 	"https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua",
@@ -187,26 +147,13 @@ if not windBody then
 end
 bootSet("loading WindUI...")
 
--- ----------------------------------------------------------
--- 1) WindUI downloads its icon sets from raw.githubusercontent.com,
---    which stalls on networks where GitHub raw is blocked -> mirror
---    every icon URL onto jsDelivr (identical files).
--- ----------------------------------------------------------
 local ICON_RAW = "https://raw.githubusercontent.com/Footagesus/Icons/refs/heads/main/"
 local ICON_CDN = "https://cdn.jsdelivr.net/gh/Footagesus/Icons@main/"
 windBody = windBody:gsub(ICON_RAW, ICON_CDN)
 
--- ----------------------------------------------------------
--- 2) Redirect WindUI's HTTP through our own fetch (executor request).
---    game:HttpGet can stall; unknown hosts are never contacted.
--- ----------------------------------------------------------
 windBody = windBody:gsub("game:HttpGet", "__RATHUB_HG")
 windBody = windBody:gsub("game%.HttpGet", "__RATHUB_HG")
 
--- ----------------------------------------------------------
--- 3) CreateWindow() waits on GetUserThumbnailAsync, which blocks
---    forever when the thumbnail service is throttled -> stub it out.
--- ----------------------------------------------------------
 local thumbPatched = 0
 windBody = windBody:gsub("([%w_%.]+):GetUserThumbnailAsync%(", function()
 	thumbPatched = thumbPatched + 1
@@ -237,8 +184,6 @@ local function windHttpGet(url)
 			body = res.Body or res.body
 		end
 		if type(body) == "string" and body ~= "" then
-			-- only hand back something that can actually be parsed as Lua,
-			-- otherwise return "" so WindUI falls back to bundled icons
 			if not body:find("<html", 1, true) and body:find("return", 1, true) then
 				windCache[url] = body
 				return body
@@ -278,19 +223,12 @@ if not windOk or not windRes then
 end
 local WindUI = windRes
 
--- stop a previous instance only once the library is ready,
--- so a failed load never leaves the user without a UI.
--- Detached: a previous window whose screen was already swept away can
--- hang inside Destroy(), and that must never block the new UI.
 if _G.__RATHUB_REG and _G.__RATHUB_REG.stop then
 	task.spawn(function()
 		pcall(_G.__RATHUB_REG.stop)
 	end)
 end
 
--- ============================================================
--- state
--- ============================================================
 local MODES = {
 	"Normal", "Hard", "VeryHard", "Insane", "Nightmare",
 	"ThunderStorm", "Zombie", "Christmas", "Hell", "DarkDimension",
@@ -299,7 +237,6 @@ local MODES = {
 }
 
 local st = {
-	-- farm
 	farm = false,
 	tween = true,
 	orbit = true,
@@ -327,40 +264,58 @@ local st = {
 	resetWave = false,
 	resetWaveNum = 5,
 	idleVec = nil,
-	-- astro
 	astro = false,
 	astroSpeed = 600,
 	astroHeal = true,
-	-- lobby
 	vote = false,
 	voteMode = "Astro",
 	ready = false,
 	readySlot = "1",
 	readyHover = true,
-	-- gacha
 	gacha = false,
 	gachaAuto = false,
 	gachaType = "GachaCharacter",
 	gachaSpin = "100Spins",
 	gachaInterval = 0.5,
 	gachaMax = 0,
-	-- mastery path
 	mastery = false,
 	masteryList = "Camera man | 30\nTv man | 80\nTV woman | 80\nLarge Speaker man | 80\nSpeaker Strider | 80\nDark Speakerman | 80\nEngineer Camera Man | 10\nScientist TV Man | 80\nLarge TV man | 80",
 	masteryDefault = 80,
 	masteryDelay = 3,
-	-- safety
 	god = false,
 	godHP = 800,
 	godSkipTimer0 = true,
 	antiAfk = true,
-	-- webhook
 	webhook = false,
 	webhookUrl = "",
 	webhookDelay = 60,
-	-- heal tuning
 	healTry = 12,
 }
+
+local WEBHOOK_FILE = "RATHUB_webhook.cfg"
+
+local function saveWebhookCfg()
+	pcall(function()
+		if writefile then
+			writefile(WEBHOOK_FILE, table.concat({
+				tostring(st.webhookUrl or ""),
+				st.webhook and "1" or "0",
+				tostring(st.webhookDelay or 60),
+			}, "\n"))
+		end
+	end)
+end
+
+pcall(function()
+	if isfile and readfile and isfile(WEBHOOK_FILE) then
+		local url, en, delay = tostring(readfile(WEBHOOK_FILE) or ""):match("^(.-)\n(.-)\n(.*)$")
+		if url then
+			st.webhookUrl = url
+			st.webhook = en == "1"
+			st.webhookDelay = tonumber(delay) or st.webhookDelay
+		end
+	end
+end)
 
 local masterySkipped = {}
 
@@ -376,11 +331,8 @@ local healRequested = false
 local lastHealT = 0
 local resetDone = false
 local godBusy = false
-local sendWebhook -- defined at the bottom (webhook block), used by Settings UI
+local sendWebhook
 
--- ============================================================
--- helpers
--- ============================================================
 local function splitList(s)
 	local out = {}
 	for part in tostring(s or ""):gmatch("[^,;]+") do
@@ -409,11 +361,6 @@ local function waveInList(wave)
 	return false
 end
 
--- Skill config line: "Remote | Cooldown | RequireChild | arg1,arg2"
---   Remote       required, name (or dotted path) under ReplicatedStorage
---   Cooldown     optional bool in CooldownFolder; skip while Value == true
---   RequireChild optional child that must exist on the character
---   args         optional comma-separated arguments passed to FireServer
 local function resolveRemote(path)
 	if not path or path == "" then
 		return nil
@@ -487,8 +434,6 @@ local function yawTo(pos, at)
 	return math.atan2(-(at.X - pos.X), -(at.Z - pos.Z))
 end
 
--- writes the position and kills the residual velocity, otherwise the
--- character keeps falling for a frame and bounces up/down between writes
 local function setPosFacing(hrp, pos, facePos)
 	hrp.CFrame = CFrame.new(pos.X, pos.Y, pos.Z) * CFrame.Angles(0, yawTo(pos, facePos), 0)
 	pcall(function()
@@ -497,9 +442,6 @@ local function setPosFacing(hrp, pos, facePos)
 	end)
 end
 
--- Infinite Yield ;reset (exact body from IY source):
---   Humanoid:ChangeState(Dead)  — или BreakJoints если нет Humanoid.
---   Roblox-движок сам заспавнит новое тело после смерти.
 local function iyReset()
 	local char = lp.Character
 	if not char then
@@ -525,7 +467,6 @@ local function cameraOnCharacter()
 	end)
 end
 
--- kill current body via IY reset, then wait for the natural respawn
 local function respawnNow()
 	if not lp.Character then
 		pcall(function()
@@ -585,9 +526,6 @@ end
 
 st.idleVec = parseVec3("-22.430267333984375 3.0063483715057373 -3.2639551162719727")
 
--- ============================================================
--- UI
--- ============================================================
 local function ele(parent, name, opts)
 	if not parent then
 		return nil
@@ -672,7 +610,6 @@ local MasteryTab = ele(Window, "Tab", { Title = "Mastery", Icon = "target", Bord
 local GachaTab = ele(Window, "Tab", { Title = "Gacha", Icon = "gift", Border = true })
 local SettingsTab = ele(Window, "Tab", { Title = "Settings", Icon = "settings", Border = true })
 
--- ---------------- Farm ----------------
 local FarmSec = ele(FarmTab, "Section", { Title = "Farm" })
 local farmToggle
 farmToggle = ele(FarmSec, "Toggle", {
@@ -699,7 +636,7 @@ ele(FarmSec, "Keybind", {
 	end,
 })
 ele(FarmSec, "Slider", {
-	Title = "Tween speed",
+	Title = "Speed",
 	Step = 25,
 	Value = { Min = 100, Max = 4000, Default = 600 },
 	Callback = function(v)
@@ -794,7 +731,7 @@ ele(SkillSec, "Input", {
 	end,
 })
 
-local HealSec = ele(FarmTab, "Section", { Title = "Auto Heal (Shop)" })
+local HealSec = ele(FarmTab, "Section", { Title = "Auto Heal" })
 ele(HealSec, "Toggle", {
 	Title = "Auto heal at shop",
 	Value = false,
@@ -906,8 +843,11 @@ ele(GodSec, "Keybind", {
 	end,
 })
 
--- ---------------- Astro ----------------
 local AstroSec = ele(AstroTab, "Section", { Title = "Astro Token Route" })
+ele(AstroSec, "Paragraph", {
+	Title = "Auto vote must be for AstroV2!!!",
+	Desc = "Set Lobby > Vote mode to AstroV2 before starting the route.",
+})
 local astroToggle
 astroToggle = ele(AstroSec, "Toggle", {
 	Title = "Route enabled",
@@ -981,7 +921,6 @@ local astroParagraph = ele(AstroSec, "Paragraph", {
 	Desc = "waiting...",
 })
 
--- live token counter
 task.spawn(function()
 	local base = nil
 	while alive() do
@@ -1009,7 +948,6 @@ task.spawn(function()
 	end
 end)
 
--- ---------------- Lobby ----------------
 local LobbySec = ele(LobbyTab, "Section", { Title = "Auto Lobby (remote)" })
 ele(LobbySec, "Toggle", { Title = "Auto vote", Value = false, Callback = function(v)
 	st.vote = v
@@ -1026,7 +964,6 @@ ele(LobbySec, "Toggle", { Title = "Auto ready", Value = false, Callback = functi
 	st.ready = v
 end })
 
--- ---------------- Mastery ----------------
 local MasterySec = ele(MasteryTab, "Section", { Title = "Mastery path" })
 local masteryToggle
 masteryToggle = ele(MasterySec, "Toggle", {
@@ -1078,7 +1015,6 @@ ele(MasterySec, "Slider", {
 	end,
 })
 
--- ---------------- Gacha ----------------
 local GachaSec = ele(GachaTab, "Section", { Title = "Auto Gacha" })
 local gachaToggle
 gachaToggle = ele(GachaSec, "Toggle", {
@@ -1139,7 +1075,6 @@ ele(GachaSec, "Slider", {
 	end,
 })
 
--- ---------------- Settings ----------------
 local SetSec = ele(SettingsTab, "Section", { Title = "Appearance" })
 ele(SetSec, "Keybind", {
 	Title = "UI toggle key",
@@ -1193,14 +1128,16 @@ ele(HookSec, "Input", {
 	Value = st.webhookUrl,
 	Callback = function(v)
 		st.webhookUrl = v
+		saveWebhookCfg()
 	end,
 })
 ele(HookSec, "Toggle", {
 	Title = "Send status periodically",
 	Desc = "Character, wave, HP, money and inventory",
-	Value = false,
+	Value = st.webhook,
 	Callback = function(v)
 		st.webhook = v
+		saveWebhookCfg()
 		if v then
 			notify("Webhook", "status sender enabled", "check", 2)
 		end
@@ -1209,9 +1146,10 @@ ele(HookSec, "Toggle", {
 ele(HookSec, "Slider", {
 	Title = "Interval (sec)",
 	Step = 5,
-	Value = { Min = 10, Max = 600, Default = 60 },
+	Value = { Min = 10, Max = 600, Default = st.webhookDelay },
 	Callback = function(v)
 		st.webhookDelay = v
+		saveWebhookCfg()
 	end,
 })
 ele(HookSec, "Button", {
@@ -1241,9 +1179,6 @@ pcall(function()
 	Window:SelectTab(1)
 end)
 
--- ============================================================
--- LOBBY: vote + ready via remotes only
--- ============================================================
 local VOTE_PAGES = {
 	{ "Normal", "Hard", "VeryHard", "Insane", "Nightmare" },
 	{ "BossRush", "ThunderStorm", "Zombie", "Christmas", "Hell" },
@@ -1386,7 +1321,6 @@ task.spawn(function()
 					votedPhase = false
 				end
 
-				-- VOTE (remote)
 				if st.vote and votingNow then
 					local mine = currentVote()
 					if mine == st.voteMode then
@@ -1403,7 +1337,6 @@ task.spawn(function()
 					end
 				end
 
-				-- READY (remote)
 				local readyBlocked = votingNow and not votedPhase
 				if (votingNow or (ws:FindFirstChild("OpenVoteUI") ~= nil)) and phaseStart > 0 then
 					if (t - phaseStart) < READY_VOTE_DELAY and not votedPhase then
@@ -1434,9 +1367,6 @@ task.spawn(function()
 	end
 end)
 
--- ============================================================
--- SHOP HEAL (remote: ShopSystem "Buy" / "FillHP")
--- ============================================================
 local function canUseShop()
 	local cus = ws:FindFirstChild("CanUseShop")
 	if not cus then
@@ -1472,10 +1402,6 @@ local function hpNow()
 	return hum and hum.Health or 0
 end
 
--- The shop window (workspace.CanUseShop) opens for a short time while the
--- helicopter is at the pad, so Buy/FillHP is spammed for the whole attempt
--- instead of a few quick shots: the buy lands the moment the window opens.
--- No teleport: the character stays wherever the farm left it.
 local function doHeal()
 	if not shopRemote() then
 		print("[rathub-heal] ReplicatedStorage.ShopSystem missing")
@@ -1527,9 +1453,6 @@ task.spawn(function()
 	end
 end)
 
--- ============================================================
--- M1 (remote)
--- ============================================================
 local function fireLMB()
 	pcall(function()
 		rs.LMB:FireServer()
@@ -1545,9 +1468,6 @@ task.spawn(function()
 	end
 end)
 
--- ============================================================
--- REMOTE SKILLS
--- ============================================================
 task.spawn(function()
 	local lastErr = 0
 	while alive() do
@@ -1579,9 +1499,6 @@ task.spawn(function()
 	end
 end)
 
--- ============================================================
--- GACHA
--- ============================================================
 task.spawn(function()
 	local opened = 0
 	local lastErr = 0
@@ -1609,9 +1526,6 @@ task.spawn(function()
 	end
 end)
 
--- ============================================================
--- ENEMY SCANNER
--- ============================================================
 local playerNames = {}
 
 local function refreshPlayerNames()
@@ -1760,9 +1674,6 @@ local function pickTarget(list)
 	return best
 end
 
--- ============================================================
--- AUTO LOOT (Gears templates spawn in workspace with a ProximityPrompt)
--- ============================================================
 local RF = game:GetService("ReplicatedFirst")
 local VIM
 pcall(function()
@@ -1770,13 +1681,10 @@ pcall(function()
 end)
 local gearKeys = {}
 
--- spawned gears do not always carry the exact template name
--- ("Flash Drive" vs "Flash Drive #2"), so match on letters/digits only
 local function normKey(s)
 	return tostring(s):lower():gsub("[^%a%d]+", "")
 end
 
--- used when ReplicatedFirst.Gears is not there (or empty)
 local GEAR_FALLBACK = {
 	"BlackGear", "BlueGear", "GreenGear", "RedGear", "WhiteGear",
 	"PurpleGear", "YellowGear", "OrangeGear", "Flash Drive",
@@ -1860,10 +1768,6 @@ local function itemPos(item)
 	return nil
 end
 
--- gears can be nested anywhere under workspace (even under a BasePart), so
--- scan for the prompt itself and for gear-named instances. Bounded by node
--- count + time; a partial scan is merged into the cache instead of dropping
--- targets, and only a complete scan replaces it.
 local LOOT_SCAN_NODES = 40000
 local LOOT_SCAN_TIME = 0.025
 
@@ -1903,7 +1807,6 @@ local function promptOwner(pr)
 	return nil
 end
 
--- simple full scan: no cache / rotation / time budget (old behaviour)
 local function listLoot(hrp)
 	if next(gearKeys) == nil then
 		refreshGearNames()
@@ -1970,7 +1873,6 @@ local function listLoot(hrp)
 	end
 	walk(ws, true)
 
-	-- keep entries found by earlier (partial) scans while they still exist
 	for inst, e in pairs(lootCache) do
 		if not found[inst] and inst.Parent and e.prompt and e.prompt.Parent then
 			local pos = promptPos(e.prompt) or itemPos(inst)
@@ -1993,9 +1895,6 @@ end
 
 local function pressE(hold, prompt)
 	local h = math.max(tonumber(hold) or 0.2, 0.15)
-	-- ProximityPrompt:InputHoldBegin/End is the reliable way to hold
-	-- (VIM SendKeyEvent on Delta/Android often registers as a single
-	-- click and never holds for HoldDuration)
 	if prompt then
 		local okB = pcall(function()
 			prompt:InputHoldBegin()
@@ -2009,7 +1908,6 @@ local function pressE(hold, prompt)
 			return
 		end
 	end
-	-- fallback: VIM key event (desktop executors)
 	if VIM then
 		pcall(function()
 			VIM:SendKeyEvent(true, Enum.KeyCode.E, false, lp)
@@ -2057,7 +1955,6 @@ local function lootPick(entry, hrp)
 				end
 				local maxD = pr.MaxActivationDistance or 10
 				if (hrp.Position - pos).Magnitude > maxD then
-					-- drifted out of range: stop, lootStep will walk back in
 					break
 				end
 				pressE(oldHold + 0.8, pr)
@@ -2129,9 +2026,6 @@ local function lootStep(hrp, dt)
 	return true
 end
 
--- ============================================================
--- FARM MAIN LOOP
--- ============================================================
 local lastNamesT = 0
 local lastScanT = 0
 local lastLmbT = 0
@@ -2156,13 +2050,10 @@ RunService.Heartbeat:Connect(function(dt)
 			return
 		end
 
-		-- the astro route owns the character: nothing else may write CFrame
-		-- (loot/idle movement here would fight the route and cause the bounce)
 		if st.astro then
 			return
 		end
 
-		-- loot can run on its own (farm off): only pick gears up
 		if not st.farm then
 			lootStep(hrp, dt)
 			return
@@ -2195,7 +2086,6 @@ RunService.Heartbeat:Connect(function(dt)
 			currentTarget = nil
 			isOrbiting = false
 			if lootStep(hrp, dt) then
-				-- looting owns movement
 			elseif zoneGoal then
 				if moveToward(hrp, zoneGoal, zoneGoal, dt) then
 					zoneGoal = nil
@@ -2299,9 +2189,6 @@ RunService.Heartbeat:Connect(function(dt)
 	end
 end)
 
--- ============================================================
--- ASTRO ROUTE
--- ============================================================
 local ASTRO_POINTS = {
 	Vector3.new(-646.6834106445312, 276.7692565917969, 453.2442321777344),
 	Vector3.new(472.2657470703125, 263.6273193359375, 473.229736328125),
@@ -2314,9 +2201,6 @@ local ASTRO_POINTS = {
 	Vector3.new(-293.5099182128906, 174.0532684326172, 122.78317260742188),
 }
 
--- movement runs on Heartbeat (once per rendered frame) with a dt-based step:
--- the old 0.05s timer wrote the position less often than physics pulled the
--- character down, which showed up as the up/down bounce at every waypoint
 local idx = 1
 local teleported = false
 local lastHeal = 0
@@ -2405,7 +2289,6 @@ RunService.Heartbeat:Connect(function(dt)
 	end
 end)
 
--- reset the route state when it is switched off
 task.spawn(function()
 	while alive() do
 		task.wait(0.5)
@@ -2416,9 +2299,6 @@ task.spawn(function()
 	end
 end)
 
--- ============================================================
--- MASTERY PATH (ReplicatedStorage.ForChangeCharacter)
--- ============================================================
 local function parseMasteryList(text)
 	local out = {}
 	for line in (text or ""):gmatch("[^\r\n]+") do
@@ -2597,12 +2477,6 @@ task.spawn(function()
 	end
 end)
 
--- ============================================================
--- GOD MODE (forced respawn before death)
---   Uses IY-style reset (LoadCharacter / fake character / void drop).
---   Health and LoadCharacter are often server-restricted, so respawnNow
---   falls back through methods until a living character appears.
--- ============================================================
 local godLastT = 0
 local lastErrGod = 0
 task.spawn(function()
@@ -2620,8 +2494,6 @@ task.spawn(function()
 				if mx <= 0 then
 					return
 				end
-				-- a threshold above the max HP makes no sense (it would reset on
-				-- every hit), so half of the max HP is used in that case
 				local limit = st.godHP >= mx and (mx * 0.5) or st.godHP
 				if not (hp < limit and hp < mx) then
 					return
@@ -2648,9 +2520,6 @@ task.spawn(function()
 	end
 end)
 
--- ============================================================
--- ANTI AFK
--- ============================================================
 pcall(function()
 	local vu = game:GetService("VirtualUser")
 	lp.Idled:Connect(function()
@@ -2667,9 +2536,6 @@ pcall(function()
 	end)
 end)
 
--- ============================================================
--- WEBHOOK (Discord status)
--- ============================================================
 local HttpService = game:GetService("HttpService")
 
 local function webhookFields()
@@ -2783,9 +2649,6 @@ task.spawn(function()
 	end
 end)
 
--- ============================================================
--- REG / STOP
--- ============================================================
 _G.__RATHUB_REG = {
 	stop = function()
 		ALIVE = false
@@ -2800,7 +2663,7 @@ _G.__RATHUB_REG = {
 print("[RATHUB] Blockade loaded (WindUI, remote-only)")
 bootOk()
 
-end -- __RATHUB_MAIN
+end
 
 local ok, err = xpcall(__RATHUB_MAIN, function(e)
 	return tostring(e) .. "\n" .. (debug and debug.traceback and debug.traceback("", 2) or "")
