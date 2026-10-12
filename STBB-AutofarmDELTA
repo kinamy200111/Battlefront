@@ -258,7 +258,7 @@ local st = {
 	waveList = "2,9,17,26,29,30,31",
 	heal = false,
 	healHP = 100,
-	loot = true,
+	loot = false,
 	lootRange = 1000,
 	lootDelay = 0.35,
 	resetWave = false,
@@ -267,17 +267,30 @@ local st = {
 	astro = false,
 	astroSpeed = 600,
 	astroHeal = true,
+	astroPointsText = "",
 	vote = false,
-	voteMode = "Astro",
+	voteMode = "AstroV2",
 	ready = false,
 	readySlot = "1",
 	readyHover = true,
 	gacha = false,
 	gachaAuto = false,
+	gachaSkinMode = false,
+	gachaSkinSel = {},
 	gachaType = "GachaCharacter",
 	gachaSpin = "100Spins",
 	gachaInterval = 0.5,
 	gachaMax = 0,
+	gachaSkipCut = true,
+	gachaSkipMethod = "multi",
+	shopBuy = false,
+	shopBuySel = {},
+	shopBuyQty = 1,
+	shopBuyInterval = 5,
+	boostAuto = false,
+	boostEconomy = true,
+	boostSel = { "Booster X2 Mastery : 1Hour", "Booster X2 Points : 1Hour" },
+	boostDelay = 30,
 	mastery = false,
 	masteryList = "Camera man | 30\nTv man | 80\nTV woman | 80\nLarge Speaker man | 80\nSpeaker Strider | 80\nDark Speakerman | 80\nEngineer Camera Man | 10\nScientist TV Man | 80\nLarge TV man | 80",
 	masteryDefault = 80,
@@ -286,6 +299,11 @@ local st = {
 	godHP = 800,
 	godSkipTimer0 = true,
 	antiAfk = true,
+	lowGfx = false,
+	noShadow = false,
+	noFog = false,
+	noParticles = false,
+	fpsUnlock = false,
 	webhook = false,
 	webhookUrl = "",
 	webhookDelay = 60,
@@ -331,6 +349,7 @@ local healRequested = false
 local lastHealT = 0
 local resetDone = false
 local godBusy = false
+local astroSnapNext = false
 local sendWebhook
 
 local function splitList(s)
@@ -608,6 +627,7 @@ local AstroTab = ele(Window, "Tab", { Title = "Astro", Icon = "star", Border = t
 local LobbyTab = ele(Window, "Tab", { Title = "Lobby", Icon = "user", Border = true })
 local MasteryTab = ele(Window, "Tab", { Title = "Mastery", Icon = "target", Border = true })
 local GachaTab = ele(Window, "Tab", { Title = "Gacha", Icon = "gift", Border = true })
+local ShopTab = ele(Window, "Tab", { Title = "Shop", Icon = "shopping-cart", Border = true })
 local SettingsTab = ele(Window, "Tab", { Title = "Settings", Icon = "settings", Border = true })
 
 local FarmSec = ele(FarmTab, "Section", { Title = "Farm" })
@@ -691,7 +711,50 @@ ele(SkillSec, "Toggle", {
 		st.skills = v
 	end,
 })
-ele(SkillSec, "Input", {
+local skillCombatInput, skillWaveInput, skillWaveListInput
+local SKILL_PRESETS = {
+	["Dark Speaker (default)"] = {
+		combat = "SoundWave | SoundWave_Cooldown | SoundImprovement\nSwing | Swing_Cooldown",
+		wave = "SpeakerCarrier | SpeakerCarrier_Cooldown\nBuffSpeakerMan | Buff_Cooldown",
+		waves = "2,9,17,26,29,30,31",
+	},
+	["Speaker Strider"] = {
+		combat = "SoundWave | SoundWave_Cooldown",
+		wave = "SpeakerCarrier | SpeakerCarrier_Cooldown",
+		waves = "2,9,17,26,29,30,31",
+	},
+}
+ele(SkillSec, "Dropdown", {
+	Title = "Character preset",
+	Desc = "Fills combat / wave / wave list below",
+	Values = { "Dark Speaker (default)", "Speaker Strider" },
+	Value = 1,
+	Callback = function(v)
+		local p = SKILL_PRESETS[v]
+		if not p then
+			return
+		end
+		st.skillCombatList = p.combat
+		st.skillWaveList = p.wave
+		st.waveList = p.waves
+		pcall(function()
+			if skillCombatInput then
+				skillCombatInput:Set(p.combat)
+			end
+		end)
+		pcall(function()
+			if skillWaveInput then
+				skillWaveInput:Set(p.wave)
+			end
+		end)
+		pcall(function()
+			if skillWaveListInput then
+				skillWaveListInput:Set(p.waves)
+			end
+		end)
+	end,
+})
+skillCombatInput = ele(SkillSec, "Input", {
 	Title = "Combat skills",
 	Desc = "Remote | Cooldown | RequireChild | args  (one per line)",
 	Type = "Textarea",
@@ -700,7 +763,7 @@ ele(SkillSec, "Input", {
 		st.skillCombatList = v
 	end,
 })
-ele(SkillSec, "Input", {
+skillWaveInput = ele(SkillSec, "Input", {
 	Title = "Wave skills",
 	Desc = "Fired on waves from the wave list",
 	Type = "Textarea",
@@ -723,7 +786,7 @@ ele(SkillSec, "Slider", {
 		st.skillDelay = v
 	end,
 })
-ele(SkillSec, "Input", {
+skillWaveListInput = ele(SkillSec, "Input", {
 	Title = "Wave list",
 	Value = "2,9,17,26,29,30,31",
 	Callback = function(v)
@@ -836,6 +899,9 @@ ele(GodSec, "Keybind", {
 		godBusy = true
 		task.spawn(function()
 			local okR = respawnNow()
+			if okR and st.astro then
+				astroSnapNext = true
+			end
 			notify("God", "respawn: " .. (okR and "ok" or "FAIL"), "info", 2)
 			task.wait(1)
 			godBusy = false
@@ -884,6 +950,16 @@ ele(AstroSec, "Toggle", {
 	Value = true,
 	Callback = function(v)
 		st.astroHeal = v
+	end,
+})
+ele(AstroSec, "Input", {
+	Title = "Custom route points",
+	Desc = "Paste Vector3 lines from pos_copier. Leave empty to use default 9 points.",
+	Type = "Textarea",
+	Value = "",
+	Placeholder = "Vector3.new(-646, 276, 453)...",
+	Callback = function(v)
+		st.astroPointsText = v or ""
 	end,
 })
 ele(AstroSec, "Toggle", {
@@ -1042,6 +1118,33 @@ ele(GachaSec, "Keybind", {
 ele(GachaSec, "Toggle", { Title = "Auto-open gacha", Value = false, Callback = function(v)
 	st.gachaAuto = v
 end })
+ele(GachaSec, "Toggle", {
+	Title = "Skip cutscene",
+	Desc = "Fast-skips gacha cutscene via multiple methods",
+	Value = true,
+	Callback = function(v)
+		st.gachaSkipCut = v
+		if not v then
+			gachaStopCamForce()
+		end
+	end,
+})
+ele(GachaSec, "Dropdown", {
+	Title = "Skip method",
+	Desc = "multi = all methods. Try others if multi fails.",
+	Values = { "Multi (all)", "Click only", "Firesignal only", "Anim break", "Speed hack" },
+	Value = 1,
+	Callback = function(v)
+		local map = {
+			["Multi (all)"] = "multi",
+			["Click only"] = "click",
+			["Firesignal only"] = "firesignal",
+			["Anim break"] = "animbreak",
+			["Speed hack"] = "speed",
+		}
+		st.gachaSkipMethod = map[v] or "multi"
+	end,
+})
 ele(GachaSec, "Dropdown", {
 	Title = "Page",
 	Values = { "Characters", "Skins" },
@@ -1073,6 +1176,172 @@ ele(GachaSec, "Slider", {
 	Callback = function(v)
 		st.gachaMax = v
 	end,
+})
+local SKIN_OPTIONS = {
+	"Jetpacked Double plunger:4 (Mini UTCM) Leg",
+	"Jetpacked Double plunger:2 (Hyper) Myth",
+	"Speaker woman:2 (Exo Speakerwoman) Leg",
+	"Dark Speakerman:2 (Mythical DSM) Myth",
+	"Dark Speakerman:3 (Brawler DSM) Leg",
+	"Scientist TV Man:1 (Betrayer) Myth",
+	"Energized TV:1 (Titan replica) Myth",
+}
+
+ele(GachaSec, "Toggle", {
+	Title = "Spin for missing skins",
+	Desc = "Auto-spins GachaSkins until selected skins are obtained. Leave empty = all missing.",
+	Value = false,
+	Callback = function(v)
+		st.gachaSkinMode = v
+		if v then
+			notify("Gacha", "skin mode on", "check", 2)
+		else
+			notify("Gacha", "skin mode off", "info", 2)
+		end
+	end,
+})
+ele(GachaSec, "Dropdown", {
+	Title = "Skins to get",
+	Desc = "Multi-select from known skins. Empty = all missing.",
+	Values = SKIN_OPTIONS,
+	Value = {},
+	Multi = true,
+	Callback = function(v)
+		local out = {}
+		if type(v) == "table" then
+			for _, x in ipairs(v) do
+				local key = tostring(x):match("^(%S+:%d+)")
+				if key then
+					out[#out + 1] = key
+				end
+			end
+		end
+		st.gachaSkinSel = out
+	end,
+})
+local gachaSkinInfo = ele(GachaSec, "Paragraph", {
+	Title = "Missing skins",
+	Content = "checking...",
+})
+
+local function multiNames(v)
+	if type(v) == "table" then
+		local out = {}
+		for _, x in ipairs(v) do
+			local s = tostring(x)
+			if s ~= "" then
+				out[#out + 1] = s
+			end
+		end
+		return out
+	end
+	if v ~= nil and tostring(v) ~= "" then
+		return { tostring(v) }
+	end
+	return {}
+end
+
+local BOOSTER_NAMES = {
+	"Booster X2 Mastery : 30Min",
+	"Booster X2 Mastery : 1Hour",
+	"Booster X2 Mastery : 6Hour",
+	"Booster X2 Points : 30Min",
+	"Booster X2 Points : 1Hour",
+	"Booster X2 Points : 6Hour",
+}
+
+local SHOP_IDS = {
+	"BSX2:30",
+	"BSX2:60",
+}
+
+local ShopSec = ele(ShopTab, "Section", { Title = "Hourly Shop (auto buy)" })
+ele(ShopSec, "Toggle", {
+	Title = "Auto buy",
+	Desc = "Buys selected items via BuyItemFromShopHourly",
+	Value = false,
+	Flag = "shopBuy",
+	Callback = function(on)
+		st.shopBuy = on
+		if on then
+			notify("Shop", "auto buy on", "check", 2)
+		else
+			notify("Shop", "auto buy off", "info", 2)
+		end
+	end,
+})
+ele(ShopSec, "Dropdown", {
+	Title = "Items to buy",
+	Desc = "Multi-select. BSX2:30 = mastery 30min, BSX2:60 = mastery 60min.",
+	Values = SHOP_IDS,
+	Value = multiNames(st.shopBuySel),
+	Multi = true,
+	Callback = function(v)
+		st.shopBuySel = multiNames(v)
+	end,
+})
+ele(ShopSec, "Slider", {
+	Title = "Quantity per item",
+	Step = 1,
+	Value = { Min = 1, Max = 50, Default = 1 },
+	Callback = function(v)
+		st.shopBuyQty = v
+	end,
+})
+ele(ShopSec, "Slider", {
+	Title = "Buy interval (sec)",
+	Desc = "Game client uses a 5s debounce; keep >= 5",
+	Step = 1,
+	Value = { Min = 5, Max = 60, Default = 5 },
+	Callback = function(v)
+		st.shopBuyInterval = math.max(5, v)
+	end,
+})
+local BoostSec = ele(ShopTab, "Section", { Title = "Auto boosters (Boosts remote)" })
+ele(BoostSec, "Toggle", {
+	Title = "Use boosters",
+	Desc = "Fires ReplicatedStorage.Boosts for owned selected boosters",
+	Value = false,
+	Flag = "boostAuto",
+	Callback = function(on)
+		st.boostAuto = on
+		if on then
+			notify("Boosts", "auto use on", "check", 2)
+		else
+			notify("Boosts", "auto use off", "info", 2)
+		end
+	end,
+})
+ele(BoostSec, "Toggle", {
+	Title = "Economy mode",
+	Desc = "Only uses a booster when the matching timer hits zero",
+	Value = true,
+	Flag = "boostEconomy",
+	Callback = function(on)
+		st.boostEconomy = on
+	end,
+})
+ele(BoostSec, "Dropdown", {
+	Title = "Boosters",
+	Desc = "Multi-select known boosters (used only if in inventory)",
+	Values = BOOSTER_NAMES,
+	Value = multiNames(st.boostSel),
+	Multi = true,
+	Callback = function(v)
+		st.boostSel = multiNames(v)
+	end,
+})
+ele(BoostSec, "Slider", {
+	Title = "Delay per booster (sec)",
+	Step = 1,
+	Value = { Min = 5, Max = 300, Default = 30 },
+	Callback = function(v)
+		st.boostDelay = v
+	end,
+})
+local boostActiveInfo = ele(BoostSec, "Paragraph", {
+	Title = "Active boosters",
+	Content = "checking...",
 })
 
 local SetSec = ele(SettingsTab, "Section", { Title = "Appearance" })
@@ -1118,6 +1387,91 @@ ele(AfkSec, "Toggle", {
 		if v then
 			notify("Anti-AFK", "enabled", "check", 2)
 		end
+	end,
+})
+
+local OptSec = ele(SettingsTab, "Section", { Title = "Performance" })
+ele(OptSec, "Toggle", {
+	Title = "Low graphics",
+	Desc = "Sets QualityLevel to 1 (minimum). Big FPS boost on weak GPUs.",
+	Value = false,
+	Callback = function(on)
+		st.lowGfx = on
+		pcall(function()
+			settings().Rendering.QualityLevel = on and Enum.QualityLevel.Level01 or Enum.QualityLevel.Level21
+		end)
+		notify("Perf", on and "low graphics ON" or "low graphics OFF", "info", 2)
+	end,
+})
+ele(OptSec, "Toggle", {
+	Title = "No shadows",
+	Desc = "Disables global shadows (Lighting.GlobalShadows)",
+	Value = false,
+	Callback = function(on)
+		st.noShadow = on
+		pcall(function()
+			game:GetService("Lighting").GlobalShadows = not on
+		end)
+		notify("Perf", on and "shadows OFF" or "shadows ON", "info", 2)
+	end,
+})
+ele(OptSec, "Toggle", {
+	Title = "No fog",
+	Desc = "Removes fog rendering (FogEnd = huge)",
+	Value = false,
+	Callback = function(on)
+		st.noFog = on
+		pcall(function()
+			local l = game:GetService("Lighting")
+			if on then
+				l.FogEnd = 1000000
+				l.FogStart = 1000000
+			else
+				l.FogEnd = 100000
+				l.FogStart = 0
+			end
+		end)
+		notify("Perf", on and "fog OFF" or "fog ON", "info", 2)
+	end,
+})
+ele(OptSec, "Toggle", {
+	Title = "Strip particles",
+	Desc = "Hides ParticleEmitters and Beams in Workspace (visual only)",
+	Value = false,
+	Callback = function(on)
+		st.noParticles = on
+		task.spawn(function()
+			if on then
+				local n = 0
+				pcall(function()
+					for _, d in ipairs(workspace:GetDescendants()) do
+						if d:IsA("ParticleEmitter") or d:IsA("Beam") then
+							d.Enabled = false
+							n = n + 1
+						end
+					end
+				end)
+				notify("Perf", "stripped " .. n .. " particles/beams", "check", 2)
+			else
+				notify("Perf", "particles restored (rejoin for full restore)", "info", 3)
+			end
+		end)
+	end,
+})
+ele(OptSec, "Toggle", {
+	Title = "FPS unlock",
+	Desc = "Removes frame rate cap via Rendering quality settings",
+	Value = false,
+	Callback = function(on)
+		st.fpsUnlock = on
+		pcall(function()
+			if on then
+				setfpscap(9999)
+			else
+				setfpscap(60)
+			end
+		end)
+		notify("Perf", on and "FPS uncapped" or "FPS capped 60", "info", 2)
 	end,
 })
 
@@ -1300,6 +1654,8 @@ task.spawn(function()
 	local phaseStart = 0
 	local lastErr = 0
 	local READY_VOTE_DELAY = 10
+	local voteSentAt = 0
+	local votedConfirmedAt = 0
 
 	while alive() do
 		task.wait(0.4)
@@ -1307,28 +1663,37 @@ task.spawn(function()
 			local t = now()
 			local ok, err = pcall(function()
 				local votingNow = ws:FindFirstChild("Voteing") and ws.Voteing.Value == true
+				local voteUIOpen = ws:FindFirstChild("OpenVoteUI") ~= nil
+				local voteActive = votingNow or voteUIOpen
 				local wave = ws:FindFirstChild("Wave") and ws.Wave.Value or 0
 
-				if votingNow then
+				if voteActive then
 					if phaseStart == 0 then
 						phaseStart = t
 					end
 				else
 					phaseStart = 0
 					votedPhase = false
+					voteSentAt = 0
+					votedConfirmedAt = 0
 				end
 				if wave > 0 then
 					votedPhase = false
+					voteSentAt = 0
+					votedConfirmedAt = 0
 				end
 
-				if st.vote and votingNow then
+				if st.vote and voteActive then
 					local mine = currentVote()
 					if mine == st.voteMode then
-						votedPhase = true
-					elseif not votedPhase or (t - lastVote > 20) then
+						if not votedPhase then
+							votedPhase = true
+							votedConfirmedAt = t
+						end
+					elseif (not votedPhase or (t - lastVote > 20)) and (t - lastVote > 2) then
 						lastVote = t
 						if fireVote(st.voteMode) then
-							votedPhase = true
+							voteSentAt = t
 							notify("Lobby", "voted " .. st.voteMode, "check", 2)
 							print("[rathub] voted " .. st.voteMode)
 						else
@@ -1337,11 +1702,22 @@ task.spawn(function()
 					end
 				end
 
-				local readyBlocked = votingNow and not votedPhase
-				if (votingNow or (ws:FindFirstChild("OpenVoteUI") ~= nil)) and phaseStart > 0 then
-					if (t - phaseStart) < READY_VOTE_DELAY and not votedPhase then
+				local readyBlocked = false
+				if voteActive and not votedPhase then
+					if st.vote then
+						readyBlocked = true
+					elseif phaseStart > 0 and (t - phaseStart) < READY_VOTE_DELAY then
 						readyBlocked = true
 					end
+				end
+				if st.vote and voteSentAt > 0 and not votedPhase then
+					readyBlocked = true
+				end
+				if votedConfirmedAt > 0 and (t - votedConfirmedAt) < 3 then
+					readyBlocked = true
+				end
+				if voteSentAt > 0 and (t - voteSentAt) < 3 then
+					readyBlocked = true
 				end
 				if st.ready and not readyBlocked and wave == 0 then
 					local nr = isNotReady()
@@ -1526,6 +1902,108 @@ task.spawn(function()
 	end
 end)
 
+local function getOwnedSkins()
+	local owned = {}
+	pcall(function()
+		local data = lp:FindFirstChild("_Data")
+		local skins = data and data:FindFirstChild("Skins")
+		if skins then
+			for _, v in ipairs(skins:GetChildren()) do
+				owned[v.Name] = true
+			end
+		end
+	end)
+	return owned
+end
+
+local function getAllSkinKeys()
+	local keys = {}
+	pcall(function()
+		local sf = rs:FindFirstChild("SkinFolders")
+		if sf then
+			for _, m in ipairs(sf:GetChildren()) do
+				keys[#keys + 1] = m.Name
+			end
+		end
+	end)
+	return keys
+end
+
+local function findMissingSkins(wanted)
+	local owned = getOwnedSkins()
+	local missing = {}
+	if wanted and #wanted > 0 then
+		for _, k in ipairs(wanted) do
+			if not owned[k] then
+				missing[#missing + 1] = k
+			end
+		end
+	else
+		local all = getAllSkinKeys()
+		for _, k in ipairs(all) do
+			if not owned[k] then
+				missing[#missing + 1] = k
+			end
+		end
+	end
+	return missing
+end
+
+task.spawn(function()
+	local lastCheck = 0
+	local lastSpin = 0
+	local lastNotify = 0
+	local spinCount = 0
+	while alive() do
+		task.wait(0.5)
+		if st.gacha and st.gachaSkinMode then
+			local t = now()
+			if t - lastCheck > 2 then
+				lastCheck = t
+				local wanted = st.gachaSkinSel or {}
+				local missing = findMissingSkins(wanted)
+				if gachaSkinInfo then
+					local n = #missing
+					local preview = ""
+					for i = 1, math.min(3, n) do
+						preview = preview .. (i > 1 and ", " or "") .. missing[i]
+					end
+					if n > 3 then
+						preview = preview .. " +" .. (n - 3) .. " more"
+					end
+					local txt = n == 0 and "All skins owned!" or ("Missing " .. n .. ": " .. preview)
+					pcall(function()
+						if gachaSkinInfo.Set then
+							gachaSkinInfo:Set(txt)
+						else
+							gachaSkinInfo.Content = txt
+						end
+					end)
+				end
+				if #missing > 0 then
+					local rem = rs:FindFirstChild("GachaSkins")
+					if rem and t - lastSpin >= st.gachaInterval then
+						lastSpin = t
+						pcall(function()
+							rem:FireServer(st.gachaSpin)
+						end)
+						spinCount = spinCount + 1
+						if t - lastNotify > 30 then
+							lastNotify = t
+							notify("Gacha", "skin spins: " .. spinCount .. ", missing: " .. #missing, "info", 2)
+						end
+					end
+				else
+					if t - lastNotify > 10 then
+						lastNotify = t
+						notify("Gacha", "all skins obtained!", "check", 3)
+					end
+				end
+			end
+		end
+	end
+end)
+
 local playerNames = {}
 
 local function refreshPlayerNames()
@@ -1679,6 +2157,480 @@ local VIM
 pcall(function()
 	VIM = game:GetService("VirtualInputManager")
 end)
+
+local function clickGuiButton(btn)
+	if not btn then
+		return
+	end
+	pcall(function()
+		if type(firesignal) == "function" then
+			firesignal(btn.Activated)
+			return
+		end
+		if getconnections and type(getconnections) == "function" then
+			local cons = getconnections(btn.Activated)
+			if cons and #cons > 0 then
+				for _, c in ipairs(cons) do
+					pcall(function()
+						c:Fire()
+					end)
+				end
+				return
+			end
+		end
+		if VIM then
+			local pos = btn.AbsolutePosition + btn.AbsoluteSize / 2
+			VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 1)
+			task.wait(0.05)
+			VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 1)
+		end
+	end)
+end
+
+local gachaBtnHidden = false
+
+local function gachaRestoreBtn()
+	local plrGui = lp:FindFirstChild("PlayerGui")
+	if not plrGui then
+		return
+	end
+	pcall(function()
+		local bottom = plrGui:FindFirstChild("UIHandlerPlayer")
+		local m1 = bottom and bottom:FindFirstChild("Main")
+		local btm = m1 and m1:FindFirstChild("Bottom")
+		local m2 = btm and btm:FindFirstChild("Main")
+		local v1 = m2 and m2:FindFirstChild("V1")
+		local ui = v1 and v1:FindFirstChild("UI")
+		local btnFrame = ui and ui:FindFirstChild("Btn")
+		local g = btnFrame and btnFrame:FindFirstChild("Gacha")
+		if g then
+			g.Visible = true
+		end
+	end)
+end
+
+local function gachaHideBtn()
+	local plrGui = lp:FindFirstChild("PlayerGui")
+	if not plrGui then
+		return
+	end
+	pcall(function()
+		local bottom = plrGui:FindFirstChild("UIHandlerPlayer")
+		local m1 = bottom and bottom:FindFirstChild("Main")
+		local btm = m1 and m1:FindFirstChild("Bottom")
+		local m2 = btm and btm:FindFirstChild("Main")
+		local v1 = m2 and m2:FindFirstChild("V1")
+		local ui = v1 and v1:FindFirstChild("UI")
+		local btnFrame = ui and ui:FindFirstChild("Btn")
+		local g = btnFrame and btnFrame:FindFirstChild("Gacha")
+		if g and g.Visible then
+			g.Visible = false
+			gachaBtnHidden = true
+		end
+	end)
+end
+
+local function gachaDestroyCutscene()
+	pcall(function()
+		for _, c in ipairs(lp:GetChildren()) do
+			local n = c.Name
+			if n == "GachaMoment" or n == "GachaMomment" or n == "GachaMoment2" then
+				c:Destroy()
+			end
+		end
+	end)
+	pcall(function()
+		for _, c in ipairs(ws:GetChildren()) do
+			local n = c.Name
+			if n == "GachaMoment" or n == "GachaRoom" or n == "ParticleGacha" then
+				c:Destroy()
+			end
+		end
+	end)
+	pcall(function()
+		local gui = lp.PlayerGui and lp.PlayerGui:FindFirstChild("GachaUI")
+		if gui then
+			gui:Destroy()
+		end
+	end)
+end
+
+local function gachaRestoreCamera()
+	pcall(function()
+		local cam = workspace.CurrentCamera
+		if cam.CameraType ~= Enum.CameraType.Custom then
+			cam.CameraType = Enum.CameraType.Custom
+		end
+	end)
+	pcall(function()
+		local char = lp.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		local root = char and char:FindFirstChild("HumanoidRootPart")
+		if hum and root then
+			workspace.CurrentCamera.CameraSubject = hum
+			workspace.CurrentCamera.CFrame = root.CFrame * CFrame.new(0, 2, 8)
+		end
+	end)
+end
+
+local function gachaSkipClick(sg)
+	local skipBtn = sg and sg:FindFirstChild("Main") and sg.Main:FindFirstChild("TextButton")
+	if skipBtn then
+		clickGuiButton(skipBtn)
+		return true
+	end
+	return false
+end
+
+local function gachaSkipFiresignal(sg)
+	local skipBtn = sg and sg:FindFirstChild("Main") and sg.Main:FindFirstChild("TextButton")
+	if skipBtn then
+		pcall(function()
+			for _, conn in ipairs(getconnections(skipBtn.Activated)) do
+				conn:Fire()
+			end
+		end)
+		pcall(function()
+			for _, conn in ipairs(getconnections(skipBtn.MouseButton1Click)) do
+				conn:Fire()
+			end
+		end)
+		return true
+	end
+	return false
+end
+
+local function gachaSkipAnimBreak()
+	pcall(function()
+		local char = lp.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		if hum then
+			hum:ChangeState(Enum.HumanoidStateType.Running)
+			hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+		end
+	end)
+	pcall(function()
+		local animController = workspace.CurrentCamera:FindFirstChildOfClass("Animator")
+		if animController then
+			for _, track in ipairs(animController:GetPlayingAnimationTracks()) do
+				track:Stop(0)
+			end
+		end
+	end)
+end
+
+local function gachaSkipSpeedHack()
+	pcall(function()
+		local char = lp.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		if hum then
+			hum.WalkSpeed = 500
+			task.wait(0.1)
+			hum.WalkSpeed = 16
+		end
+	end)
+end
+
+local gachaCamConn = nil
+
+local function gachaStartCamForce()
+	if gachaCamConn then
+		return
+	end
+	gachaCamConn = RunService.Heartbeat:Connect(function()
+		if not alive() or not st.gachaSkipCut then
+			if gachaCamConn then
+				gachaCamConn:Disconnect()
+				gachaCamConn = nil
+			end
+			return
+		end
+		pcall(function()
+			local cam = workspace.CurrentCamera
+			if cam.CameraType == Enum.CameraType.Scriptable then
+				cam.CameraType = Enum.CameraType.Custom
+				local char = lp.Character
+				local hum = char and char:FindFirstChildOfClass("Humanoid")
+				local root = char and char:FindFirstChild("HumanoidRootPart")
+				if hum and root then
+					cam.CameraSubject = hum
+					cam.CFrame = root.CFrame * CFrame.new(0, 2, 8)
+				end
+			end
+		end)
+	end)
+end
+
+local function gachaStopCamForce()
+	if gachaCamConn then
+		gachaCamConn:Disconnect()
+		gachaCamConn = nil
+	end
+end
+
+task.spawn(function()
+	local lastSkip = 0
+	local lastErr = 0
+	while alive() do
+		task.wait(0.1)
+		if st.gachaSkipCut then
+			local t = now()
+			local ok, err = pcall(function()
+				gachaDestroyCutscene()
+				gachaStartCamForce()
+				local cam = workspace.CurrentCamera
+				if cam.CameraType == Enum.CameraType.Scriptable then
+					cam.CameraType = Enum.CameraType.Custom
+					local char = lp.Character
+					local hum = char and char:FindFirstChildOfClass("Humanoid")
+					local root = char and char:FindFirstChild("HumanoidRootPart")
+					if hum and root then
+						cam.CameraSubject = hum
+						cam.CFrame = root.CFrame * CFrame.new(0, 2, 8)
+					end
+				end
+				local plrGui = lp:FindFirstChild("PlayerGui")
+				if not plrGui then
+					return
+				end
+				local sg = plrGui:FindFirstChild("SkipGacha")
+				local moment = ws:FindFirstChild("GachaMoment")
+				local hasMoment = false
+				for _, c in ipairs(lp:GetChildren()) do
+					if c.Name == "GachaMoment" or c.Name == "GachaMomment" then
+						hasMoment = true
+						break
+					end
+				end
+				local cutscene = (sg and sg.Enabled == true) or (moment ~= nil) or hasMoment
+				if not cutscene then
+					if gachaBtnHidden then
+						gachaBtnHidden = false
+						gachaRestoreBtn()
+					end
+					return
+				end
+				if t - lastSkip < 0.1 then
+					return
+				end
+				lastSkip = t
+				gachaHideBtn()
+				local method = st.gachaSkipMethod or "multi"
+				if method == "click" then
+					gachaSkipClick(sg)
+				elseif method == "firesignal" then
+					gachaSkipFiresignal(sg)
+				elseif method == "animbreak" then
+					gachaSkipAnimBreak()
+				elseif method == "speed" then
+					gachaSkipSpeedHack()
+				else
+					gachaSkipClick(sg)
+					gachaSkipFiresignal(sg)
+				end
+				gachaRestoreCamera()
+			end)
+			if not ok and t - lastErr > 5 then
+				lastErr = t
+				print("[rathub-gacha-skip] " .. tostring(err))
+			end
+		end
+	end
+end)
+local function shopGateOpen()
+	local sandbox = rs:FindFirstChild("SandboxMode")
+	local vipCode = rs:FindFirstChild("OwnerVIPServerCode")
+	if sandbox and sandbox.Value == true then
+		return false
+	end
+	if vipCode and vipCode.Value ~= "" then
+		return false
+	end
+	return true
+end
+
+local shopBuyCursor = 1
+local shopStock = {}
+
+do
+	local rem = rs:FindFirstChild("ShopUpdated")
+	if rem then
+		rem.OnClientEvent:Connect(function(args)
+			local stock = args and args.Stock
+			if type(stock) == "table" then
+				shopStock = stock
+			end
+		end)
+	end
+end
+
+task.spawn(function()
+	local lastBuy = 0
+	local lastNotify = 0
+	while alive() do
+		task.wait(0.5)
+		if st.shopBuy then
+			local t = now()
+			local interval = math.max(5, tonumber(st.shopBuyInterval) or 5)
+			if t - lastBuy >= interval then
+				if not shopGateOpen() then
+					if t - lastNotify > 10 then
+						lastNotify = t
+						notify("Shop", "blocked (sandbox or vip code)", "info", 2)
+					end
+				else
+					local ids = st.shopBuySel or {}
+					if #ids == 0 then
+						if t - lastNotify > 15 then
+							lastNotify = t
+							notify("Shop", "select items in the dropdown", "info", 2)
+						end
+					else
+						local qty = math.max(1, tonumber(st.shopBuyQty) or 1)
+						local rem = rs:FindFirstChild("BuyItemFromShopHourly")
+						if rem then
+							local tries = 0
+							while tries < #ids do
+								if shopBuyCursor > #ids then
+									shopBuyCursor = 1
+								end
+								local id = ids[shopBuyCursor]
+								shopBuyCursor = shopBuyCursor + 1
+								tries = tries + 1
+								local stock = tonumber(shopStock[id])
+								if stock and stock > 0 then
+									local buyQty = math.min(qty, stock)
+									pcall(function()
+										rem:FireServer(id, buyQty)
+									end)
+									lastBuy = t
+									if t - lastNotify > 3 then
+										lastNotify = t
+										notify("Shop", "bought " .. id .. " x" .. buyQty, "check", 2)
+									end
+									break
+								end
+							end
+							if tries >= #ids and t - lastNotify > 15 then
+								lastNotify = t
+								notify("Shop", "all selected items out of stock", "info", 2)
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+end)
+
+local boostLastUse = {}
+local boostTypeLock = {}
+
+local function boosterKey(name)
+	name = tostring(name)
+	if name:find("Mastery") then
+		return "BoostMastery"
+	end
+	if name:find("Points") then
+		return "BoostPoints"
+	end
+	return nil
+end
+
+local function activeBoostSec(key)
+	local bd = lp:FindFirstChild("BoostsData")
+	local v = bd and bd:FindFirstChild(key)
+	if v then
+		local ok, val = pcall(function()
+			return tonumber(v.Value)
+		end)
+		if ok and val then
+			return math.max(0, val)
+		end
+	end
+	return 0
+end
+
+local function fmtHMS(sec)
+	sec = math.max(0, math.floor(sec))
+	local h = math.floor(sec / 3600)
+	local m = math.floor((sec % 3600) / 60)
+	local s = sec % 60
+	return string.format("%02d:%02d:%02d", h, m, s)
+end
+
+task.spawn(function()
+	local lastText = ""
+	while alive() do
+		task.wait(1)
+		local mas = activeBoostSec("BoostMastery")
+		local pts = activeBoostSec("BoostPoints")
+		local masTxt = mas > 0 and fmtHMS(mas) or "off"
+		local ptsTxt = pts > 0 and fmtHMS(pts) or "off"
+		local txt = "X2 Mastery: " .. masTxt .. "  |  X2 Points: " .. ptsTxt
+		if txt ~= lastText then
+			lastText = txt
+			pcall(function()
+				if boostActiveInfo.Set then
+					boostActiveInfo:Set(txt)
+				else
+					boostActiveInfo.Content = txt
+				end
+			end)
+		end
+	end
+end)
+
+task.spawn(function()
+	while alive() do
+		task.wait(1)
+		if st.boostAuto then
+			local rem = rs:FindFirstChild("Boosts")
+			local items = lp:FindFirstChild("ItemsFolder")
+			if rem and items then
+				local t = now()
+				local delayN = math.max(5, tonumber(st.boostDelay) or 30)
+				for _, name in ipairs(st.boostSel) do
+					local inv = items:FindFirstChild(name)
+					if inv then
+						local count = 0
+						pcall(function()
+							count = tonumber(tostring(inv.Value):match("^(%d+)")) or 0
+						end)
+						local last = boostLastUse[name] or 0
+						if count > 0 and t - last >= delayN then
+							local okToUse = true
+							if st.boostEconomy then
+								local key = boosterKey(name)
+								if key and activeBoostSec(key) > 0 then
+									okToUse = false
+								end
+								if boostTypeLock[key] and t - boostTypeLock[key] < 8 then
+									okToUse = false
+								end
+							end
+							if okToUse then
+								pcall(function()
+									rem:FireServer(name)
+								end)
+								boostLastUse[name] = t
+								local key = boosterKey(name)
+								if key then
+									boostTypeLock[key] = t
+								end
+								notify("Boosts", "used " .. name, "check", 2)
+								if st.boostEconomy then
+									break
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+end)
+
 local gearKeys = {}
 
 local function normKey(s)
@@ -2201,6 +3153,34 @@ local ASTRO_POINTS = {
 	Vector3.new(-293.5099182128906, 174.0532684326172, 122.78317260742188),
 }
 
+local function parseAstroPoints(text)
+	if type(text) ~= "string" or text == "" then
+		return nil
+	end
+	local out = {}
+	for line in text:gmatch("[^\r\n]+") do
+		local a, b, c = line:match("Vector3%.new%(%s*([%-%d%.]+)%s*,%s*([%-%d%.]+)%s*,%s*([%-%d%.]+)%s*%)")
+		if not a then
+			a, b, c = line:match("^%s*([%-%d%.]+)%s+([%-%d%.]+)%s+([%-%d%.]+)%s*$")
+		end
+		if a then
+			out[#out + 1] = Vector3.new(tonumber(a), tonumber(b), tonumber(c))
+		end
+	end
+	if #out == 0 then
+		return nil
+	end
+	return out
+end
+
+local function astroRoutePoints()
+	local custom = parseAstroPoints(st.astroPointsText)
+	if custom then
+		return custom
+	end
+	return ASTRO_POINTS
+end
+
 local idx = 1
 local teleported = false
 local lastHeal = 0
@@ -2219,6 +3199,25 @@ RunService.Heartbeat:Connect(function(dt)
 		end
 		if godBusy then
 			return
+		end
+
+		if astroSnapNext then
+			astroSnapNext = false
+			teleported = false
+			local pts = astroRoutePoints()
+			local nearest, nd
+			for i, p in ipairs(pts) do
+				local d = (p - hrp.Position).Magnitude
+				if not nd or d < nd then
+					nd = d
+					nearest = i
+				end
+			end
+			if nearest then
+				idx = nearest
+				setPosFacing(hrp, pts[idx], pts[idx])
+				print("[rathub] respawn snap to astro point " .. idx)
+			end
 		end
 
 		local tw = ws:FindFirstChild("TimerWave")
@@ -2271,12 +3270,16 @@ RunService.Heartbeat:Connect(function(dt)
 			end
 		end
 
-		local goal = ASTRO_POINTS[idx]
+		local pts = astroRoutePoints()
+		if idx > #pts then
+			idx = 1
+		end
+		local goal = pts[idx]
 		local pos = hrp.Position
 		local dist = (goal - pos).Magnitude
 		if dist <= 3 then
-			idx = idx % #ASTRO_POINTS + 1
-			goal = ASTRO_POINTS[idx]
+			idx = idx % #pts + 1
+			goal = pts[idx]
 			dist = (goal - pos).Magnitude
 		end
 		local step = math.min(st.astroSpeed * dt, dist)
@@ -2508,6 +3511,9 @@ task.spawn(function()
 				godLastT = t
 				godBusy = true
 				local okR = respawnNow()
+				if okR and st.astro then
+					astroSnapNext = true
+				end
 				notify("God", "reset (hp " .. math.floor(hp) .. ") " .. (okR and "ok" or "FAIL"), "info", 3)
 				task.wait(0.4)
 				godBusy = false
