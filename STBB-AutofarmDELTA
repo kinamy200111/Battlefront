@@ -1212,7 +1212,7 @@ ele(GachaSec, "Dropdown", {
 		local out = {}
 		if type(v) == "table" then
 			for _, x in ipairs(v) do
-				local key = tostring(x):match("^(%S+:%d+)")
+				local key = tostring(x):match("^(.-:%d+)")
 				if key then
 					out[#out + 1] = key
 				end
