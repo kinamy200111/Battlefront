@@ -885,8 +885,8 @@ godToggle = ele(GodSec, "Toggle", {
 ele(GodSec, "Slider", {
 	Title = "Reset below HP",
 	Desc = "Above your max HP it falls back to half of max HP",
-	Step = 50,
-	Value = { Min = 200, Max = 10000, Default = 800 },
+	Step = 1,
+	Value = { Min = 1, Max = 10000, Default = 800 },
 	Callback = function(v)
 		st.godHP = v
 	end,
@@ -976,8 +976,8 @@ ele(AstroSec, "Toggle", {
 ele(AstroSec, "Slider", {
 	Title = "Reset below HP",
 	Desc = "Shared with Farm > God mode: respawns below this HP",
-	Step = 50,
-	Value = { Min = 200, Max = 10000, Default = 800 },
+	Step = 1,
+	Value = { Min = 1, Max = 10000, Default = 800 },
 	Callback = function(v)
 		st.godHP = v
 	end,
