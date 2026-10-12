@@ -825,11 +825,13 @@ ele(HealSec, "Slider", {
 
 local LootSec = ele(FarmTab, "Section", { Title = "Auto Loot (Gears)" })
 ele(LootSec, "Toggle", {
-	Title = "Loot when no enemies",
+	Title = "Auto Loot",
 	Desc = "Runs with Farm on or off (full hold interaction)",
-	Value = true,
+	Value = st.loot,
+	Flag = "loot",
 	Callback = function(v)
 		st.loot = v
+		notify("Loot", v and "auto loot on" or "auto loot off", v and "check" or "info", 2)
 	end,
 })
 ele(LootSec, "Slider", {
@@ -1554,9 +1556,6 @@ end
 local function readyRemote()
 	return rs:FindFirstChild("GetReadyRemote")
 end
-local function autoReadyZone()
-	return ws:FindFirstChild("AutoReady")
-end
 
 local function currentVote()
 	local v = ws:FindFirstChild("Vote")
@@ -1722,10 +1721,6 @@ task.spawn(function()
 				if st.ready and not readyBlocked and wave == 0 then
 					local nr = isNotReady()
 					if nr ~= false then
-						if st.readyHover and t - lastReady > 5 then
-							lastReady = t
-							hoverReadyZone()
-						end
 						if t - lastReadyFire > 5 then
 							lastReadyFire = t
 							if fireReady() then
