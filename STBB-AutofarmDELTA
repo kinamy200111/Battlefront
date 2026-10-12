@@ -1875,7 +1875,7 @@ task.spawn(function()
 	local lastErr = 0
 	while alive() do
 		task.wait(st.gachaInterval)
-		if st.gacha and st.gachaAuto then
+		if st.gacha and st.gachaAuto and not st.gachaSkinMode then
 			local t = now()
 			local rem = rs:FindFirstChild(st.gachaType)
 			if rem then
