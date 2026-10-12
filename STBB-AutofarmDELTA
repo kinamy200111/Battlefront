@@ -2354,6 +2354,20 @@ local function gachaSkipSpeedHack()
 	end)
 end
 
+local function gachaClearBlackout()
+	pcall(function()
+		local light = game:GetService("Lighting")
+		local cc = light:FindFirstChild("ColorCorrection")
+		if cc and cc:IsA("ColorCorrectionEffect") and cc.Brightness <= -5 then
+			cc.Enabled = false
+			local bl = light:FindFirstChild("Blur")
+			if bl and bl:IsA("BlurEffect") then
+				bl.Enabled = false
+			end
+		end
+	end)
+end
+
 local gachaCamConn = nil
 
 local function gachaStartCamForce()
@@ -2400,6 +2414,7 @@ task.spawn(function()
 			local t = now()
 			local ok, err = pcall(function()
 				gachaDestroyCutscene()
+				gachaClearBlackout()
 				gachaStartCamForce()
 				local cam = workspace.CurrentCamera
 				if cam.CameraType == Enum.CameraType.Scriptable then
