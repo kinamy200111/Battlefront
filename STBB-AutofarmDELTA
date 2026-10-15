@@ -697,7 +697,6 @@ local SettingsTab = ele(Window, "Tab", { Title = "Settings", Icon = "settings", 
 
 local FarmSec = ele(FarmTab, "Section", { Title = "Farm" })
 local farmToggle
-local farmToggle2
 farmToggle = ele(FarmSec, "Toggle", {
 	Title = "Включит",
 	Desc = "Ну бля сам авто-фарм",
@@ -705,9 +704,6 @@ farmToggle = ele(FarmSec, "Toggle", {
 	Flag = "farm",
 	Callback = function(on)
 		st.farm = on
-		if farmToggle2 then
-			setToggle(farmToggle2, on)
-		end
 		if on then
 			notify("Farm", "started", "check", 2)
 		else
@@ -722,9 +718,6 @@ ele(FarmSec, "Keybind", {
 		local nv = not st.farm
 		st.farm = nv
 		setToggle(farmToggle, nv)
-		if farmToggle2 then
-			setToggle(farmToggle2, nv)
-		end
 	end,
 })
 ele(FarmSec, "Slider", {
@@ -1121,20 +1114,6 @@ ele(TitanSec, "Keybind", {
 		local nv = not st.titanFarm
 		st.titanFarm = nv
 		setToggle(titanToggle, nv)
-	end,
-})
-farmToggle2 = ele(TitanSec, "Toggle", {
-	Title = "Типо персонаж сам добывает титан рекьюст",
-	Desc = "Обычный персонаж фармит бабло пока не купится Titan-Request (то же самое что Enabled во вкладке Farm)",
-	Value = false,
-	Callback = function(on)
-		st.farm = on
-		setToggle(farmToggle, on)
-		if on then
-			notify("Farm", "started", "check", 2)
-		else
-			notify("Farm", "stopped", "info", 2)
-		end
 	end,
 })
 ele(TitanSec, "Slider", {
