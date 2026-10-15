@@ -268,6 +268,22 @@ local st = {
 	astroSpeed = 600,
 	astroHeal = true,
 	astroPointsText = "",
+	titanFarm = false,
+	titanSpeed = 1200,
+	titanRadius = 23,
+	titanOrbitDeg = 23,
+	titanFeetOffset = 58.4,
+	titanPriority = "",
+	titanAutoRequest = true,
+	titanRequestWave = 1,
+	titanShopItem = "Titan-Request",
+	titanPrice = 2200,
+	titanM1 = true,
+	titanSkillDelay = 0.35,
+	titanSkillsOn = true,
+	titanOrbitOnly = true,
+	titanCinema = true,
+	titanResetWave = 10,
 	vote = false,
 	voteMode = "AstroV2",
 	ready = false,
@@ -351,6 +367,18 @@ local resetDone = false
 local godBusy = false
 local astroSnapNext = false
 local sendWebhook
+local titanRequestUsed = false
+
+local function isTitanForm()
+	local ch = lp.Character
+	return ch ~= nil and ch:FindFirstChild("TitanTVScript") ~= nil
+end
+
+-- titan farm includes the normal farm: regular character until the request
+-- is bought and used, titan farm after the form is active
+local function farmOn()
+	return st.farm or (st.titanFarm and not isTitanForm())
+end
 
 local function splitList(s)
 	local out = {}
@@ -447,6 +475,42 @@ local function runSkillList(list, char, cdf, busy)
 			end
 		end
 	end
+end
+
+-- fires ONE skill per call (round-robin from `from`), so abilities go one
+-- after another instead of all at once; returns the index to start next call
+local function runSkillNext(list, char, cdf, busy, from)
+	local n = #list
+	if n == 0 then
+		return from
+	end
+	if type(from) ~= "number" or from < 1 or from > n then
+		from = 1
+	end
+	for k = 0, n - 1 do
+		local i = (from - 1 + k) % n + 1
+		local s = list[i]
+		local rem = resolveRemote(s.remote)
+		if rem then
+			local ok = not busy
+			if ok and s.cooldown then
+				local cd = cdf and cdf:FindFirstChild(s.cooldown)
+				if cd and cd.Value == true then
+					ok = false
+				end
+			end
+			if ok and s.require and not char:FindFirstChild(s.require) then
+				ok = false
+			end
+			if ok then
+				pcall(function()
+					rem:FireServer(table.unpack(s.args))
+				end)
+				return i % n + 1
+			end
+		end
+	end
+	return from
 end
 
 local function yawTo(pos, at)
@@ -624,6 +688,7 @@ end)
 
 local FarmTab = ele(Window, "Tab", { Title = "Farm", Icon = "crosshair", Border = true })
 local AstroTab = ele(Window, "Tab", { Title = "Astro", Icon = "star", Border = true })
+local TitansTab = ele(Window, "Tab", { Title = "Farm titans", Icon = "crown", Border = true })
 local LobbyTab = ele(Window, "Tab", { Title = "Lobby", Icon = "user", Border = true })
 local MasteryTab = ele(Window, "Tab", { Title = "Mastery", Icon = "target", Border = true })
 local GachaTab = ele(Window, "Tab", { Title = "Gacha", Icon = "gift", Border = true })
@@ -632,13 +697,17 @@ local SettingsTab = ele(Window, "Tab", { Title = "Settings", Icon = "settings", 
 
 local FarmSec = ele(FarmTab, "Section", { Title = "Farm" })
 local farmToggle
+local farmToggle2
 farmToggle = ele(FarmSec, "Toggle", {
-	Title = "Enabled",
-	Desc = "Auto attack: approach, orbit and skills",
+	Title = "Включит",
+	Desc = "Ну бля сам авто-фарм",
 	Value = false,
 	Flag = "farm",
 	Callback = function(on)
 		st.farm = on
+		if farmToggle2 then
+			setToggle(farmToggle2, on)
+		end
 		if on then
 			notify("Farm", "started", "check", 2)
 		else
@@ -647,16 +716,19 @@ farmToggle = ele(FarmSec, "Toggle", {
 	end,
 })
 ele(FarmSec, "Keybind", {
-	Title = "Toggle farm",
+	Title = "Бинд для фарма",
 	Value = "X",
 	Callback = function()
 		local nv = not st.farm
 		st.farm = nv
 		setToggle(farmToggle, nv)
+		if farmToggle2 then
+			setToggle(farmToggle2, nv)
+		end
 	end,
 })
 ele(FarmSec, "Slider", {
-	Title = "Speed",
+	Title = "Скорость полёта типа",
 	Step = 25,
 	Value = { Min = 100, Max = 4000, Default = 600 },
 	Callback = function(v)
@@ -664,7 +736,7 @@ ele(FarmSec, "Slider", {
 	end,
 })
 ele(FarmSec, "Slider", {
-	Title = "Orbit radius",
+	Title = "Радиус орбиты",
 	Step = 1,
 	Value = { Min = 3, Max = 40, Default = 10 },
 	Callback = function(v)
@@ -672,7 +744,7 @@ ele(FarmSec, "Slider", {
 	end,
 })
 ele(FarmSec, "Slider", {
-	Title = "Orbit speed",
+	Title = "Скорость орбиты",
 	Step = 1,
 	Value = { Min = 10, Max = 360, Default = 90 },
 	Callback = function(v)
@@ -680,7 +752,7 @@ ele(FarmSec, "Slider", {
 	end,
 })
 ele(FarmSec, "Input", {
-	Title = "Priority targets",
+	Title = "Приоритет на атаку",
 	Value = "G-Toilet 3.0",
 	Placeholder = "name1, name2",
 	Callback = function(v)
@@ -688,15 +760,15 @@ ele(FarmSec, "Input", {
 	end,
 })
 ele(FarmSec, "Toggle", {
-	Title = "M1 remote attack",
-	Desc = "rs.LMB when a target is alive",
+	Title = "М1 спам",
+	Desc = "Название само за себя говорит",
 	Value = true,
 	Callback = function(v)
 		st.m1 = v
 	end,
 })
 ele(FarmSec, "Toggle", {
-	Title = "Spam M1 remote (0.05s)",
+	Title = "М1 спам второй эдишен",
 	Value = false,
 	Callback = function(v)
 		st.m1Spam = v
@@ -705,7 +777,7 @@ ele(FarmSec, "Toggle", {
 
 local SkillSec = ele(FarmTab, "Section", { Title = "Auto Skills (remote)" })
 ele(SkillSec, "Toggle", {
-	Title = "Auto skills",
+	Title = "Авто скиллы",
 	Value = false,
 	Callback = function(v)
 		st.skills = v
@@ -725,7 +797,7 @@ local SKILL_PRESETS = {
 	},
 }
 ele(SkillSec, "Dropdown", {
-	Title = "Character preset",
+	Title = "Пресеты",
 	Desc = "Fills combat / wave / wave list below",
 	Values = { "Dark Speaker (default)", "Speaker Strider" },
 	Value = 1,
@@ -755,7 +827,7 @@ ele(SkillSec, "Dropdown", {
 	end,
 })
 skillCombatInput = ele(SkillSec, "Input", {
-	Title = "Combat skills",
+	Title = "Комбат скиллы",
 	Desc = "Remote | Cooldown | RequireChild | args  (one per line)",
 	Type = "Textarea",
 	Value = "SoundWave | SoundWave_Cooldown | SoundImprovement\nSwing | Swing_Cooldown",
@@ -764,7 +836,7 @@ skillCombatInput = ele(SkillSec, "Input", {
 	end,
 })
 skillWaveInput = ele(SkillSec, "Input", {
-	Title = "Wave skills",
+	Title = "Скиллы на определенных волнах",
 	Desc = "Fired on waves from the wave list",
 	Type = "Textarea",
 	Value = "SpeakerCarrier | SpeakerCarrier_Cooldown\nBuffSpeakerMan | Buff_Cooldown",
@@ -772,14 +844,14 @@ skillWaveInput = ele(SkillSec, "Input", {
 		st.skillWaveList = v
 	end,
 })
-ele(SkillSec, "Toggle", { Title = "Respect ActiveM1 busy", Value = true, Callback = function(v)
+ele(SkillSec, "Toggle", { Title = "Во время М1 не юзать абилку", Value = true, Callback = function(v)
 	st.skillBusy = v
 end })
-ele(SkillSec, "Toggle", { Title = "Only while orbiting", Value = false, Callback = function(v)
+ele(SkillSec, "Toggle", { Title = "Юзать абилку только во время орбиты", Value = false, Callback = function(v)
 	st.skillOrbitOnly = v
 end })
 ele(SkillSec, "Slider", {
-	Title = "Spam interval",
+	Title = "Интервал спама",
 	Step = 0.05,
 	Value = { Min = 0.05, Max = 2, Default = 0.3 },
 	Callback = function(v)
@@ -787,7 +859,7 @@ ele(SkillSec, "Slider", {
 	end,
 })
 skillWaveListInput = ele(SkillSec, "Input", {
-	Title = "Wave list",
+	Title = "Волна на которых абилка типа",
 	Value = "2,9,17,26,29,30,31",
 	Callback = function(v)
 		st.waveList = v
@@ -796,7 +868,7 @@ skillWaveListInput = ele(SkillSec, "Input", {
 
 local HealSec = ele(FarmTab, "Section", { Title = "Auto Heal" })
 ele(HealSec, "Toggle", {
-	Title = "Auto heal at shop",
+	Title = "Авто хил (мне лень эту хуйню фиксить)",
 	Value = false,
 	Callback = function(v)
 		st.heal = v
@@ -806,7 +878,7 @@ ele(HealSec, "Toggle", {
 	end,
 })
 ele(HealSec, "Slider", {
-	Title = "Heal below HP",
+	Title = "Хилится ниже хп",
 	Step = 1,
 	Value = { Min = 1, Max = 100, Default = 100 },
 	Callback = function(v)
@@ -814,8 +886,8 @@ ele(HealSec, "Slider", {
 	end,
 })
 ele(HealSec, "Slider", {
-	Title = "Heal attempt (sec)",
-	Desc = "Spams Buy/FillHP every 0.18s for this long (covers the helicopter ride)",
+	Title = "Попытатся похилится",
+	Desc = "Спамит хиллом по интервалу",
 	Step = 1,
 	Value = { Min = 4, Max = 30, Default = 12 },
 	Callback = function(v)
@@ -823,10 +895,10 @@ ele(HealSec, "Slider", {
 	end,
 })
 
-local LootSec = ele(FarmTab, "Section", { Title = "Auto Loot (Gears)" })
+local LootSec = ele(FarmTab, "Section", { Title = "Auto Loot" })
 ele(LootSec, "Toggle", {
-	Title = "Auto Loot",
-	Desc = "Runs with Farm on or off (full hold interaction)",
+	Title = "Авто лут",
+	Desc = "Лутает говно",
 	Value = st.loot,
 	Flag = "loot",
 	Callback = function(v)
@@ -835,7 +907,7 @@ ele(LootSec, "Toggle", {
 	end,
 })
 ele(LootSec, "Slider", {
-	Title = "Loot range (studs)",
+	Title = "Вещь, которой никогда пользоватся не буду",
 	Step = 50,
 	Value = { Min = 25, Max = 2000, Default = 1000 },
 	Callback = function(v)
@@ -843,7 +915,7 @@ ele(LootSec, "Slider", {
 	end,
 })
 ele(LootSec, "Slider", {
-	Title = "Rescan delay (sec)",
+	Title = "Тоже бесполезно",
 	Step = 5,
 	Value = { Min = 10, Max = 300, Default = 35 },
 	Callback = function(v)
@@ -853,7 +925,7 @@ ele(LootSec, "Slider", {
 
 local ResetSec = ele(FarmTab, "Section", { Title = "Reset wave" })
 ele(ResetSec, "Toggle", {
-	Title = "Reset on wave",
+	Title = "На какой волне ресет",
 	Value = false,
 	Callback = function(v)
 		st.resetWave = v
@@ -863,7 +935,7 @@ ele(ResetSec, "Toggle", {
 	end,
 })
 ele(ResetSec, "Slider", {
-	Title = "Wave to reset",
+	Title = "Волна на которой ресетнутся",
 	Step = 1,
 	Value = { Min = 1, Max = 200, Default = 5 },
 	Callback = function(v)
@@ -871,11 +943,11 @@ ele(ResetSec, "Slider", {
 	end,
 })
 
-local GodSec = ele(FarmTab, "Section", { Title = "God mode (forced reset)" })
+local GodSec = ele(FarmTab, "Section", { Title = "Холи бессмертие" })
 local godToggle
 godToggle = ele(GodSec, "Toggle", {
-	Title = "Reset before death",
-	Desc = "Respawns the character when HP drops below the value below",
+	Title = "Ресет до смерти (бог режим крч)",
+	Desc = "Ну типа хазе",
 	Value = false,
 	Callback = function(v)
 		st.god = v
@@ -883,8 +955,8 @@ godToggle = ele(GodSec, "Toggle", {
 	end,
 })
 ele(GodSec, "Slider", {
-	Title = "Reset below HP",
-	Desc = "Above your max HP it falls back to half of max HP",
+	Title = "Тут типо на какой шкале хп ресетать",
+	Desc = "Хорни кроссточкапнг",
 	Step = 1,
 	Value = { Min = 1, Max = 10000, Default = 800 },
 	Callback = function(v)
@@ -892,7 +964,7 @@ ele(GodSec, "Slider", {
 	end,
 })
 ele(GodSec, "Keybind", {
-	Title = "Instant respawn now",
+	Title = "Респаун",
 	Value = "R",
 	Callback = function()
 		if godBusy then
@@ -911,14 +983,14 @@ ele(GodSec, "Keybind", {
 	end,
 })
 
-local AstroSec = ele(AstroTab, "Section", { Title = "Astro Token Route" })
+local AstroSec = ele(AstroTab, "Section", { Title = "Астро токены авто-фап" })
 ele(AstroSec, "Paragraph", {
-	Title = "Auto vote must be for AstroV2!!!",
-	Desc = "Set Lobby > Vote mode to AstroV2 before starting the route.",
+	Title = "Сука ставить авто голосование на AstroV2!!!",
+	Desc = "Фармит хоулдаут",
 })
 local astroToggle
 astroToggle = ele(AstroSec, "Toggle", {
-	Title = "Route enabled",
+	Title = "Включить авто-токены",
 	Value = false,
 	Flag = "astro",
 	Callback = function(on)
@@ -931,7 +1003,7 @@ astroToggle = ele(AstroSec, "Toggle", {
 	end,
 })
 ele(AstroSec, "Keybind", {
-	Title = "Toggle route",
+	Title = "Бинд",
 	Value = "K",
 	Callback = function()
 		local nv = not st.astro
@@ -940,7 +1012,7 @@ ele(AstroSec, "Keybind", {
 	end,
 })
 ele(AstroSec, "Slider", {
-	Title = "Fly speed",
+	Title = "Скорость полёта",
 	Step = 10,
 	Value = { Min = 100, Max = 2000, Default = 600 },
 	Callback = function(v)
@@ -948,14 +1020,14 @@ ele(AstroSec, "Slider", {
 	end,
 })
 ele(AstroSec, "Toggle", {
-	Title = "Heal skill (Buff) at 50% HP",
+	Title = "Только вантуз: Авто-хил с помощью декларации",
 	Value = true,
 	Callback = function(v)
 		st.astroHeal = v
 	end,
 })
 ele(AstroSec, "Input", {
-	Title = "Custom route points",
+	Title = "Не пользуйся этим, я хз зачем добавил",
 	Desc = "Paste Vector3 lines from pos_copier. Leave empty to use default 9 points.",
 	Type = "Textarea",
 	Value = "",
@@ -965,8 +1037,8 @@ ele(AstroSec, "Input", {
 	end,
 })
 ele(AstroSec, "Toggle", {
-	Title = "Reset before death (God mode)",
-	Desc = "Same switch as Farm > God mode: respawns below the HP threshold",
+	Title = "Год мод (я хз вроде норм работает)",
+	Desc = "пизда",
 	Value = false,
 	Callback = function(v)
 		st.god = v
@@ -974,25 +1046,25 @@ ele(AstroSec, "Toggle", {
 	end,
 })
 ele(AstroSec, "Slider", {
-	Title = "Reset below HP",
-	Desc = "Shared with Farm > God mode: respawns below this HP",
+	Title = "Год мод слайдер хп",
+	Desc = "Шэрит",
 	Step = 1,
-	Value = { Min = 1, Max = 10000, Default = 800 },
+	Value = { Min = 1, Max = 10000, Default = 100 },
 	Callback = function(v)
 		st.godHP = v
 	end,
 })
 ele(AstroSec, "Toggle", {
-	Title = "Skip when timer = 0",
-	Desc = "God mode stays off while the wave timer is 0 (resetting there ruins the run)",
+	Title = "Бессмертие не будет работать после 20 секунд",
+	Desc = "Это засейвит твой токен я думаю",
 	Value = true,
 	Callback = function(v)
 		st.godSkipTimer0 = v
 	end,
 })
 ele(AstroSec, "Paragraph", {
-	Title = "Recommended characters",
-	Desc = "Best: Mini UTCM, Speaker Strider, Espada.\nAlso good: any character with 2500+ HP.",
+	Title = "Рекомендуемые персонажи",
+	Desc = "Кто лучший?(я): Mini UTCM",
 })
 local astroParagraph = ele(AstroSec, "Paragraph", {
 	Title = "Astro Tokens",
@@ -1026,27 +1098,195 @@ task.spawn(function()
 	end
 end)
 
-local LobbySec = ele(LobbyTab, "Section", { Title = "Auto Lobby (remote)" })
-ele(LobbySec, "Toggle", { Title = "Auto vote", Value = false, Callback = function(v)
+local TitanSec = ele(TitansTab, "Section", { Title = "Titan farm" })
+local titanToggle
+titanToggle = ele(TitanSec, "Toggle", {
+	Title = "Enabled",
+	Desc = "Авто-фарм мастери на титанах (обязательно врубать ещё обычный фарм!)",
+	Value = false,
+	Flag = "titanFarm",
+	Callback = function(on)
+		st.titanFarm = on
+		if on then
+			notify("Titan", "farm started", "check", 2)
+		else
+			notify("Titan", "farm stopped", "info", 2)
+		end
+	end,
+})
+ele(TitanSec, "Keybind", {
+	Title = "Бинд",
+	Value = "B",
+	Callback = function()
+		local nv = not st.titanFarm
+		st.titanFarm = nv
+		setToggle(titanToggle, nv)
+	end,
+})
+farmToggle2 = ele(TitanSec, "Toggle", {
+	Title = "Типо персонаж сам добывает титан рекьюст",
+	Desc = "Обычный персонаж фармит бабло пока не купится Titan-Request (то же самое что Enabled во вкладке Farm)",
+	Value = false,
+	Callback = function(on)
+		st.farm = on
+		setToggle(farmToggle, on)
+		if on then
+			notify("Farm", "started", "check", 2)
+		else
+			notify("Farm", "stopped", "info", 2)
+		end
+	end,
+})
+ele(TitanSec, "Slider", {
+	Title = "Скорость",
+	Step = 50,
+	Value = { Min = 100, Max = 4000, Default = 1200 },
+	Callback = function(v)
+		st.titanSpeed = v
+	end,
+})
+ele(TitanSec, "Slider", {
+	Title = "Орбита радиус",
+	Desc = "сирин пидор",
+	Step = 1,
+	Value = { Min = 5, Max = 120, Default = 23 },
+	Callback = function(v)
+		st.titanRadius = v
+	end,
+})
+ele(TitanSec, "Slider", {
+	Title = "Орбита спид",
+	Desc = "шприц",
+	Step = 1,
+	Value = { Min = 10, Max = 360, Default = 23 },
+	Callback = function(v)
+		st.titanOrbitDeg = v
+	end,
+})
+ele(TitanSec, "Slider", {
+	Title = "Это тебе не надо",
+	Desc = "ы",
+	Step = 0.1,
+	Value = { Min = 20, Max = 100, Default = 58.4 },
+	Callback = function(v)
+		st.titanFeetOffset = v
+	end,
+})
+ele(TitanSec, "Input", {
+	Title = "По желанию, приоритет",
+	Value = "",
+	Placeholder = "name1, name2",
+	Callback = function(v)
+		st.titanPriority = v
+	end,
+})
+ele(TitanSec, "Toggle", {
+	Title = "М1 атака",
+	Desc = "ы, я заебался",
+	Value = true,
+	Callback = function(v)
+		st.titanM1 = v
+	end,
+})
+
+local TitanSkillSec = ele(TitansTab, "Section", { Title = "Titan abilities" })
+ele(TitanSkillSec, "Toggle", {
+	Title = "Авто абилки",
+	Value = true,
+	Callback = function(v)
+		st.titanSkillsOn = v
+	end,
+})
+ele(TitanSkillSec, "Toggle", {
+	Title = "Скиллы только во время орбиты",
+	Desc = "шкуллшутер",
+	Value = true,
+	Callback = function(v)
+		st.titanOrbitOnly = v
+	end,
+})
+ele(TitanSkillSec, "Paragraph", {
+	Title = "Тест версия",
+	Desc = "Ам ам ам", 
+})
+ele(TitanSkillSec, "Slider", {
+	Title = "Интервал спама",
+	Step = 0.05,
+	Value = { Min = 0.05, Max = 2, Default = 0.35 },
+	Callback = function(v)
+		st.titanSkillDelay = v
+	end,
+})
+
+local TitanReqSec = ele(TitansTab, "Section", { Title = "Авто-покупка титан реквеста" })
+ele(TitanReqSec, "Toggle", {
+	Title = "Авто-покупка реквеста",
+	Desc = "нахуя нерфить ттв",
+	Value = true,
+	Flag = "titanRequest",
+	Callback = function(v)
+		st.titanAutoRequest = v
+		if v then
+			notify("Titan", "auto request armed", "check", 2)
+		end
+	end,
+})
+ele(TitanReqSec, "Slider", {
+	Title = "На какой волне покупать (не юзать)",
+	Desc = "алах акбар",
+	Step = 1,
+	Value = { Min = 1, Max = 100, Default = 1 },
+	Callback = function(v)
+		st.titanRequestWave = v
+	end,
+})
+ele(TitanReqSec, "Input", {
+	Title = "Ещё одна бесполезная вещь",
+	Desc = "изи",
+	Value = "Titan-Request",
+	Callback = function(v)
+		st.titanShopItem = v
+	end,
+})
+ele(TitanReqSec, "Toggle", {
+	Title = "Авто-покупок колонок титану тв",
+	Desc = "абвговно",
+	Value = true,
+	Callback = function(v)
+		st.titanCinema = v
+	end,
+})
+ele(TitanReqSec, "Slider", {
+	Title = "Ресетатся на какой то волне",
+	Desc = "0 значит вырублено",
+	Step = 1,
+	Value = { Min = 0, Max = 40, Default = 10 },
+	Callback = function(v)
+		st.titanResetWave = v
+	end,
+})
+
+local LobbySec = ele(LobbyTab, "Section", { Title = "Auto Lobby" })
+ele(LobbySec, "Toggle", { Title = "Авто-голосование", Value = false, Callback = function(v)
 	st.vote = v
 end })
 ele(LobbySec, "Dropdown", {
-	Title = "Vote mode",
+	Title = "За какой мод голосовать",
 	Values = MODES,
 	Value = idxOf(MODES, "Astro"),
 	Callback = function(v)
 		st.voteMode = v
 	end,
 })
-ele(LobbySec, "Toggle", { Title = "Auto ready", Value = false, Callback = function(v)
+ele(LobbySec, "Toggle", { Title = "Авто-рейди", Value = false, Callback = function(v)
 	st.ready = v
 end })
 
-local MasterySec = ele(MasteryTab, "Section", { Title = "Mastery path" })
+local MasterySec = ele(MasteryTab, "Section", { Title = "Путь мастери" })
 local masteryToggle
 masteryToggle = ele(MasterySec, "Toggle", {
-	Title = "Auto switch character",
-	Desc = "Switches to the next character when its mastery target is reached",
+	Title = "Авто поменка перса",
+	Desc = "Как одного персонажа докачает до определенного уровня, перейдёт на другого",
 	Value = false,
 	Callback = function(v)
 		st.mastery = v
@@ -1057,7 +1297,7 @@ masteryToggle = ele(MasterySec, "Toggle", {
 	end,
 })
 ele(MasterySec, "Keybind", {
-	Title = "Toggle mastery path",
+	Title = "Переключить путь мастери",
 	Value = "P",
 	Callback = function()
 		local nv = not st.mastery
@@ -1068,8 +1308,8 @@ ele(MasterySec, "Keybind", {
 	end,
 })
 ele(MasterySec, "Input", {
-	Title = "Path (Name | target mastery)",
-	Desc = "One per line, missing target uses the default below",
+	Title = "Не юзай это",
+	Desc = "Бабах",
 	Type = "Textarea",
 	Value = st.masteryList,
 	Callback = function(v)
@@ -1077,7 +1317,7 @@ ele(MasterySec, "Input", {
 	end,
 })
 ele(MasterySec, "Slider", {
-	Title = "Default target mastery",
+	Title = "Какое мастери обычно таргетить",
 	Step = 5,
 	Value = { Min = 10, Max = 200, Default = 80 },
 	Callback = function(v)
@@ -1085,7 +1325,7 @@ ele(MasterySec, "Slider", {
 	end,
 })
 ele(MasterySec, "Slider", {
-	Title = "Check interval (sec)",
+	Title = "Проверять интервал в секунду",
 	Step = 1,
 	Value = { Min = 1, Max = 30, Default = 3 },
 	Callback = function(v)
@@ -1096,7 +1336,7 @@ ele(MasterySec, "Slider", {
 local GachaSec = ele(GachaTab, "Section", { Title = "Auto Gacha" })
 local gachaToggle
 gachaToggle = ele(GachaSec, "Toggle", {
-	Title = "Gacha enabled",
+	Title = "Мистер дэп включить",
 	Value = false,
 	Flag = "gacha",
 	Callback = function(on)
@@ -1109,7 +1349,7 @@ gachaToggle = ele(GachaSec, "Toggle", {
 	end,
 })
 ele(GachaSec, "Keybind", {
-	Title = "Toggle gacha",
+	Title = "Переключить дэп",
 	Value = "L",
 	Callback = function()
 		local nv = not st.gacha
@@ -1117,12 +1357,12 @@ ele(GachaSec, "Keybind", {
 		setToggle(gachaToggle, nv)
 	end,
 })
-ele(GachaSec, "Toggle", { Title = "Auto-open gacha", Value = false, Callback = function(v)
+ele(GachaSec, "Toggle", { Title = "Тоже переключить дэп", Value = false, Callback = function(v)
 	st.gachaAuto = v
 end })
 ele(GachaSec, "Toggle", {
-	Title = "Skip cutscene",
-	Desc = "Fast-skips gacha cutscene via multiple methods",
+	Title = "Скипать хуйню с открытием",
+	Desc = "фыв",
 	Value = true,
 	Callback = function(v)
 		st.gachaSkipCut = v
@@ -1132,8 +1372,8 @@ ele(GachaSec, "Toggle", {
 	end,
 })
 ele(GachaSec, "Dropdown", {
-	Title = "Skip method",
-	Desc = "multi = all methods. Try others if multi fails.",
+	Title = "Метод скипа",
+	Desc = "сирин не умеет делать шансы",
 	Values = { "Multi (all)", "Click only", "Firesignal only", "Anim break", "Speed hack" },
 	Value = 1,
 	Callback = function(v)
@@ -1148,7 +1388,7 @@ ele(GachaSec, "Dropdown", {
 	end,
 })
 ele(GachaSec, "Dropdown", {
-	Title = "Page",
+	Title = "Страничка",
 	Values = { "Characters", "Skins" },
 	Value = 1,
 	Callback = function(v)
@@ -1156,7 +1396,7 @@ ele(GachaSec, "Dropdown", {
 	end,
 })
 ele(GachaSec, "Dropdown", {
-	Title = "Spin",
+	Title = "Сколько крутить",
 	Values = { "1Spin", "10Spins", "100Spins", "1SpinLucky", "10SpinLucky" },
 	Value = idxOf({ "1Spin", "10Spins", "100Spins", "1SpinLucky", "10SpinLucky" }, "100Spins"),
 	Callback = function(v)
@@ -1164,7 +1404,7 @@ ele(GachaSec, "Dropdown", {
 	end,
 })
 ele(GachaSec, "Slider", {
-	Title = "Interval",
+	Title = "Интервал дэпа",
 	Step = 0.05,
 	Value = { Min = 0.05, Max = 5, Default = 0.5 },
 	Callback = function(v)
@@ -1172,7 +1412,7 @@ ele(GachaSec, "Slider", {
 	end,
 })
 ele(GachaSec, "Slider", {
-	Title = "Max spins (0 = unlimited)",
+	Title = "Сколько выкрутить (0 значит инф)",
 	Step = 1,
 	Value = { Min = 0, Max = 1000, Default = 0 },
 	Callback = function(v)
@@ -1190,8 +1430,8 @@ local SKIN_OPTIONS = {
 }
 
 ele(GachaSec, "Toggle", {
-	Title = "Spin for missing skins",
-	Desc = "Auto-spins GachaSkins until selected skins are obtained. Leave empty = all missing.",
+	Title = "Дэпать из списка",
+	Desc = "Если выбранный скин повляется в стоке, то будет депать пока не выбьет его",
 	Value = false,
 	Callback = function(v)
 		st.gachaSkinMode = v
@@ -1203,8 +1443,8 @@ ele(GachaSec, "Toggle", {
 	end,
 })
 ele(GachaSec, "Dropdown", {
-	Title = "Skins to get",
-	Desc = "Multi-select from known skins. Empty = all missing.",
+	Title = "Какие скины хатите палучить?",
+	Desc = "изи",
 	Values = SKIN_OPTIONS,
 	Value = {},
 	Multi = true,
@@ -1222,7 +1462,7 @@ ele(GachaSec, "Dropdown", {
 	end,
 })
 local gachaSkinInfo = ele(GachaSec, "Paragraph", {
-	Title = "Missing skins",
+	Title = "Юзлесс надпись",
 	Content = "checking...",
 })
 
@@ -1255,12 +1495,13 @@ local BOOSTER_NAMES = {
 local SHOP_IDS = {
 	"BSX2:30",
 	"BSX2:60",
+	"MasterCard:NormalIII",
 }
 
-local ShopSec = ele(ShopTab, "Section", { Title = "Hourly Shop (auto buy)" })
+local ShopSec = ele(ShopTab, "Section", { Title = "Хоурли шоп" })
 ele(ShopSec, "Toggle", {
-	Title = "Auto buy",
-	Desc = "Buys selected items via BuyItemFromShopHourly",
+	Title = "Авто бай",
+	Desc = "Нет блять авто-селл",
 	Value = false,
 	Flag = "shopBuy",
 	Callback = function(on)
@@ -1273,7 +1514,7 @@ ele(ShopSec, "Toggle", {
 	end,
 })
 ele(ShopSec, "Dropdown", {
-	Title = "Items to buy",
+	Title = "Что покупать",
 	Desc = "Multi-select. BSX2:30 = mastery 30min, BSX2:60 = mastery 60min.",
 	Values = SHOP_IDS,
 	Value = multiNames(st.shopBuySel),
@@ -1283,7 +1524,7 @@ ele(ShopSec, "Dropdown", {
 	end,
 })
 ele(ShopSec, "Slider", {
-	Title = "Quantity per item",
+	Title = "Кол-во за предмет",
 	Step = 1,
 	Value = { Min = 1, Max = 50, Default = 1 },
 	Callback = function(v)
@@ -1291,18 +1532,18 @@ ele(ShopSec, "Slider", {
 	end,
 })
 ele(ShopSec, "Slider", {
-	Title = "Buy interval (sec)",
-	Desc = "Game client uses a 5s debounce; keep >= 5",
+	Title = "В раз сколько покупать",
+	Desc = "ыыы",
 	Step = 1,
 	Value = { Min = 5, Max = 60, Default = 5 },
 	Callback = function(v)
 		st.shopBuyInterval = math.max(5, v)
 	end,
 })
-local BoostSec = ele(ShopTab, "Section", { Title = "Auto boosters (Boosts remote)" })
+local BoostSec = ele(ShopTab, "Section", { Title = "Авто бустер" })
 ele(BoostSec, "Toggle", {
-	Title = "Use boosters",
-	Desc = "Fires ReplicatedStorage.Boosts for owned selected boosters",
+	Title = "Использовать авто бустер",
+	Desc = "сложна",
 	Value = false,
 	Flag = "boostAuto",
 	Callback = function(on)
@@ -1315,8 +1556,8 @@ ele(BoostSec, "Toggle", {
 	end,
 })
 ele(BoostSec, "Toggle", {
-	Title = "Economy mode",
-	Desc = "Only uses a booster when the matching timer hits zero",
+	Title = "Экономить",
+	Desc = "Экономит по максу (приложение такое)",
 	Value = true,
 	Flag = "boostEconomy",
 	Callback = function(on)
@@ -1324,8 +1565,8 @@ ele(BoostSec, "Toggle", {
 	end,
 })
 ele(BoostSec, "Dropdown", {
-	Title = "Boosters",
-	Desc = "Multi-select known boosters (used only if in inventory)",
+	Title = "Бустеры",
+	Desc = "Multi-select known boosters",
 	Values = BOOSTER_NAMES,
 	Value = multiNames(st.boostSel),
 	Multi = true,
@@ -1334,7 +1575,7 @@ ele(BoostSec, "Dropdown", {
 	end,
 })
 ele(BoostSec, "Slider", {
-	Title = "Delay per booster (sec)",
+	Title = "В раз сколько юзать бустер",
 	Step = 1,
 	Value = { Min = 5, Max = 300, Default = 30 },
 	Callback = function(v)
@@ -1342,7 +1583,7 @@ ele(BoostSec, "Slider", {
 	end,
 })
 local boostActiveInfo = ele(BoostSec, "Paragraph", {
-	Title = "Active boosters",
+	Title = "Юзлесс",
 	Content = "checking...",
 })
 
@@ -1670,26 +1911,13 @@ task.spawn(function()
 					if phaseStart == 0 then
 						phaseStart = t
 					end
-				else
-					phaseStart = 0
-					votedPhase = false
-					voteSentAt = 0
-					votedConfirmedAt = 0
-				end
-				if wave > 0 then
-					votedPhase = false
-					voteSentAt = 0
-					votedConfirmedAt = 0
-				end
-
-				if st.vote and voteActive then
 					local mine = currentVote()
 					if mine == st.voteMode then
 						if not votedPhase then
 							votedPhase = true
 							votedConfirmedAt = t
 						end
-					elseif (not votedPhase or (t - lastVote > 20)) and (t - lastVote > 2) then
+					elseif st.vote and (not votedPhase or (t - lastVote > 20)) and (t - lastVote > 2) then
 						lastVote = t
 						if fireVote(st.voteMode) then
 							voteSentAt = t
@@ -1699,15 +1927,20 @@ task.spawn(function()
 							notify("Lobby", "vote remote failed", "triangle-alert", 2)
 						end
 					end
+				else
+					phaseStart = 0
+					voteSentAt = 0
+					votedConfirmedAt = 0
+				end
+				if wave > 0 then
+					votedPhase = false
+					voteSentAt = 0
+					votedConfirmedAt = 0
 				end
 
 				local readyBlocked = false
 				if voteActive and not votedPhase then
-					if st.vote then
-						readyBlocked = true
-					elseif phaseStart > 0 and (t - phaseStart) < READY_VOTE_DELAY then
-						readyBlocked = true
-					end
+					readyBlocked = true
 				end
 				if st.vote and voteSentAt > 0 and not votedPhase then
 					readyBlocked = true
@@ -1833,7 +2066,7 @@ end
 task.spawn(function()
 	while alive() do
 		task.wait(0.05)
-		if st.m1Spam and st.farm then
+		if st.m1Spam and farmOn() then
 			fireLMB()
 		end
 	end
@@ -1843,7 +2076,7 @@ task.spawn(function()
 	local lastErr = 0
 	while alive() do
 		task.wait(st.skillDelay)
-		if st.farm and st.skills then
+		if farmOn() and (st.skills or st.titanFarm) then
 			local t = now()
 			local ok, err = pcall(function()
 				if st.skillOrbitOnly and not isOrbiting then
@@ -2518,6 +2751,18 @@ task.spawn(function()
 					end
 				else
 					local ids = st.shopBuySel or {}
+					-- MasterCard:NormalIII x1 is always bought while auto buy is on
+					local hasMC = false
+					for _, v in ipairs(ids) do
+						if v == "MasterCard:NormalIII" then
+							hasMC = true
+							break
+						end
+					end
+					if not hasMC then
+						ids = { table.unpack(ids) }
+						table.insert(ids, "MasterCard:NormalIII")
+					end
 					if #ids == 0 then
 						if t - lastNotify > 15 then
 							lastNotify = t
@@ -2528,6 +2773,7 @@ task.spawn(function()
 						local rem = rs:FindFirstChild("BuyItemFromShopHourly")
 						if rem then
 							local tries = 0
+							local boughtAny = false
 							while tries < #ids do
 								if shopBuyCursor > #ids then
 									shopBuyCursor = 1
@@ -2535,13 +2781,16 @@ task.spawn(function()
 								local id = ids[shopBuyCursor]
 								shopBuyCursor = shopBuyCursor + 1
 								tries = tries + 1
+								local isMC = id == "MasterCard:NormalIII"
 								local stock = tonumber(shopStock[id])
-								if stock and stock > 0 then
-									local buyQty = math.min(qty, stock)
+								-- MasterCard is fired blindly: FireServer(id, 1), no stock check
+								if isMC or (stock and stock > 0) then
+									local buyQty = isMC and 1 or math.min(qty, stock)
 									pcall(function()
 										rem:FireServer(id, buyQty)
 									end)
 									lastBuy = t
+									boughtAny = true
 									if t - lastNotify > 3 then
 										lastNotify = t
 										notify("Shop", "bought " .. id .. " x" .. buyQty, "check", 2)
@@ -2549,7 +2798,7 @@ task.spawn(function()
 									break
 								end
 							end
-							if tries >= #ids and t - lastNotify > 15 then
+							if not boughtAny and tries >= #ids and t - lastNotify > 15 then
 								lastNotify = t
 								notify("Shop", "all selected items out of stock", "info", 2)
 							end
@@ -3016,10 +3265,12 @@ local function lootStep(hrp, dt)
 	return true
 end
 
-local lastNamesT = 0
-local lastScanT = 0
-local lastLmbT = 0
-local lastErrT = 0
+-- shop spot (helicopter pad) taken from matcha script: the Buy remote only
+-- accepts purchases while the character stands here
+local SHOP_POS = Vector3.new(39.84444046020508, 2.7063474655151367, -24.393577575683594)
+local shopHold = false
+
+local FS = { namesT = 0, scanT = 0, lmbT = 0, errT = 0 }
 
 RunService.Heartbeat:Connect(function(dt)
 	if not alive() or not (st.farm or st.loot) then
@@ -3036,6 +3287,15 @@ RunService.Heartbeat:Connect(function(dt)
 			angleInit = false
 		end
 
+		-- pinned at the shop spot while a shop purchase is in flight
+		if shopHold then
+			if (hrp.Position - SHOP_POS).Magnitude > 2 then
+				hrp.CFrame = CFrame.new(SHOP_POS.X, SHOP_POS.Y, SHOP_POS.Z)
+				hrp.AssemblyLinearVelocity = Vector3.zero
+			end
+			return
+		end
+
 		if godBusy then
 			return
 		end
@@ -3044,7 +3304,11 @@ RunService.Heartbeat:Connect(function(dt)
 			return
 		end
 
-		if not st.farm then
+		if st.titanFarm and isTitanForm() then
+			return
+		end
+
+		if not farmOn() then
 			lootStep(hrp, dt)
 			return
 		end
@@ -3062,12 +3326,12 @@ RunService.Heartbeat:Connect(function(dt)
 		end
 
 		local t = now()
-		if t - lastNamesT >= 1 then
-			lastNamesT = t
+		if t - FS.namesT >= 1 then
+			FS.namesT = t
 			refreshPlayerNames()
 		end
-		if t - lastScanT >= 0.5 then
-			lastScanT = t
+		if t - FS.scanT >= 0.5 then
+			FS.scanT = t
 			mobs = scanMobs(hrp)
 		end
 
@@ -3093,8 +3357,8 @@ RunService.Heartbeat:Connect(function(dt)
 			end
 		end
 
-		if st.m1 and t - lastLmbT >= 0.1 then
-			lastLmbT = t
+		if (st.m1 or st.titanFarm) and t - FS.lmbT >= 0.1 then
+			FS.lmbT = t
 			local cdf = lp.Character and lp.Character:FindFirstChild("CooldownFolder")
 			local am1 = cdf and cdf:FindFirstChild("ActiveM1")
 			local lb = cdf and cdf:FindFirstChild("LMBActive")
@@ -3172,8 +3436,8 @@ RunService.Heartbeat:Connect(function(dt)
 	end)
 	if not ok then
 		local t = now()
-		if t - lastErrT > 5 then
-			lastErrT = t
+		if t - FS.errT > 5 then
+			FS.errT = t
 			print("[rathub-farm] " .. tostring(err))
 		end
 	end
@@ -3219,10 +3483,7 @@ local function astroRoutePoints()
 	return ASTRO_POINTS
 end
 
-local idx = 1
-local teleported = false
-local lastHeal = 0
-local lastErrA = 0
+local AS = { idx = 1, teleported = false, heal = 0, err = 0 }
 
 RunService.Heartbeat:Connect(function(dt)
 	if not alive() or not st.astro then
@@ -3241,7 +3502,7 @@ RunService.Heartbeat:Connect(function(dt)
 
 		if astroSnapNext then
 			astroSnapNext = false
-			teleported = false
+			AS.teleported = false
 			local pts = astroRoutePoints()
 			local nearest, nd
 			for i, p in ipairs(pts) do
@@ -3252,9 +3513,9 @@ RunService.Heartbeat:Connect(function(dt)
 				end
 			end
 			if nearest then
-				idx = nearest
-				setPosFacing(hrp, pts[idx], pts[idx])
-				print("[rathub] respawn snap to astro point " .. idx)
+				AS.idx = nearest
+				setPosFacing(hrp, pts[AS.idx], pts[AS.idx])
+				print("[rathub] respawn snap to astro point " .. AS.idx)
 			end
 		end
 
@@ -3264,11 +3525,17 @@ RunService.Heartbeat:Connect(function(dt)
 		if wave <= 0 then
 			return
 		end
+		local voteActiveNow = (ws:FindFirstChild("Voteing") and ws.Voteing.Value == true)
+			or (ws:FindFirstChild("OpenVoteUI") ~= nil)
+			or (lp.PlayerGui and lp.PlayerGui:FindFirstChild("OpenVoteUI") ~= nil)
+		if voteActiveNow then
+			return
+		end
 
-		if teleported then
+		if AS.teleported then
 			if timeLeft > 100 then
-				teleported = false
-				idx = 1
+				AS.teleported = false
+				AS.idx = 1
 				print("[rathub] new round, flying again")
 			end
 			return
@@ -3281,11 +3548,11 @@ RunService.Heartbeat:Connect(function(dt)
 				print("[rathub] timer 0, teleported to circle")
 				notify("Astro", "timer 0: standing on circle", "check", 3)
 			end
-			teleported = true
+			AS.teleported = true
 			return
 		end
 
-		if st.astroHeal and t - lastHeal > 1 then
+		if st.astroHeal and t - AS.heal > 1 then
 			local hum = char:FindFirstChild("Humanoid")
 			if hum then
 				local hp, mx = hum.Health, hum.MaxHealth
@@ -3302,30 +3569,30 @@ RunService.Heartbeat:Connect(function(dt)
 							VIM:SendKeyEvent(false, Enum.KeyCode.Y, false, lp)
 						end)
 					end
-					lastHeal = t
+					AS.heal = t
 					print("[rathub] astro heal, hp " .. math.floor(hp) .. "/" .. math.floor(mx))
 				end
 			end
 		end
 
 		local pts = astroRoutePoints()
-		if idx > #pts then
-			idx = 1
+		if AS.idx > #pts then
+			AS.idx = 1
 		end
-		local goal = pts[idx]
+		local goal = pts[AS.idx]
 		local pos = hrp.Position
 		local dist = (goal - pos).Magnitude
 		if dist <= 3 then
-			idx = idx % #pts + 1
-			goal = pts[idx]
+			AS.idx = AS.idx % #pts + 1
+			goal = pts[AS.idx]
 			dist = (goal - pos).Magnitude
 		end
 		local step = math.min(st.astroSpeed * dt, dist)
 		local np = pos + (goal - pos).Unit * step
 		setPosFacing(hrp, np, goal)
 	end)
-	if not ok and t - lastErrA > 5 then
-		lastErrA = t
+	if not ok and t - AS.err > 5 then
+		AS.err = t
 		print("[rathub-astro] " .. tostring(err))
 	end
 end)
@@ -3334,9 +3601,521 @@ task.spawn(function()
 	while alive() do
 		task.wait(0.5)
 		if not st.astro then
-			teleported = false
-			idx = 1
+			AS.teleported = false
+			AS.idx = 1
 		end
+	end
+end)
+
+local TS = { scan = 0, lmb = 0, mobs = {}, err = 0, hint = false, angle = 0, angleInit = false, buy = 0, use = 0, wIdx = 1, sIdx = 1, target = nil, orbiting = false, lastY = nil, resetDone = false, cinemaLast = 0, cinemaTries = 0 }
+
+local function titanPickTarget(list)
+	if #list == 0 then
+		return nil
+	end
+	local prioSrc = (st.titanPriority and st.titanPriority ~= "") and st.titanPriority or st.priority
+	local prio = splitList(prioSrc)
+	if #prio > 0 then
+		local best = nil
+		for _, m in ipairs(list) do
+			local low = m.name:lower()
+			for i = 1, #prio do
+				if low:find(prio[i], 1, true) then
+					if not best or m.dist < best.dist then
+						best = m
+					end
+					break
+				end
+			end
+		end
+		if best then
+			return best
+		end
+	end
+	-- targets with 300+ max HP are priority over weaker ones
+	local bestS, bestW = nil, nil
+	for _, m in ipairs(list) do
+		local strong = (m.mx or 0) >= 300
+		if strong then
+			if not bestS or m.dist < bestS.dist then
+				bestS = m
+			end
+		else
+			if not bestW or m.dist < bestW.dist then
+				bestW = m
+			end
+		end
+	end
+	return bestS or bestW
+end
+
+local function titanGroundY(char, x, z, fromY)
+	local y = nil
+	pcall(function()
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		local excl = { char }
+		local living = ws:FindFirstChild("Living")
+		if living then
+			excl[#excl + 1] = living
+		end
+		params.FilterDescendantsInstances = excl
+		local hit = workspace:Raycast(Vector3.new(x, fromY + 200, z), Vector3.new(0, -2000, 0), params)
+		if hit then
+			y = hit.Position.Y
+		end
+	end)
+	return y
+end
+
+-- test auto-skill version: abilities by enemy max HP (SoundWave removed -
+-- it bugs the titan)
+local TITAN_WEAK = parseSkillList("StompTitanTV | Stomp_Cooldown\nRadiantTitanTV | Radiant_Cooldown")
+local TITAN_STRONG = parseSkillList("StompTitanTV | Stomp_Cooldown\nStabTitanTV | Stab_Cooldown\nTackle | Tackle_Cooldown\nRadiantTitanTV | Radiant_Cooldown")
+
+local function titanIsFlyer(name)
+	local low = tostring(name):lower()
+	return low:find("helicopter", 1, true) ~= nil
+		or low:find("helicoper", 1, true) ~= nil
+		or low:find("jetpacktoilet", 1, true) ~= nil
+end
+
+local function titanHasItem()
+	local ok, owned = pcall(function()
+		local data = lp:FindFirstChild("_Data")
+		local items = data and data:FindFirstChild("Items")
+		local it = items and items:FindFirstChild(st.titanShopItem)
+		if not it then
+			return false
+		end
+		local n = tonumber(it.Value)
+		return n == nil or n > 0
+	end)
+	if ok and owned then
+		return true
+	end
+	-- fallback: tool in backpack / character
+	local ok2, hasTool = pcall(function()
+		local bp = lp:FindFirstChild("Backpack")
+		if bp then
+			for _, tool in ipairs(bp:GetChildren()) do
+				if tool:IsA("Tool") and tool.Name:lower():find("titan", 1, true) then
+					return true
+				end
+			end
+		end
+		local ch = lp.Character
+		if ch then
+			for _, tool in ipairs(ch:GetChildren()) do
+				if tool:IsA("Tool") and tool.Name:lower():find("titan", 1, true) then
+					return true
+				end
+			end
+		end
+		return false
+	end)
+	return ok2 and hasTool
+end
+
+local function titanMoney()
+	-- the shop spends Data.MoneysInShop (round money), NOT lifetime _Data.Money
+	local ok, v = pcall(function()
+		local d = lp:FindFirstChild("Data")
+		local m = d and d:FindFirstChild("MoneysInShop")
+		local n = m and tonumber(m.Value)
+		if n then
+			return n
+		end
+		local data = lp:FindFirstChild("_Data")
+		local money = data and data:FindFirstChild("Money")
+		local mm = money and money:FindFirstChild("Moneys")
+		return mm and tonumber(mm.Value)
+	end)
+	return (ok and v) or 0
+end
+
+task.spawn(function()
+	while alive() do
+		task.wait(0.5)
+		if not (st.titanAutoRequest and st.titanFarm) then
+			continue
+		end
+		if isTitanForm() or titanRequestUsed then
+			continue
+		end
+		local wave = ws:FindFirstChild("Wave") and ws.Wave.Value or 0
+		if wave == 0 then
+			titanRequestUsed = false
+			continue
+		end
+		if wave < st.titanRequestWave then
+			continue
+		end
+
+		if not titanHasItem() then
+			-- the ShopSystem remote always works here: fire it whenever the
+			-- shop is open, no money checks
+			local t = now()
+			if t - TS.buy < 2 then
+				continue
+			end
+			if not canUseShop() then
+				continue
+			end
+			TS.buy = t
+			-- the Buy remote only works while standing at the shop helicopter
+			shopHold = true
+			pcall(function()
+				local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+				if hrp then
+					hrp.CFrame = CFrame.new(SHOP_POS.X, SHOP_POS.Y, SHOP_POS.Z)
+					hrp.AssemblyLinearVelocity = Vector3.zero
+				end
+			end)
+			task.wait(0.4)
+			local rem = shopRemote()
+			if not rem then
+				shopHold = false
+				continue
+			end
+			pcall(function()
+				rem:FireServer("Buy", st.titanShopItem)
+			end)
+			print("[rathub-titan] buy sent (at shop): " .. st.titanShopItem)
+			task.wait(1)
+			shopHold = false
+			if titanHasItem() then
+				notify("Titan", st.titanShopItem .. " bought", "check", 3)
+				print("[rathub-titan] purchase confirmed")
+			end
+			continue
+		end
+
+		-- item owned: use it WITHOUT remotes (RequestTitan is broken) -
+		-- equip the item and LMB, fallback: click the slot in the inventory UI
+		local t = now()
+		if t - TS.use < 3 then
+			continue
+		end
+		TS.use = t
+		print("[rathub-titan] item owned, equipping " .. st.titanShopItem)
+		-- step 1: really put the item into the hands (exact name first)
+		local pickedName = nil
+		pcall(function()
+			local bp = lp:FindFirstChild("Backpack")
+			local ch = lp.Character
+			local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+			local want = st.titanShopItem:lower()
+			local function pick(container, strict)
+				if not container then
+					return nil
+				end
+				for _, tool in ipairs(container:GetChildren()) do
+					if tool:IsA("Tool") then
+						local n = tool.Name:lower()
+						if strict then
+							if n == want or n:find(want, 1, true) then
+								return tool
+							end
+						elseif n:find("titan", 1, true) then
+							return tool
+						end
+					end
+				end
+				return nil
+			end
+			local tool = pick(ch, true) or pick(bp, true) or pick(ch, false) or pick(bp, false)
+			if not tool then
+				return
+			end
+			pickedName = tool.Name
+			if tool.Parent ~= ch and hum then
+				hum:EquipTool(tool)
+			end
+		end)
+		-- wait until the tool really sits in the Character (EquipTool may lag)
+		local inHands = false
+		for _ = 1, 30 do
+			local ok, has = pcall(function()
+				local ch = lp.Character
+				if not ch or not pickedName then
+					return false
+				end
+				return ch:FindFirstChild(pickedName) ~= nil
+			end)
+			if ok and has then
+				inHands = true
+				break
+			end
+			pcall(function()
+				local ch = lp.Character
+				local bp = lp:FindFirstChild("Backpack")
+				local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+				local t = bp and pickedName and bp:FindFirstChild(pickedName)
+				if t and hum then
+					hum:EquipTool(t)
+				end
+			end)
+			task.wait(0.15)
+		end
+		-- step 2: ONLY with the item in hands fire the remote
+		if inHands then
+			print("[rathub-titan] item in hands, firing RequestTitan")
+			pcall(function()
+				rs:WaitForChild("RequestTitan"):FireServer()
+			end)
+			task.wait(1.2)
+		else
+			print("[rathub-titan] NOT in hands (" .. tostring(pickedName) .. "), remote skipped")
+		end
+		for _ = 1, 5 do
+			if isTitanForm() then
+				break
+			end
+			pcall(function()
+				rs.LMB:FireServer()
+			end)
+			if type(mouse1click) == "function" then
+				pcall(mouse1click)
+			end
+			task.wait(0.4)
+		end
+		if not isTitanForm() then
+			pcall(function()
+				local pg = lp:FindFirstChild("PlayerGui")
+				local gui = pg and pg:FindFirstChild("003-A")
+				local slot = gui and gui:FindFirstChild(st.titanShopItem, true)
+				if slot then
+					local btn = nil
+					if slot:IsA("GuiButton") then
+						btn = slot
+					else
+						for _, d in ipairs(slot:GetDescendants()) do
+							if d:IsA("GuiButton") then
+								btn = d
+								break
+							end
+						end
+					end
+					if btn then
+						clickGuiButton(btn)
+						print("[rathub-titan] clicked inventory slot of " .. st.titanShopItem)
+					end
+				end
+			end)
+			task.wait(1.5)
+		end
+		if isTitanForm() then
+			titanRequestUsed = true
+			notify("Titan", "titan form active", "check", 3)
+			print("[rathub-titan] form active")
+		else
+			print("[rathub-titan] use attempt failed, will retry")
+		end
+	end
+end)
+
+-- auto purchase cinema columns on the titan: fire ChangeToCinema while the
+-- shop is open until ValuesFolder.Cinema turns on (attempts reset per round)
+task.spawn(function()
+	while alive() do
+		task.wait(1)
+		if not (st.titanFarm and st.titanCinema) then
+			TS.cinemaTries = 0
+			continue
+		end
+		local wave = ws:FindFirstChild("Wave") and ws.Wave.Value or 0
+		if wave == 0 then
+			TS.cinemaTries = 0
+		end
+		if not isTitanForm() then
+			TS.cinemaTries = 0
+			continue
+		end
+		local isCinema = nil
+		pcall(function()
+			local vf = lp.Character and lp.Character:FindFirstChild("ValuesFolder")
+			local cv = vf and vf:FindFirstChild("Cinema")
+			isCinema = cv and cv.Value
+		end)
+		if isCinema == true then
+			continue
+		end
+		if TS.cinemaTries >= 10 then
+			continue
+		end
+		if not canUseShop() then
+			continue
+		end
+		local t = now()
+		if t - TS.cinemaLast < 3 then
+			continue
+		end
+		TS.cinemaLast = t
+		TS.cinemaTries = TS.cinemaTries + 1
+		pcall(function()
+			rs:WaitForChild("ChangeToCinema"):FireServer()
+		end)
+		print("[rathub-titan] ChangeToCinema fired (" .. tostring(TS.cinemaTries) .. "/10)")
+		task.wait(1)
+		pcall(function()
+			local vf = lp.Character and lp.Character:FindFirstChild("ValuesFolder")
+			local cv = vf and vf:FindFirstChild("Cinema")
+			if cv and cv.Value == true then
+				notify("Titan", "cinema columns active", "check", 3)
+			end
+		end)
+	end
+end)
+
+task.spawn(function()
+	while alive() do
+		task.wait(st.titanSkillDelay)
+		if st.titanFarm and st.titanSkillsOn and isTitanForm() then
+			local t = now()
+			local ok, err = pcall(function()
+				-- abilities only while orbiting the target
+				if st.titanOrbitOnly and not TS.orbiting then
+					return
+				end
+				local tgt = TS.target
+				if not tgt then
+					return
+				end
+				-- helicopters / jetpack toilets: M1 only
+				if titanIsFlyer(tgt.name) then
+					return
+				end
+				local char = lp.Character
+				local cdf = char and char:FindFirstChild("CooldownFolder")
+				-- wait only while a skill itself is casting (not M1), so the
+				-- M1 spam cannot starve abilities
+				local busy = false
+				local ask = cdf and cdf:FindFirstChild("ActiveSkill")
+				if ask and ask.Value == true then
+					busy = true
+				end
+				-- test version: weak (<300 max HP) / strong (300+)
+				if (tgt.mx or 0) < 300 then
+					TS.wIdx = runSkillNext(TITAN_WEAK, char, cdf, busy, TS.wIdx)
+				else
+					TS.sIdx = runSkillNext(TITAN_STRONG, char, cdf, busy, TS.sIdx)
+				end
+			end)
+			if not ok and t - TS.err > 5 then
+				TS.err = t
+				print("[rathub-titan-skill] " .. tostring(err))
+			end
+		end
+	end
+end)
+
+RunService.Heartbeat:Connect(function(dt)
+	if not alive() or not st.titanFarm then
+		return
+	end
+	if not isTitanForm() then
+		if st.titanFarm and not TS.hint then
+			TS.hint = true
+			notify("Titan", "normal character farm until the request is bought and used", "info", 3)
+		end
+		return
+	end
+	TS.hint = false
+	local t = now()
+	local ok, err = pcall(function()
+		local char = lp.Character
+		local hrp = char and char:FindFirstChild("HumanoidRootPart")
+		if not hrp then
+			return
+		end
+		local wave = ws:FindFirstChild("Wave") and ws.Wave.Value or 0
+		-- reset wave (titan side, the normal farm heartbeat returns here)
+		if st.titanResetWave and st.titanResetWave > 0 then
+			if wave >= st.titanResetWave and not TS.resetDone then
+				hrp.CFrame = CFrame.new(hrp.Position.X, -175, hrp.Position.Z)
+				TS.resetDone = true
+				print("[rathub-titan] reset: under map (wave " .. tostring(wave) .. ")")
+				return
+			elseif wave < st.titanResetWave then
+				TS.resetDone = false
+			end
+		end
+		-- M1 spams all the time, together with abilities
+		if st.titanM1 and t - TS.lmb >= 0.1 then
+			TS.lmb = t
+			local cdf = char:FindFirstChild("CooldownFolder")
+			local am1 = cdf and cdf:FindFirstChild("ActiveM1")
+			local lb = cdf and cdf:FindFirstChild("LMBActive")
+			if not ((am1 and am1.Value == true) or (lb and lb.Value == true)) then
+				pcall(function()
+					rs.LMB:FireServer()
+				end)
+			end
+		end
+
+		if t - TS.scan >= 0.5 then
+			TS.scan = t
+			TS.mobs = scanMobs(hrp)
+		end
+		local target = titanPickTarget(TS.mobs)
+		if not target then
+			-- no enemies: stay in one position (like the normal farm)
+			TS.target = nil
+			TS.orbiting = false
+			TS.angleInit = false
+			return
+		end
+		TS.target = { name = target.name, mx = target.mx }
+		local tpos
+		pcall(function()
+			tpos = target.root.Position
+		end)
+		if not tpos then
+			tpos = target.pos
+		end
+		target.pos = tpos
+		local ppos = hrp.Position
+		local flatT = Vector3.new(tpos.X, ppos.Y, tpos.Z)
+		local dist = (flatT - ppos).Magnitude
+
+		if dist > st.titanRadius + 3 then
+			-- approach: stay at orbit radius, feet on the ground
+			TS.angleInit = false
+			TS.orbiting = false
+			local dir = Vector3.new(ppos.X - flatT.X, 0, ppos.Z - flatT.Z)
+			if dir.Magnitude < 0.01 then
+				dir = Vector3.new(0, 0, 1)
+			end
+			dir = dir.Unit
+			local goal = flatT + dir * st.titanRadius
+			local step = math.min(st.titanSpeed * dt, math.max(dist - st.titanRadius, 0))
+			local flat = Vector3.new(goal.X, ppos.Y, goal.Z)
+			local toGoal = flat - ppos
+			local np = ppos + (toGoal.Magnitude > 0.01 and toGoal.Unit * math.min(step, toGoal.Magnitude) or Vector3.new(0, 0, 0))
+			local gy = titanGroundY(char, np.X, np.Z, ppos.Y)
+			local y = (gy or TS.lastY or ppos.Y) + st.titanFeetOffset
+			TS.lastY = y
+			setPosFacing(hrp, Vector3.new(np.X, y, np.Z), tpos)
+		else
+			-- orbit the target on the ground
+			TS.orbiting = true
+			if not TS.angleInit then
+				local off = ppos - flatT
+				TS.angle = math.atan2(off.Z, off.X)
+				TS.angleInit = true
+			end
+			TS.angle = TS.angle + math.rad(st.titanOrbitDeg) * dt
+			local orb = tpos + Vector3.new(math.cos(TS.angle) * st.titanRadius, 0, math.sin(TS.angle) * st.titanRadius)
+			local gy = titanGroundY(char, orb.X, orb.Z, ppos.Y)
+			local y = (gy or TS.lastY or ppos.Y) + st.titanFeetOffset
+			TS.lastY = y
+			setPosFacing(hrp, Vector3.new(orb.X, y, orb.Z), tpos)
+		end
+	end)
+	if not ok and t - TS.err > 5 then
+		TS.err = t
+		print("[rathub-titan] " .. tostring(err))
 	end
 end)
 
@@ -3540,7 +4319,7 @@ task.spawn(function()
 					return
 				end
 				local tw = ws:FindFirstChild("TimerWave")
-				if st.godSkipTimer0 and tw and tw.Value <= 0 then
+				if st.godSkipTimer0 and tw and tw.Value < 20 then
 					return
 				end
 				if t - godLastT < 3 then
