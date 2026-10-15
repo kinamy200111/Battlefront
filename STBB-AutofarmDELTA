@@ -1116,6 +1116,17 @@ ele(TitanSec, "Keybind", {
 		setToggle(titanToggle, nv)
 	end,
 })
+ele(TitanSec, "Dropdown", {
+	Title = "Пресет титана",
+	Desc = "Скиллы и атаки настроены под него.",
+	Values = { "Titan TV" },
+	Value = "Titan TV",
+	Callback = function(v)
+		if v == "Titan TV" then
+			st.titanShopItem = "Titan-Request"
+		end
+	end,
+})
 ele(TitanSec, "Slider", {
 	Title = "Скорость",
 	Step = 50,
@@ -1184,10 +1195,6 @@ ele(TitanSkillSec, "Toggle", {
 		st.titanOrbitOnly = v
 	end,
 })
-ele(TitanSkillSec, "Paragraph", {
-	Title = "Тест версия",
-	Desc = "Ам ам ам", 
-})
 ele(TitanSkillSec, "Slider", {
 	Title = "Интервал спама",
 	Step = 0.05,
@@ -1217,14 +1224,6 @@ ele(TitanReqSec, "Slider", {
 	Value = { Min = 1, Max = 100, Default = 1 },
 	Callback = function(v)
 		st.titanRequestWave = v
-	end,
-})
-ele(TitanReqSec, "Input", {
-	Title = "Ещё одна бесполезная вещь",
-	Desc = "изи",
-	Value = "Titan-Request",
-	Callback = function(v)
-		st.titanShopItem = v
 	end,
 })
 ele(TitanReqSec, "Toggle", {
@@ -3974,12 +3973,9 @@ task.spawn(function()
 				if ask and ask.Value == true then
 					busy = true
 				end
-				-- test version: weak (<300 max HP) / strong (300+)
-				if (tgt.mx or 0) < 300 then
-					TS.wIdx = runSkillNext(TITAN_WEAK, char, cdf, busy, TS.wIdx)
-				else
-					TS.sIdx = runSkillNext(TITAN_STRONG, char, cdf, busy, TS.sIdx)
-				end
+				-- Titan TV preset: weak (<300 max HP) / strong (300+)
+				local list = ((tgt.mx or 0) < 300) and TITAN_WEAK or TITAN_STRONG
+				TS.sIdx = runSkillNext(list, char, cdf, busy, TS.sIdx)
 			end)
 			if not ok and t - TS.err > 5 then
 				TS.err = t
