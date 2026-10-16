@@ -3740,6 +3740,10 @@ task.spawn(function()
 			continue
 		end
 		if wave < st.titanRequestWave then
+			-- a new round is running: waves restarted below the threshold,
+			-- so the previous round's "used" flag must not block this one
+			-- (wave==0 may never be observed between rounds)
+			titanRequestUsed = false
 			continue
 		end
 
@@ -4052,6 +4056,7 @@ RunService.Heartbeat:Connect(function(dt)
 			-- only now it is safe to lift the silence and reset flags
 			TS.wasForm = false
 			transformQuietUntil = 0
+			titanRequestUsed = false
 		end
 		if st.titanFarm and not TS.hint then
 			TS.hint = true
