@@ -368,6 +368,12 @@ local godBusy = false
 local astroSnapNext = false
 local sendWebhook
 local titanRequestUsed = false
+-- from the RequestTitan fire until the form is fully loaded NOTHING may
+-- touch the character: during the transform the game still sees the normal
+-- form, so the normal farm (orbit / LMB / combat skills) runs and its
+-- activity mid-transform bugs the titan (validated manually: farm off at
+-- the moment of becoming titan => everything works afterwards)
+local transformQuietUntil = 0
 
 local function isTitanForm()
 	local ch = lp.Character
@@ -375,9 +381,11 @@ local function isTitanForm()
 end
 
 -- titan farm includes the normal farm: regular character until the request
--- is bought and used, titan farm after the form is active
+-- is bought and used, titan farm after the form is active; while in titan
+-- form the normal farm must not touch the character at all (its skill list
+-- spams wrong remotes and bugs the titan)
 local function farmOn()
-	return st.farm or (st.titanFarm and not isTitanForm())
+	return (st.farm or st.titanFarm) and not isTitanForm()
 end
 
 local function splitList(s)
@@ -2011,7 +2019,7 @@ end
 task.spawn(function()
 	while alive() do
 		task.wait(0.5)
-		if st.heal and st.farm then
+		if st.heal and st.farm and now() >= transformQuietUntil then
 			local t = now()
 			local hum = lp.Character and lp.Character:FindFirstChild("Humanoid")
 			if hum then
@@ -2044,7 +2052,7 @@ end
 task.spawn(function()
 	while alive() do
 		task.wait(0.05)
-		if st.m1Spam and farmOn() then
+		if st.m1Spam and farmOn() and now() >= transformQuietUntil then
 			fireLMB()
 		end
 	end
@@ -2054,7 +2062,7 @@ task.spawn(function()
 	local lastErr = 0
 	while alive() do
 		task.wait(st.skillDelay)
-		if farmOn() and (st.skills or st.titanFarm) then
+		if farmOn() and (st.skills or st.titanFarm) and now() >= transformQuietUntil then
 			local t = now()
 			local ok, err = pcall(function()
 				if st.skillOrbitOnly and not isOrbiting then
@@ -3274,6 +3282,11 @@ RunService.Heartbeat:Connect(function(dt)
 			return
 		end
 
+		-- transform window: no orbit / no movement at all
+		if now() < transformQuietUntil then
+			return
+		end
+
 		if godBusy then
 			return
 		end
@@ -3282,7 +3295,7 @@ RunService.Heartbeat:Connect(function(dt)
 			return
 		end
 
-		if st.titanFarm and isTitanForm() then
+		if isTitanForm() then
 			return
 		end
 
@@ -3585,7 +3598,7 @@ task.spawn(function()
 	end
 end)
 
-local TS = { scan = 0, lmb = 0, mobs = {}, err = 0, hint = false, angle = 0, angleInit = false, buy = 0, use = 0, wIdx = 1, sIdx = 1, target = nil, orbiting = false, lastY = nil, resetDone = false, cinemaLast = 0, cinemaTries = 0 }
+local TS = { scan = 0, lmb = 0, mobs = {}, err = 0, hint = false, angle = 0, angleInit = false, buy = 0, use = 0, reqFired = 0, wasForm = false, wIdx = 1, sIdx = 1, target = nil, orbiting = false, lastY = nil, resetDone = false, cinemaLast = 0, cinemaTries = 0 }
 
 local function titanPickTarget(list)
 	if #list == 0 then
@@ -3741,6 +3754,9 @@ task.spawn(function()
 				continue
 			end
 			TS.buy = t
+			-- silence everything from the buy onwards: the manual recipe is
+			-- "farm off before buying the request"
+			transformQuietUntil = now() + 10
 			-- the Buy remote only works while standing at the shop helicopter
 			shopHold = true
 			pcall(function()
@@ -3775,7 +3791,17 @@ task.spawn(function()
 		if t - TS.use < 3 then
 			continue
 		end
+		-- after a RequestTitan fire the transform takes a few seconds: do not
+		-- equip / fire / click anything during that window, a second
+		-- activation mid-transform bugs the titan
+		if TS.reqFired > 0 and t - TS.reqFired < 8 then
+			continue
+		end
 		TS.use = t
+		-- keep / start the silence through equip + fire + transform
+		if transformQuietUntil < now() + 40 then
+			transformQuietUntil = now() + 40
+		end
 		print("[rathub-titan] item owned, equipping " .. st.titanShopItem)
 		-- step 1: really put the item into the hands (exact name first)
 		local pickedName = nil
@@ -3839,56 +3865,81 @@ task.spawn(function()
 		-- step 2: ONLY with the item in hands fire the remote
 		if inHands then
 			print("[rathub-titan] item in hands, firing RequestTitan")
+			-- silence ALL loops from this moment: orbit / LMB / skills /
+			-- clicks mid-transform bug the titan
+			transformQuietUntil = now() + 30
 			pcall(function()
 				rs:WaitForChild("RequestTitan"):FireServer()
 			end)
-			task.wait(1.2)
+			TS.reqFired = now()
+			-- wait for the form WITHOUT touching anything; only if the
+			-- remote did not transform us after the quiet window the
+			-- LMB fallback below may run
+			for _ = 1, 60 do
+				if isTitanForm() then
+					break
+				end
+				if now() >= transformQuietUntil then
+					break
+				end
+				task.wait(0.5)
+			end
 		else
 			print("[rathub-titan] NOT in hands (" .. tostring(pickedName) .. "), remote skipped")
-		end
-		for _ = 1, 5 do
-			if isTitanForm() then
-				break
-			end
-			pcall(function()
-				rs.LMB:FireServer()
-			end)
-			if type(mouse1click) == "function" then
-				pcall(mouse1click)
-			end
-			task.wait(0.4)
-		end
-		if not isTitanForm() then
-			pcall(function()
-				local pg = lp:FindFirstChild("PlayerGui")
-				local gui = pg and pg:FindFirstChild("003-A")
-				local slot = gui and gui:FindFirstChild(st.titanShopItem, true)
-				if slot then
-					local btn = nil
-					if slot:IsA("GuiButton") then
-						btn = slot
-					else
-						for _, d in ipairs(slot:GetDescendants()) do
-							if d:IsA("GuiButton") then
-								btn = d
-								break
-							end
-						end
-					end
-					if btn then
-						clickGuiButton(btn)
-						print("[rathub-titan] clicked inventory slot of " .. st.titanShopItem)
-					end
-				end
-			end)
-			task.wait(1.5)
 		end
 		if isTitanForm() then
 			titanRequestUsed = true
 			notify("Titan", "titan form active", "check", 3)
 			print("[rathub-titan] form active")
+		elseif now() >= transformQuietUntil then
+			-- remote did nothing and the quiet window is over: legacy
+			-- LMB / inventory click fallback (form is still normal here)
+			for _ = 1, 5 do
+				if isTitanForm() then
+					break
+				end
+				pcall(function()
+					rs.LMB:FireServer()
+				end)
+				if type(mouse1click) == "function" then
+					pcall(mouse1click)
+				end
+				task.wait(0.4)
+			end
+			if not isTitanForm() then
+				pcall(function()
+					local pg = lp:FindFirstChild("PlayerGui")
+					local gui = pg and pg:FindFirstChild("003-A")
+					local slot = gui and gui:FindFirstChild(st.titanShopItem, true)
+					if slot then
+						local btn = nil
+						if slot:IsA("GuiButton") then
+							btn = slot
+						else
+							for _, d in ipairs(slot:GetDescendants()) do
+								if d:IsA("GuiButton") then
+									btn = d
+									break
+								end
+							end
+						end
+						if btn then
+							clickGuiButton(btn)
+							print("[rathub-titan] clicked inventory slot of " .. st.titanShopItem)
+						end
+					end
+				end)
+				task.wait(1.5)
+			end
+			if isTitanForm() then
+				titanRequestUsed = true
+				notify("Titan", "titan form active", "check", 3)
+				print("[rathub-titan] form active")
+			else
+				print("[rathub-titan] use attempt failed, will retry")
+			end
 		else
-			print("[rathub-titan] use attempt failed, will retry")
+			print("[rathub-titan] quiet wait ended without form, will retry")
 		end
 	end
 end)
@@ -3908,6 +3959,9 @@ task.spawn(function()
 		end
 		if not isTitanForm() then
 			TS.cinemaTries = 0
+			continue
+		end
+		if now() < transformQuietUntil then
 			continue
 		end
 		local isCinema = nil
@@ -3951,6 +4005,9 @@ task.spawn(function()
 		task.wait(st.titanSkillDelay)
 		if st.titanFarm and st.titanSkillsOn and isTitanForm() then
 			local t = now()
+			if t < transformQuietUntil then
+				continue
+			end
 			local ok, err = pcall(function()
 				-- abilities only while orbiting the target
 				if st.titanOrbitOnly and not TS.orbiting then
@@ -3990,6 +4047,12 @@ RunService.Heartbeat:Connect(function(dt)
 		return
 	end
 	if not isTitanForm() then
+		if TS.wasForm then
+			-- the form was active and is now gone (died / round ended):
+			-- only now it is safe to lift the silence and reset flags
+			TS.wasForm = false
+			transformQuietUntil = 0
+		end
 		if st.titanFarm and not TS.hint then
 			TS.hint = true
 			notify("Titan", "normal character farm until the request is bought and used", "info", 3)
@@ -3997,6 +4060,7 @@ RunService.Heartbeat:Connect(function(dt)
 		return
 	end
 	TS.hint = false
+	TS.wasForm = true
 	local t = now()
 	local ok, err = pcall(function()
 		local char = lp.Character
@@ -4175,7 +4239,7 @@ task.spawn(function()
 	local lastSwitch = 0
 	while alive() do
 		task.wait(st.masteryDelay)
-		if st.mastery then
+		if st.mastery and now() >= transformQuietUntil and not isTitanForm() then
 			local t = now()
 			local ok, err = pcall(function()
 				local d = dataFolder()
@@ -4277,7 +4341,7 @@ local lastErrGod = 0
 task.spawn(function()
 	while alive() do
 		task.wait(0.25)
-		if st.god and not godBusy then
+		if st.god and not godBusy and now() >= transformQuietUntil then
 			local t = now()
 			local ok, err = pcall(function()
 				local char = lp.Character
