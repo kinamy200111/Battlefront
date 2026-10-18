@@ -270,13 +270,14 @@ local st = {
 	astroPointsText = "",
 	titanFarm = false,
 	titanSpeed = 1200,
-	titanRadius = 23,
-	titanOrbitDeg = 23,
+	titanRadius = 40,
+	titanOrbitDeg = 180,
 	titanFeetOffset = 58.4,
 	titanPriority = "",
 	titanAutoRequest = true,
 	titanRequestWave = 1,
 	titanShopItem = "Titan-Request",
+	titanPreset = "Titan TV",
 	titanPrice = 2200,
 	titanM1 = true,
 	titanSkillDelay = 0.35,
@@ -1126,13 +1127,13 @@ ele(TitanSec, "Keybind", {
 })
 ele(TitanSec, "Dropdown", {
 	Title = "Пресет титана",
-	Desc = "Скиллы и атаки настроены под него.",
-	Values = { "Titan TV" },
-	Value = "Titan TV",
+	Desc = "Скиллы и атаки настроены под него. Реквест одинаковый.",
+	Values = { "Titan TV", "Titan Cameraman" },
+	Value = st.titanPreset,
 	Callback = function(v)
-		if v == "Titan TV" then
-			st.titanShopItem = "Titan-Request"
-		end
+		st.titanPreset = v
+		-- same request item for every titan
+		st.titanShopItem = "Titan-Request"
 	end,
 })
 ele(TitanSec, "Slider", {
@@ -1147,7 +1148,7 @@ ele(TitanSec, "Slider", {
 	Title = "Орбита радиус",
 	Desc = "сирин пидор",
 	Step = 1,
-	Value = { Min = 5, Max = 120, Default = 23 },
+	Value = { Min = 5, Max = 120, Default = 40 },
 	Callback = function(v)
 		st.titanRadius = v
 	end,
@@ -1156,7 +1157,7 @@ ele(TitanSec, "Slider", {
 	Title = "Орбита спид",
 	Desc = "шприц",
 	Step = 1,
-	Value = { Min = 10, Max = 360, Default = 23 },
+	Value = { Min = 10, Max = 360, Default = 180 },
 	Callback = function(v)
 		st.titanOrbitDeg = v
 	end,
@@ -2733,26 +2734,14 @@ task.spawn(function()
 				if not shopGateOpen() then
 					if t - lastNotify > 10 then
 						lastNotify = t
-						notify("Shop", "blocked (sandbox or vip code)", "info", 2)
+						print("[rathub-shop] blocked (sandbox or vip code)")
 					end
 				else
 					local ids = st.shopBuySel or {}
-					-- MasterCard:NormalIII x1 is always bought while auto buy is on
-					local hasMC = false
-					for _, v in ipairs(ids) do
-						if v == "MasterCard:NormalIII" then
-							hasMC = true
-							break
-						end
-					end
-					if not hasMC then
-						ids = { table.unpack(ids) }
-						table.insert(ids, "MasterCard:NormalIII")
-					end
 					if #ids == 0 then
 						if t - lastNotify > 15 then
 							lastNotify = t
-							notify("Shop", "select items in the dropdown", "info", 2)
+							print("[rathub-shop] select items in the dropdown")
 						end
 					else
 						local qty = math.max(1, tonumber(st.shopBuyQty) or 1)
@@ -2767,26 +2756,21 @@ task.spawn(function()
 								local id = ids[shopBuyCursor]
 								shopBuyCursor = shopBuyCursor + 1
 								tries = tries + 1
-								local isMC = id == "MasterCard:NormalIII"
 								local stock = tonumber(shopStock[id])
-								-- MasterCard is fired blindly: FireServer(id, 1), no stock check
-								if isMC or (stock and stock > 0) then
-									local buyQty = isMC and 1 or math.min(qty, stock)
+								if stock and stock > 0 then
+									local buyQty = math.min(qty, stock)
 									pcall(function()
 										rem:FireServer(id, buyQty)
 									end)
 									lastBuy = t
 									boughtAny = true
-									if t - lastNotify > 3 then
-										lastNotify = t
-										notify("Shop", "bought " .. id .. " x" .. buyQty, "check", 2)
-									end
+									print("[rathub-shop] bought " .. id .. " x" .. buyQty)
 									break
 								end
 							end
 							if not boughtAny and tries >= #ids and t - lastNotify > 15 then
 								lastNotify = t
-								notify("Shop", "all selected items out of stock", "info", 2)
+								print("[rathub-shop] all selected items out of stock")
 							end
 						end
 					end
@@ -3516,12 +3500,6 @@ RunService.Heartbeat:Connect(function(dt)
 		if wave <= 0 then
 			return
 		end
-		local voteActiveNow = (ws:FindFirstChild("Voteing") and ws.Voteing.Value == true)
-			or (ws:FindFirstChild("OpenVoteUI") ~= nil)
-			or (lp.PlayerGui and lp.PlayerGui:FindFirstChild("OpenVoteUI") ~= nil)
-		if voteActiveNow then
-			return
-		end
 
 		if AS.teleported then
 			if timeLeft > 100 then
@@ -3661,8 +3639,21 @@ end
 
 -- test auto-skill version: abilities by enemy max HP (SoundWave removed -
 -- it bugs the titan)
-local TITAN_WEAK = parseSkillList("StompTitanTV | Stomp_Cooldown\nRadiantTitanTV | Radiant_Cooldown")
-local TITAN_STRONG = parseSkillList("StompTitanTV | Stomp_Cooldown\nStabTitanTV | Stab_Cooldown\nTackle | Tackle_Cooldown\nRadiantTitanTV | Radiant_Cooldown")
+local TITAN_PRESETS = {
+	["Titan TV"] = {
+		weak = parseSkillList("StompTitanTV | Stomp_Cooldown\nRadiantTitanTV | Radiant_Cooldown"),
+		strong = parseSkillList("StompTitanTV | Stomp_Cooldown\nStabTitanTV | Stab_Cooldown\nTackle | Tackle_Cooldown\nRadiantTitanTV | Radiant_Cooldown"),
+	},
+	["Titan Cameraman"] = {
+		weak = parseSkillList("KickTitanCamera\nJumpSlamTitanCam\nStompTitanCamera\nCoreFlameTitanCamera"),
+		strong = parseSkillList("KickTitanCamera\nJumpSlamTitanCam\nStompTitanCamera\nTackleTitanCam\nCoreFlameTitanCamera"),
+	},
+}
+
+local function titanPresetLists()
+	local p = TITAN_PRESETS[st.titanPreset] or TITAN_PRESETS["Titan TV"]
+	return p.weak, p.strong
+end
 
 local function titanIsFlyer(name)
 	local low = tostring(name):lower()
@@ -4034,8 +4025,9 @@ task.spawn(function()
 				if ask and ask.Value == true then
 					busy = true
 				end
-				-- Titan TV preset: weak (<300 max HP) / strong (300+)
-				local list = ((tgt.mx or 0) < 300) and TITAN_WEAK or TITAN_STRONG
+				-- presets: weak (<300 max HP) / strong (300+)
+				local weakL, strongL = titanPresetLists()
+				local list = ((tgt.mx or 0) < 300) and weakL or strongL
 				TS.sIdx = runSkillNext(list, char, cdf, busy, TS.sIdx)
 			end)
 			if not ok and t - TS.err > 5 then
