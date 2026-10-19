@@ -1,0 +1,1886 @@
+-- CameraTD Macro System v4
+-- Запись/воспроизведение + авто-конфиг + авто-экзекут (queue_on_teleport) + авто-заход в лифт + фарм каток
+-- GUI: Obsidian (mspaint)
+
+local __bootG = getgenv()
+if __bootG.CameraTDLastBoot and (os.clock() - __bootG.CameraTDLastBoot) < 3 then return end
+__bootG.CameraTDLastBoot = os.clock()
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+local UserInputService = game:GetService("UserInputService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+
+local LocalPlayer = Players.LocalPlayer
+if not LocalPlayer then
+	local t0 = os.clock()
+	while not LocalPlayer and os.clock() - t0 < 30 do
+		task.wait(0.1)
+		LocalPlayer = Players.LocalPlayer
+	end
+end
+
+local NetworkFolder = RS:WaitForChild("ModuleLoader"):WaitForChild("Shared"):WaitForChild("Network"):WaitForChild("RemoteEvent")
+local NetworkRF = RS:WaitForChild("ModuleLoader"):WaitForChild("Shared"):WaitForChild("Network"):WaitForChild("RemoteFunction")
+
+-- Ленивые require'ы: GameReplicator есть только в катке, в лобби его нет
+local _gameReplicator, _replication
+local function getGameReplicator()
+	if _gameReplicator == nil then
+		local mod = RS.ModuleLoader.Client:FindFirstChild("GameReplicator")
+		if mod then
+			local ok, res = pcall(require, mod)
+			_gameReplicator = ok and res or false
+		end
+	end
+	return _gameReplicator or nil
+end
+local function getReplicationModule()
+	if _replication == nil then
+		local mod = RS.ModuleLoader.Client:FindFirstChild("Replication")
+		if mod then
+			local ok, res = pcall(require, mod)
+			_replication = ok and res or false
+		end
+	end
+	return _replication or nil
+end
+
+local MACRO_DIR = "CameraTD_Macros/"
+local CONFIG_PATH = MACRO_DIR.."config.json"
+local LOBBY_PLACE = 132929771812494
+
+local LOADER_SRC = [[
+if isfile("CameraTD_Macros/MacroSystem.lua") then
+	local f, err = loadfile("CameraTD_Macros/MacroSystem.lua")
+	if f then f() else warn("[Macro] loader: "..tostring(err)) end
+end
+]]
+
+local function armTeleportQueue()
+	if typeof(queue_on_teleport) == "function" then
+		pcall(queue_on_teleport, LOADER_SRC)
+	end
+end
+
+local function inLobby()
+	return game.PlaceId == LOBBY_PLACE
+end
+
+-- ========== Защита от двойных загрузок ==========
+
+local G = getgenv()
+if type(G.CameraTDThreads) == "table" then
+	for _, h in ipairs(G.CameraTDThreads) do pcall(task.cancel, h) end
+end
+G.CameraTDThreads = {}
+local function track(f)
+	local h = task.spawn(function()
+		local ok, err = pcall(f)
+		if not ok then warn("[Macro] thread: "..tostring(err)) end
+	end)
+	table.insert(G.CameraTDThreads, h)
+	return h
+end
+
+local WATCHED = {
+	TowerAdd = true, TowerSell = true, TowerUpgrade = true,
+	TowerTarget = true, TowerRemove = true, WaveSkip = true,
+}
+if not G.CameraTDHooked then
+	G.CameraTDHooked = true
+	local oldNamecall
+	oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+		local method = getnamecallmethod()
+		if method == "FireServer" and WATCHED[self.Name] and G.CameraTDRecording then
+			local cb = G.CameraTDOnRemote
+			if cb then task.spawn(cb, self.Name, { ... }) end
+		end
+		return oldNamecall(self, ...)
+	end))
+end
+
+-- ========== Конфиг ==========
+
+local Config
+local function mergeConfig(decoded)
+	local c = {
+		version = 4,
+		autoload = true,
+		autoJoin = false,
+		lastMacro = nil,
+		lastMap = nil,
+		farm = { active = false, target = 5, done = 0 },
+		settings = { VoteMode = "Normal", AutoSkipBeforeRecord = false, PlaceByTimer = false, SmartUpgrade = true, AntiAfk = true, AfterMatch = "PlayAgain", Speed15 = false, MenuVisible = true },
+	}
+	if type(decoded) == "table" then
+		for k, v in pairs(decoded) do
+			if k == "settings" and type(v) == "table" then
+				for sk, sv in pairs(v) do c.settings[sk] = sv end
+			elseif k == "farm" and type(v) == "table" then
+				for sk, sv in pairs(v) do c.farm[sk] = sv end
+			else
+				c[k] = v
+			end
+		end
+	end
+	return c
+end
+local ConfigRead = false
+local function loadConfig()
+	local ok, decoded = pcall(function()
+		if isfile(CONFIG_PATH) then
+			return HttpService:JSONDecode(readfile(CONFIG_PATH))
+		end
+	end)
+	ConfigRead = ok and type(decoded) == "table"
+	Config = mergeConfig(ConfigRead and decoded or nil)
+	return Config
+end
+local function saveConfig()
+	pcall(function() writefile(CONFIG_PATH, HttpService:JSONEncode(Config)) end)
+end
+loadConfig()
+
+-- ========== Состояние ==========
+
+local Macro = {
+	Recording = false,
+	Playing = false,
+	Actions = {},
+	StartTime = 0,
+	StopFlag = false,
+	AutoUpgrade = false,
+	AutoSkip = false,
+	TargetLevels = {},
+	TargetOrder = {},
+	Meta = { matches = {} },
+	Settings = Config.settings,
+	CurrentMacroName = Config.lastMacro or "default",
+}
+
+local applyConfigToUI
+local updateMacroInfo
+local updateFarmLabel
+local startAutoJoin
+local autoJoinWanted
+local notify
+
+-- ========== Helpers ==========
+
+local function getReplica()
+	local Replication = getReplicationModule()
+	return Replication and Replication.GetCurrentReplica and Replication.GetCurrentReplica()
+end
+
+local function getEquippedUnits()
+	local replica = getReplica()
+	local bySlot = {}
+	if replica and replica.Data and replica.Data.Towers then
+		for uid, info in pairs(replica.Data.Towers) do
+			if info.Equipped then
+				bySlot[info.Equipped] = { UnitId = uid, Name = info.Name, Slot = info.Equipped }
+			end
+		end
+	end
+	return bySlot
+end
+
+local function getPlacedTowers()
+	local out = {}
+	local GR = getGameReplicator()
+	if GR and GR.Data and GR.Data.Towers then
+		for id, data in pairs(GR.Data.Towers) do
+			table.insert(out, {
+				Id = id,
+				Name = data.Name,
+				UnitId = data.UnitId,
+				Pos = data.Pos,
+				Level = data.Level,
+				OwnerUserId = data.OwnerUserId,
+			})
+		end
+	end
+	return out
+end
+
+local function findTowerByPos(pos, tolerance)
+	tolerance = tolerance or 1.5
+	local best, bestDist
+	for _, t in ipairs(getPlacedTowers()) do
+		if t.Pos then
+			local d = (Vector3.new(t.Pos.X, t.Pos.Y, t.Pos.Z) - Vector3.new(pos.X, pos.Y, pos.Z)).Magnitude
+			if d <= tolerance and (not bestDist or d < bestDist) then
+				best, bestDist = t, d
+			end
+		end
+	end
+	return best
+end
+
+local function makePosKey(pos)
+	return string.format("%.1f,%.1f,%.1f", pos.X, pos.Y, pos.Z)
+end
+
+local function fireRemote(name, ...)
+	local remote = NetworkFolder:FindFirstChild(name)
+	if not remote then return end
+	remote:FireServer(...)
+end
+
+local function invokeRemote(name, ...)
+	local rf = NetworkRF:FindFirstChild(name)
+	if not rf then return nil end
+	local args = { ... }
+	local ok, res = pcall(function() return rf:InvokeServer(unpack(args)) end)
+	return ok and res or nil
+end
+
+local function vimClick(btn)
+	local pos = btn.AbsolutePosition
+	local size = btn.AbsoluteSize
+	local cx = pos.X + size.X / 2
+	local cy = pos.Y + size.Y / 2
+	VirtualInputManager:SendMouseButtonEvent(cx, cy, 0, true, nil, 0)
+	task.wait(0.05)
+	VirtualInputManager:SendMouseButtonEvent(cx, cy, 0, false, nil, 0)
+end
+
+local placementQueue = {}
+local queueMode = false
+
+local function parseDigits(text)
+	local s = (tostring(text or ""):gsub("%D", ""))
+	return tonumber(s)
+end
+
+function Macro.GetMoney()
+	local pg = LocalPlayer and LocalPlayer.PlayerGui
+	local gui = pg and pg:FindFirstChild("GameUI")
+	local stats = gui and gui:FindFirstChild("Stats")
+	local other = stats and stats:FindFirstChild("OtherUI")
+	local moneyFrame = other and other:FindFirstChild("Money")
+	local title = moneyFrame and moneyFrame:FindFirstChild("Title")
+	if title then return parseDigits(title.Text) or 0 end
+	return 0
+end
+
+local function getSlotPriceForUnit(unitId)
+	local replica = getReplica()
+	local eq
+	if replica and replica.Data and replica.Data.Towers then
+		local info = replica.Data.Towers[unitId]
+		if info then eq = info.Equipped end
+	end
+	if not eq then return nil end
+	local pg = LocalPlayer and LocalPlayer.PlayerGui
+	local gui = pg and pg:FindFirstChild("GameUI")
+	local slots = gui and gui:FindFirstChild("Slots")
+	local slot = slots and slots:FindFirstChild("Slot"..tostring(eq))
+	local troop = slot and slot:FindFirstChild("TroopFrame")
+	local price = troop and troop:FindFirstChild("Price")
+	if price and (price:IsA("TextLabel") or price:IsA("TextButton")) then
+		return parseDigits(price.Text)
+	end
+	return nil
+end
+
+-- ========== Mode Vote ==========
+
+function Macro.VoteMode(mode)
+	if not mode or mode == "None" then return end
+	local rm = NetworkFolder:FindFirstChild("ModeVote")
+	if rm then
+		rm:FireServer(mode)
+		print("[Macro] Voted: "..mode)
+	else
+		warn("[Macro] ModeVote remote not found")
+	end
+end
+
+-- ========== API действий ==========
+
+function Macro.PlaceTower(slot, cf)
+	local unit = getEquippedUnits()[slot]
+	if not unit then return false end
+	fireRemote("TowerAdd", { UnitId = unit.UnitId, Name = unit.Name, Pos = cf.Position, CFrame = cf })
+	return true
+end
+
+function Macro.UpgradeTowerAt(pos)
+	local t = findTowerByPos(pos)
+	if not t then return false end
+	fireRemote("TowerUpgrade", { Id = t.Id })
+	return true
+end
+
+function Macro.SellTowerAt(pos)
+	local t = findTowerByPos(pos)
+	if not t then return false end
+	fireRemote("TowerSell", { Id = t.Id })
+	return true
+end
+
+function Macro.UpgradeTower(id) fireRemote("TowerUpgrade", { Id = id }) end
+function Macro.SellTower(id) fireRemote("TowerSell", { Id = id }) end
+function Macro.SetTarget(id, mode) fireRemote("TowerTarget", { Id = id, TargetMode = mode }) end
+function Macro.SkipWave() fireRemote("WaveSkip") end
+
+function Macro.UpgradeAllOwned(maxLevel)
+	maxLevel = maxLevel or 99
+	for _, t in ipairs(getPlacedTowers()) do
+		if t.OwnerUserId == LocalPlayer.UserId and (t.Level or 1) < maxLevel then
+			fireRemote("TowerUpgrade", { Id = t.Id })
+			task.wait(0.05)
+		end
+	end
+end
+
+function Macro.SellAllOwned()
+	for _, t in ipairs(getPlacedTowers()) do
+		if t.OwnerUserId == LocalPlayer.UserId then
+			fireRemote("TowerSell", { Id = t.Id })
+			task.wait(0.05)
+		end
+	end
+end
+
+-- ========== Smart Auto-Upgrade ==========
+
+function Macro.BuildTargetLevels()
+	local targets = {}
+	local order = {}
+	for _, a in ipairs(Macro.Actions) do
+		if a.type == "TowerUpgrade" and a.pos then
+			local key = makePosKey(Vector3.new(a.pos.x, a.pos.y, a.pos.z))
+			local targetLevel = (a.levelBefore or 1) + 1
+			if not targets[key] then
+				targets[key] = targetLevel
+				table.insert(order, key)
+			elseif targets[key] < targetLevel then
+				targets[key] = targetLevel
+			end
+		end
+	end
+	Macro.TargetLevels = targets
+	Macro.TargetOrder = order
+end
+
+local autoUpgradeThread
+function Macro.SetAutoUpgrade(enabled)
+	Macro.AutoUpgrade = enabled
+	if autoUpgradeThread then pcall(task.cancel, autoUpgradeThread); autoUpgradeThread = nil end
+	if enabled then
+		if #Macro.Actions > 0 or not next(Macro.TargetLevels) then Macro.BuildTargetLevels() end
+		autoUpgradeThread = track(function()
+			while Macro.AutoUpgrade do
+				pcall(function()
+					local function tryKey(key)
+						local target = Macro.TargetLevels[key]
+						if not target then return false end
+						for _, t in ipairs(getPlacedTowers()) do
+							if t.OwnerUserId == LocalPlayer.UserId and t.Pos and makePosKey(t.Pos) == key then
+								if (t.Level or 1) < target then
+									fireRemote("TowerUpgrade", { Id = t.Id })
+									task.wait(0.15)
+									return true
+								end
+								return false
+							end
+						end
+						return false
+					end
+					local order = Macro.TargetOrder
+					if order and #order > 0 then
+						for _, key in ipairs(order) do
+							if not Macro.AutoUpgrade then return end
+							if tryKey(key) then break end
+						end
+					else
+						for _, t in ipairs(getPlacedTowers()) do
+							if t.OwnerUserId == LocalPlayer.UserId and t.Pos then
+								local target = Macro.TargetLevels[makePosKey(t.Pos)]
+								if target and (t.Level or 1) < target then
+									fireRemote("TowerUpgrade", { Id = t.Id })
+									task.wait(0.15)
+								end
+							end
+						end
+					end
+				end)
+				task.wait(0.3)
+			end
+		end)
+	end
+end
+
+-- ========== Auto-Skip (только remote) ==========
+
+local autoSkipThread
+function Macro.SetAutoSkip(enabled)
+	Macro.AutoSkip = enabled and true or false
+	if autoSkipThread then pcall(task.cancel, autoSkipThread); autoSkipThread = nil end
+	if Macro.AutoSkip then
+		autoSkipThread = track(function()
+			while Macro.AutoSkip do
+				pcall(fireRemote, "WaveSkip")
+				task.wait(0.12)
+			end
+		end)
+	end
+	print("[Macro] AutoSkip = "..tostring(Macro.AutoSkip))
+end
+
+-- ========== Multi-Macro Save/Load ==========
+
+local function collectUnits(actions)
+	local seen, list = {}, {}
+	for _, a in ipairs(actions or {}) do
+		if a.type == "TowerAdd" and a.place and a.place.UnitId and not seen[a.place.UnitId] then
+			seen[a.place.UnitId] = true
+			list[#list + 1] = tostring(a.place.Name or a.place.UnitId)
+		end
+	end
+	return list
+end
+
+function Macro.ListMacros()
+	local files = {}
+	local ok, result = pcall(function()
+		return listfiles(MACRO_DIR)
+	end)
+	if ok and result then
+		for _, f in ipairs(result) do
+			if f:match("%.json$") then
+				local name = f:match("([^/\\]+)%.json$")
+				if name and name ~= "config" and not name:match("%.rec$") then
+					table.insert(files, name)
+				end
+			end
+		end
+	end
+	return files
+end
+
+local function recPath(name)
+	return MACRO_DIR..(name or Macro.CurrentMacroName or "default")..".rec.json"
+end
+
+local function deleteRec(name)
+	pcall(function()
+		local p = recPath(name)
+		if isfile(p) then delfile(p) end
+	end)
+end
+
+function Macro.Save(name)
+	name = name or Macro.CurrentMacroName or "default"
+	Macro.CurrentMacroName = name
+	Macro.Meta.units = collectUnits(Macro.Actions)
+	local data = {
+		version = 4,
+		actions = Macro.Actions,
+		targetLevels = Macro.TargetLevels,
+		settings = Macro.Settings,
+		meta = Macro.Meta,
+		savedAt = os.date("%Y-%m-%d %H:%M:%S"),
+	}
+	local path = MACRO_DIR..name..".json"
+	local ok, err = pcall(function()
+		writefile(path, HttpService:JSONEncode(data))
+	end)
+	if ok then
+		deleteRec(name)
+		print("[Macro] Saved: "..path.." ("..#Macro.Actions.." actions)")
+		if updateMacroInfo then pcall(updateMacroInfo, name) end
+		return path
+	end
+	warn("[Macro] Save failed: "..tostring(err))
+	return nil
+end
+
+function Macro.Load(name)
+	name = name or Macro.CurrentMacroName or "default"
+	Macro.CurrentMacroName = name
+	local path = MACRO_DIR..name..".json"
+	if not isfile(path) then
+		warn("[Macro] Not found: "..path)
+		return false
+	end
+	local ok, data = pcall(function()
+		return HttpService:JSONDecode(readfile(path))
+	end)
+	if not ok or type(data) ~= "table" then
+		warn("[Macro] Bad json: "..path)
+		return false
+	end
+	Macro.Actions = data.actions or {}
+	Macro.TargetLevels = data.targetLevels or {}
+	Macro.Meta = type(data.meta) == "table" and data.meta or { matches = {} }
+	if type(Macro.Meta.matches) ~= "table" then Macro.Meta.matches = {} end
+	if type(data.settings) == "table" then
+		for k, v in pairs(data.settings) do Macro.Settings[k] = v end
+		saveConfig()
+	end
+	if not next(Macro.TargetLevels) then Macro.BuildTargetLevels() end
+	Config.lastMacro = name
+	saveConfig()
+	print(string.format("[Macro] Loaded %s: %d actions", name, #Macro.Actions))
+	if applyConfigToUI then pcall(applyConfigToUI) end
+	if updateMacroInfo then pcall(updateMacroInfo, name) end
+	if autoJoinWanted() and inLobby() then
+		local ok = pcall(startAutoJoin)
+		if not ok then print("[Macro] autoJoin после Load не стартовал") end
+	end
+	return true
+end
+
+function Macro.DeleteMacro(name)
+	if not name or name == "" or name == "config" then
+		warn("[Macro] Удаление запрещено: "..tostring(name))
+		return false
+	end
+	local path = MACRO_DIR..name..".json"
+	if isfile(path) then
+		delfile(path)
+		deleteRec(name)
+		print("[Macro] Deleted: "..name)
+		return true
+	end
+	return false
+end
+
+function Macro.List()
+	for i, a in ipairs(Macro.Actions) do
+		print(string.format("  #%d t=%.2f %s", i, a.t or 0, a.type))
+	end
+end
+
+function Macro.Stop() Macro.StopFlag = true end
+
+-- ========== Запись ==========
+
+local function serializeArg(a)
+	local t = typeof(a)
+	if t == "CFrame" then return { _type = "CFrame", components = { a:GetComponents() } }
+	elseif t == "Vector3" then return { _type = "Vector3", x = a.X, y = a.Y, z = a.Z }
+	elseif t == "table" then
+		local out = {}
+		for k, v in pairs(a) do out[k] = serializeArg(v) end
+		return out
+	elseif t == "string" or t == "number" or t == "boolean" then return a
+	else return tostring(a) end
+end
+
+local function deserializeArg(a)
+	if type(a) ~= "table" then return a end
+	if a._type == "CFrame" then return CFrame.new(unpack(a.components))
+	elseif a._type == "Vector3" then return Vector3.new(a.x, a.y, a.z)
+	else
+		local out = {}
+		for k, v in pairs(a) do out[k] = deserializeArg(v) end
+		return out
+	end
+end
+
+-- ========== Очередь построек ==========
+
+local placementWorker
+
+local function tryPlaceEntry(e)
+	local place = e.place
+	if not place then return true end
+	local pos = place.Pos and Vector3.new(place.Pos.x, place.Pos.y, place.Pos.z) or nil
+	if pos and findTowerByPos(pos, 1.0) then return true end
+	local price = getSlotPriceForUnit(place.UnitId)
+	local money = Macro.GetMoney()
+	if price and money < price then return false end
+	local cf = place.CFrame and deserializeArg(place.CFrame) or (pos and CFrame.new(pos)) or nil
+	if not cf then return true end
+	fireRemote("TowerAdd", { UnitId = place.UnitId, Name = place.Name, Pos = pos or cf.Position, CFrame = cf })
+	task.wait(0.4)
+	if pos then return findTowerByPos(pos, 1.5) ~= nil end
+	return true
+end
+
+local function startPlacementQueue()
+	placementQueue = {}
+	for _, e in ipairs(Macro.Actions) do
+		if e.type == "TowerAdd" and e.place then
+			table.insert(placementQueue, { entry = e, placed = false, attempts = 0 })
+		end
+	end
+	queueMode = #placementQueue > 0
+	if not queueMode then return end
+	print("[Macro] Queue mode: "..#placementQueue.." towers to place ASAP")
+	if placementWorker then pcall(task.cancel, placementWorker) end
+	placementWorker = track(function()
+		while Macro.Playing and #placementQueue > 0 do
+			local progressed = false
+			for _, item in ipairs(placementQueue) do
+				if not item.placed and Macro.Playing then
+					item.attempts = item.attempts + 1
+					local ok, perr = pcall(tryPlaceEntry, item.entry)
+					if not ok and item.attempts <= 2 then warn("[Macro] place error: "..tostring(perr)) end
+					if ok and (not item.entry.place.Pos or findTowerByPos(Vector3.new(item.entry.place.Pos.x, item.entry.place.Pos.y, item.entry.place.Pos.z), 1.5)) then
+						item.placed = true
+						progressed = true
+						print("[Macro] Queued tower placed: "..tostring(item.entry.place.Name))
+					end
+				end
+			end
+			for i = #placementQueue, 1, -1 do
+				if placementQueue[i].placed then table.remove(placementQueue, i) end
+			end
+			if not progressed then task.wait(0.3) else task.wait(0.1) end
+		end
+		queueMode = false
+		placementQueue = {}
+	end)
+end
+
+local function recordAction(rmName, args)
+	if rmName == "WaveSkip" then
+		if Macro.AutoSkip then return end
+		local last = Macro.Actions[#Macro.Actions]
+		local entryT = os.clock() - Macro.StartTime
+		if last and last.type == "WaveSkip" and (entryT - (last.t or 0)) < 0.1 then return end
+	end
+	local entry = { t = os.clock() - Macro.StartTime, type = rmName, args = {} }
+	if (rmName == "TowerUpgrade" or rmName == "TowerSell" or rmName == "TowerTarget") and args[1] and args[1].Id then
+		for _, t in ipairs(getPlacedTowers()) do
+			if t.Id == args[1].Id and t.Pos then
+				entry.pos = { x = t.Pos.X, y = t.Pos.Y, z = t.Pos.Z }
+				entry.towerName = t.Name
+				entry.levelBefore = t.Level or 1
+				break
+			end
+		end
+	end
+	for i, a in ipairs(args) do entry.args[i] = serializeArg(a) end
+	if rmName == "TowerAdd" and args[1] then
+		local a = args[1]
+		entry.place = {
+			UnitId = a.UnitId, Name = a.Name,
+			Pos = a.Pos and { x = a.Pos.X, y = a.Pos.Y, z = a.Pos.Z } or nil,
+			CFrame = a.CFrame and serializeArg(a.CFrame) or nil,
+		}
+	end
+	table.insert(Macro.Actions, entry)
+	print(string.format("[Macro] REC #%d %s t=%.2fs", #Macro.Actions, rmName, entry.t))
+end
+
+local function autosaveRecording()
+	if not Macro.Recording or #Macro.Actions == 0 then return end
+	local data = {
+		version = 4,
+		partial = true,
+		actions = Macro.Actions,
+		targetLevels = Macro.TargetLevels,
+		meta = Macro.Meta,
+		settings = Macro.Settings,
+		at = os.date("%Y-%m-%d %H:%M:%S"),
+	}
+	pcall(function()
+		writefile(recPath(), HttpService:JSONEncode(data))
+	end)
+end
+
+local function recoverRec()
+	local candidates = {}
+	if Config.lastMacro then table.insert(candidates, Config.lastMacro) end
+	if Macro.CurrentMacroName and Macro.CurrentMacroName ~= Config.lastMacro then
+		table.insert(candidates, Macro.CurrentMacroName)
+	end
+	for _, n in ipairs(candidates) do
+		local p = recPath(n)
+		if isfile(p) then
+			local ok, data = pcall(function()
+				return HttpService:JSONDecode(readfile(p))
+			end)
+			if ok and type(data) == "table" and type(data.actions) == "table" and #data.actions > 0 then
+				Macro.Actions = data.actions
+				Macro.TargetLevels = data.targetLevels or {}
+				if type(data.meta) == "table" then Macro.Meta = data.meta end
+				if type(Macro.Meta.matches) ~= "table" then Macro.Meta.matches = {} end
+				Macro.CurrentMacroName = n
+				Config.lastMacro = n
+				saveConfig()
+				if not next(Macro.TargetLevels) then Macro.BuildTargetLevels() end
+				return n, #data.actions
+			end
+		end
+	end
+	return nil, 0
+end
+
+function Macro.SetSpeed(mult)
+	local res = invokeRemote("ChangeSpeed", mult)
+	print("[Macro] ChangeSpeed -> "..tostring(mult).." (res="..tostring(res)..")")
+	return res ~= nil
+end
+
+function Macro.StartRecording()
+	if Macro.Recording then return end
+	Macro.Actions = {}
+	Macro.TargetLevels = {}
+	Macro.Meta = { matches = {} }
+	if Config.lastMap and not Macro.Meta.map then Macro.Meta.map = Config.lastMap end
+	Macro.StartTime = os.clock()
+	Macro.Recording = true
+	G.CameraTDRecording = true
+	G.CameraTDOnRemote = recordAction
+	if Macro.Settings.VoteMode and Macro.Settings.VoteMode ~= "None" then
+		Macro.VoteMode(Macro.Settings.VoteMode)
+	end
+	if Macro.Settings.AutoSkipBeforeRecord then
+		Macro.SetAutoSkip(true)
+	end
+	print("[Macro] === RECORDING STARTED ===")
+end
+
+function Macro.StopRecording()
+	Macro.Recording = false
+	G.CameraTDRecording = false
+	Macro.BuildTargetLevels()
+	autosaveRecording()
+	print(string.format("[Macro] === RECORDING STOPPED: %d actions (autosaved rec) ===", #Macro.Actions))
+end
+
+-- ========== Воспроизведение ==========
+
+function Macro.Play()
+	if Macro.Playing or #Macro.Actions == 0 then
+		if #Macro.Actions == 0 then warn("[Macro] No actions") end
+		return
+	end
+	Macro.Playing = true
+	Macro.StopFlag = false
+
+	if Macro.Settings.VoteMode and Macro.Settings.VoteMode ~= "None" then
+		Macro.VoteMode(Macro.Settings.VoteMode)
+	end
+
+	if Macro.Settings.AutoSkipBeforeRecord then
+		Macro.SetAutoSkip(true)
+	end
+
+	if Macro.Settings.Speed15 then
+		Macro.SetSpeed(1.5)
+	end
+
+	if Macro.Settings.SmartUpgrade ~= false and next(Macro.TargetLevels) then
+		Macro.SetAutoUpgrade(true)
+	end
+
+	queueMode = false
+	placementQueue = {}
+	if Macro.Settings.PlaceByTimer ~= true then
+		startPlacementQueue()
+	end
+
+	print("[Macro] === PLAYBACK START: "..#Macro.Actions.." actions ===")
+
+	local lastT = 0
+	for i, entry in ipairs(Macro.Actions) do
+		if Macro.StopFlag then break end
+		local delay = (entry.t or 0) - lastT
+		if delay > 0 then task.wait(delay) end
+		lastT = entry.t or 0
+
+		local skipAdd = queueMode and entry.type == "TowerAdd"
+
+		if entry.type ~= "TowerUpgrade" and not skipAdd then
+			local ok, err = pcall(function()
+				if entry.type == "TowerAdd" and entry.place then
+					if entry.place.Pos then
+						local existing = findTowerByPos(Vector3.new(entry.place.Pos.x, entry.place.Pos.y, entry.place.Pos.z), 1.0)
+						if existing then return end
+					end
+					local cf = entry.place.CFrame and deserializeArg(entry.place.CFrame) or nil
+					local pos = entry.place.Pos and Vector3.new(entry.place.Pos.x, entry.place.Pos.y, entry.place.Pos.z) or nil
+					if not cf and pos then cf = CFrame.new(pos) end
+					if cf then
+						fireRemote("TowerAdd", { UnitId = entry.place.UnitId, Name = entry.place.Name, Pos = pos or cf.Position, CFrame = cf })
+					end
+				elseif entry.type == "WaveSkip" then
+					Macro.SkipWave()
+				elseif entry.type == "TowerSell" then
+					if entry.pos then
+						Macro.SellTowerAt(Vector3.new(entry.pos.x, entry.pos.y, entry.pos.z))
+					elseif entry.args and entry.args[1] and entry.args[1].Id then
+						Macro.SellTower(entry.args[1].Id)
+					end
+				elseif entry.type == "TowerTarget" then
+					if entry.args and entry.args[1] then
+						fireRemote("TowerTarget", deserializeArg(entry.args[1]))
+					end
+				elseif entry.type == "TowerRemove" then
+					if entry.args and entry.args[1] and entry.args[1].Id then
+						fireRemote("TowerRemove", entry.args[1].Id)
+					end
+				else
+					local args = {}
+					for j, a in ipairs(entry.args or {}) do args[j] = deserializeArg(a) end
+					fireRemote(entry.type, unpack(args))
+				end
+			end)
+			if not ok then warn("[Macro] Error #"..i..": "..tostring(err)) end
+		end
+	end
+	if queueMode and #placementQueue > 0 and not Macro.StopFlag then
+		print("[Macro] Waiting for placement queue: "..#placementQueue.." left")
+		local deadline = os.clock() + 60
+		while #placementQueue > 0 and not Macro.StopFlag and os.clock() < deadline do
+			task.wait(0.2)
+		end
+	end
+	Macro.Playing = false
+	print("[Macro] === PLAYBACK DONE ===")
+end
+
+-- ========== Конец катки: время/монеты/карта ==========
+
+local MatchState = { t0 = nil, ended = false }
+
+local function getGameUI()
+	local pg = LocalPlayer and LocalPlayer.PlayerGui
+	return pg and pg:FindFirstChild("GameUI")
+end
+
+local function getFinalUI()
+	local gui = getGameUI()
+	return gui and gui:FindFirstChild("FinalUI")
+end
+
+local function parseDurationText(text)
+	if type(text) ~= "string" then return nil end
+	local h, m, s = text:match("(%d+):(%d+):(%d+)")
+	if h then return tonumber(h) * 3600 + tonumber(m) * 60 + tonumber(s) end
+	local mm, ss = text:match("(%d+):(%d+)")
+	if mm then return tonumber(mm) * 60 + tonumber(ss) end
+	return nil
+end
+
+local function parseCoins(final)
+	local content = final:FindFirstChild("Content")
+	local stats = content and content:FindFirstChild("Stats")
+	if not stats then return nil, "" end
+	local rawParts, sum, largest = {}, 0, nil
+	for _, d in ipairs(stats:GetDescendants()) do
+		if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Visible then
+			local t = d.Text or ""
+			if t:find("%d") then
+				rawParts[#rawParts + 1] = d.Name.."="..t
+				local plus = tonumber(t:match("^%+(%d+)"))
+				local plain = tonumber(t:match("(%d+)"))
+				if plus then
+					sum = sum + plus
+				elseif plain and (not largest or plain > largest) then
+					largest = plain
+				end
+			end
+		end
+	end
+	local dump = table.concat(rawParts, " | ")
+	print("[Macro] FinalUI Stats dump: "..dump)
+	local coins = (sum > 0) and sum or largest
+	return coins, dump
+end
+
+local function parseFinalUI()
+	local final = getFinalUI()
+	if not final or not final.Visible then return nil end
+	local content = final:FindFirstChild("Content")
+	if not content then return nil end
+	local function txt(n)
+		local l = content:FindFirstChild(n)
+		return l and l.Text or ""
+	end
+	local timeText = txt("TimeLabel")
+	local mapText = txt("Map")
+	local modeText = txt("Mode")
+	local resultText = txt("Content")
+	local dur = parseDurationText(timeText)
+	if not dur and MatchState.t0 then
+		dur = math.max(1, math.floor(os.clock() - MatchState.t0))
+	end
+	local coins, dump = parseCoins(final)
+	return {
+		dur = dur, coins = coins, time = timeText,
+		map = mapText, mode = modeText, result = resultText, dump = dump,
+	}
+end
+
+local function recordMatchResult()
+	local r = parseFinalUI()
+	if not r then return false end
+	local meta = Macro.Meta
+	meta.matches = meta.matches or {}
+	if r.map and r.map ~= "" and r.map ~= "0" and not meta.mapManual then
+		meta.map = r.map:gsub("^Map:%s*", "")
+	end
+	if r.mode and r.mode ~= "" and not meta.modeManual then meta.mode = r.mode end
+	table.insert(meta.matches, 1, {
+		at = os.date("%Y-%m-%d %H:%M"),
+		dur = r.dur,
+		coins = r.coins,
+		time = r.time,
+		result = r.result,
+	})
+	while #meta.matches > 5 do table.remove(meta.matches) end
+	local totC, totS = 0, 0
+	for _, m in ipairs(meta.matches) do
+		if m.coins and m.dur and m.dur > 0 then
+			totC = totC + m.coins
+			totS = totS + m.dur
+		end
+	end
+	meta.coinsPerHour = totS > 0 and math.floor(totC * 3600 / totS + 0.5) or nil
+	print(string.format("[Macro] Катка: результат=%s время=%s монет=%s карта=%s монет/ч=%s",
+		r.result ~= "" and r.result or "?",
+		r.time ~= "" and r.time or tostring(r.dur).."s",
+		tostring(r.coins or "?"),
+		tostring(meta.map or "?"),
+		tostring(meta.coinsPerHour or "?")))
+	Macro.Save(Macro.CurrentMacroName)
+	if updateMacroInfo then pcall(updateMacroInfo, Macro.CurrentMacroName) end
+	return true
+end
+
+local function leaveMatch()
+	local final = getFinalUI()
+	local content = final and final:FindFirstChild("Content")
+	local btn = content and content:FindFirstChild("Lobby")
+	if btn and btn.Visible then
+		vimClick(btn)
+		print("[Macro] FinalUI Lobby clicked")
+	end
+	task.wait(7)
+	if not inLobby() then
+		print("[Macro] Still in match, firing OnLeave")
+		fireRemote("OnLeave")
+	end
+end
+
+local function playAgainMatch()
+	local final = getFinalUI()
+	local content = final and final:FindFirstChild("Content")
+	local btn = content and content:FindFirstChild("PlayAgain")
+	if btn and btn.Visible then
+		vimClick(btn)
+		print("[Macro] FinalUI PlayAgain clicked")
+		task.wait(8)
+	end
+	if not inLobby() then
+		local f2 = getFinalUI()
+		local c2 = f2 and f2:FindFirstChild("Content")
+		local b2 = c2 and c2:FindFirstChild("Lobby")
+		if b2 and b2.Visible then
+			print("[Macro] PlayAgain не перевёл — fallback: Lobby")
+			leaveMatch()
+		end
+	end
+end
+
+local function onMatchFinished()
+	local farmDone = false
+	if Config.farm and Config.farm.active then
+		Config.farm.done = (Config.farm.done or 0) + 1
+		local done, target = Config.farm.done, Config.farm.target or 5
+		if done >= target then
+			Config.farm.active = false
+			farmDone = true
+			local cph = Macro.Meta.coinsPerHour
+			notify("Фарм завершён", string.format("%d/%d каток%s", done, target,
+				cph and (" | "..cph.." монет/ч") or ""))
+		else
+			notify("Фарм", string.format("Катка %d/%d", done, target))
+		end
+		saveConfig()
+		if updateFarmLabel then pcall(updateFarmLabel) end
+	end
+	task.wait(4)
+	local mode = Macro.Settings.AfterMatch or "PlayAgain"
+	if farmDone or mode == "Lobby" then
+		leaveMatch()
+	elseif mode == "PlayAgain" then
+		playAgainMatch()
+	end
+end
+
+local function matchWatcher()
+	MatchState = { t0 = nil, ended = false }
+	local pg = LocalPlayer and LocalPlayer.PlayerGui
+	local gui = pg and pg:WaitForChild("GameUI", 40)
+	if not gui then
+		print("[Macro] GameUI не найдена — не катка")
+		return
+	end
+	MatchState.t0 = os.clock()
+	print("[Macro] Матч-вотчер активен")
+	while not MatchState.ended do
+		if inLobby() then return end
+		local final = gui:FindFirstChild("FinalUI")
+		if final and final.Visible then
+			MatchState.ended = true
+			local ok, err = pcall(recordMatchResult)
+			if not ok then warn("[Macro] parse error: "..tostring(err)) end
+			pcall(onMatchFinished)
+			return
+		end
+		task.wait(0.5)
+	end
+end
+
+-- ========== Авто-заход в лифт ==========
+
+local ElevatorCtl = {
+	insideName = nil,
+	insideModel = nil,
+	canStart = false,
+	teleporting = false,
+	lastStartTry = 0,
+	startFails = 0,
+	joinRunning = false,
+}
+
+autoJoinWanted = function()
+	return Config.autoJoin == true or (Config.farm and Config.farm.active == true)
+end
+
+local function getElevatorGui()
+	local pg = LocalPlayer and LocalPlayer.PlayerGui
+	return pg and pg:FindFirstChild("ElevatorGui")
+end
+
+local function queueFrameVisible()
+	local g = getElevatorGui()
+	local q = g and g:FindFirstChild("QueueFrame")
+	return q ~= nil and q.Visible == true
+end
+
+local function detectInsideModel()
+	local char = LocalPlayer.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not hrp then return nil end
+	local folder = workspace:FindFirstChild("Elevators")
+	if not folder then return nil end
+	for _, m in ipairs(folder:GetChildren()) do
+		if m:IsA("Model") then
+			local part = m:FindFirstChild("Area") or m:FindFirstChild("Hitbox") or m:FindFirstChildWhichIsA("BasePart")
+			if part and part:IsA("BasePart") then
+				local p = part.CFrame:PointToObjectSpace(hrp.Position)
+				local h = part.Size * 0.5
+				if math.abs(p.X) <= h.X and math.abs(p.Y) <= h.Y and math.abs(p.Z) <= h.Z then
+					return m
+				end
+			end
+		end
+	end
+	return nil
+end
+
+local lastWaitMapLog = 0
+local function normMap(s)
+	if type(s) ~= "string" then return "" end
+	local n = s:lower():gsub("^map:%s*", "")
+	n = n:gsub("[%s_%-]+", "")
+	return n
+end
+local function pickElevator()
+	local want = Macro.Meta and Macro.Meta.map
+	local wantN = normMap(want)
+	local exact, empties = nil, {}
+	local folder = workspace:FindFirstChild("Elevators")
+	if not folder then return nil end
+	for _, m in ipairs(folder:GetChildren()) do
+		if m:IsA("Model") and (m:GetAttribute("Players") or 0) == 0 then
+			local map = m:GetAttribute("Map")
+			if wantN ~= "" and normMap(map) == wantN then
+				exact = m
+			end
+			empties[#empties + 1] = m
+		end
+	end
+	if want and wantN ~= "" then
+		if exact then return exact end
+		if os.clock() - lastWaitMapLog > 5 then
+			lastWaitMapLog = os.clock()
+			print("[Macro] Жду лифт с картой: "..tostring(want))
+		end
+		return nil
+	end
+	if #empties == 0 then return nil end
+	return empties[math.random(#empties)]
+end
+
+local function pivotInto(model)
+	local part = model:FindFirstChild("Hitbox") or model:FindFirstChildWhichIsA("BasePart")
+	local char = LocalPlayer.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not (part and hrp) then return false end
+	hrp.CFrame = part.CFrame
+	return true
+end
+
+startAutoJoin = function()
+	if ElevatorCtl.joinRunning then return end
+	if #Macro.Actions == 0 then
+		print("[Macro] AutoJoin: нет загруженного макроса — сначала Load (или включи фарм)")
+		return
+	end
+	ElevatorCtl.joinRunning = true
+	track(function()
+		print("[Macro] AutoJoin старт")
+		while autoJoinWanted() and inLobby() and not ElevatorCtl.teleporting do
+			local ok, err = pcall(function()
+				if queueFrameVisible() then
+					local model = detectInsideModel() or ElevatorCtl.insideModel
+					if model and model.Parent then
+						local players = model:GetAttribute("Players") or 0
+						if players > 1 then
+							print("[Macro] Лифт занят ("..players.."), выходим")
+							invokeRemote("ElevatorLeave", model.Name)
+							ElevatorCtl.insideModel = nil
+							task.wait(1.2)
+						else
+							if os.clock() - ElevatorCtl.lastStartTry > 1.5 then
+								ElevatorCtl.lastStartTry = os.clock()
+								local res = invokeRemote("ElevatorStart", model.Name)
+								print("[Macro] ElevatorStart("..model.Name..") -> "..tostring(res)
+									.." canStart="..tostring(ElevatorCtl.canStart))
+								if res == false then
+									ElevatorCtl.startFails = ElevatorCtl.startFails + 1
+									if ElevatorCtl.startFails >= 3 then
+										local g = getElevatorGui()
+										local q = g and g:FindFirstChild("QueueFrame")
+										local rb = q and q:FindFirstChild("ReadyButton")
+										if rb and rb.Visible then
+											vimClick(rb)
+											print("[Macro] ReadyButton кликнут")
+										end
+									end
+								else
+									ElevatorCtl.startFails = 0
+								end
+							end
+						end
+					end
+				else
+					ElevatorCtl.insideModel = nil
+					local model = pickElevator()
+					if model then
+						if pivotInto(model) then
+							ElevatorCtl.insideModel = model
+							print("[Macro] Захожу в "..model.Name.." (карта "..tostring(model:GetAttribute("Map"))..")")
+							task.wait(0.9)
+							if not queueFrameVisible() then
+								invokeRemote("ElevatorEnter", model.Name)
+								task.wait(0.6)
+							end
+						end
+					end
+				end
+			end)
+			if not ok then warn("[Macro] join: "..tostring(err)) end
+			task.wait(0.4)
+		end
+		ElevatorCtl.joinRunning = false
+		print("[Macro] AutoJoin остановлен")
+	end)
+end
+
+local function connectElevatorEvents()
+	pcall(function()
+		NetworkFolder:WaitForChild("ElevatorTeleporting", 10).OnClientEvent:Connect(function()
+			ElevatorCtl.teleporting = true
+			local model = ElevatorCtl.insideModel or detectInsideModel()
+			if model and model.Parent then
+				Config.lastMap = model:GetAttribute("Map")
+			end
+			saveConfig()
+			armTeleportQueue()
+			notify("Телепорт в катку", "Карта: "..tostring(Config.lastMap or "?"))
+		end)
+	end)
+	pcall(function()
+		NetworkFolder:WaitForChild("ElevatorEntered", 10).OnClientEvent:Connect(function(name, canStart)
+			ElevatorCtl.insideName = name
+			local folder = workspace:FindFirstChild("Elevators")
+			ElevatorCtl.insideModel = folder and folder:FindFirstChild(name)
+			ElevatorCtl.canStart = canStart == true
+		end)
+	end)
+	pcall(function()
+		NetworkFolder:WaitForChild("ElevatorLeft", 10).OnClientEvent:Connect(function()
+			ElevatorCtl.insideName = nil
+			ElevatorCtl.insideModel = nil
+			ElevatorCtl.canStart = false
+		end)
+	end)
+end
+
+-- ========== Obsidian (mspaint) UI ==========
+
+local Library
+local Window
+local Toggles, Options
+local MainTab
+local macroDropdownRef
+local infoLabelRef
+local farmLabelRef
+local macroMapRef
+local macroModeRef
+local settingMetaUI = false
+
+local function refreshMacroList()
+	local names = Macro.ListMacros()
+	if #names == 0 then names = { "default" } end
+	return names
+end
+
+notify = function(title, desc)
+	if not Library then
+		print("[Macro] "..tostring(title).." — "..tostring(desc))
+		return
+	end
+	pcall(function()
+		Library:Notify({ Title = title, Description = desc, Time = 3 })
+	end)
+end
+
+updateFarmLabel = function()
+	if not farmLabelRef then return end
+	local f = Config.farm or {}
+	pcall(function()
+		if f.active then
+			farmLabelRef:SetText(string.format("Фарм: %d/%d каток", f.done or 0, f.target or 5))
+		else
+			farmLabelRef:SetText("Фарм выключен")
+		end
+	end)
+end
+
+updateMacroInfo = function(name)
+	if not infoLabelRef then return end
+	name = name or Macro.CurrentMacroName
+	local path = MACRO_DIR..tostring(name)..".json"
+	if not isfile(path) then
+		pcall(function() infoLabelRef:SetText("Макрос '"..tostring(name).."' не найден") end)
+		return
+	end
+	local ok, data = pcall(function()
+		return HttpService:JSONDecode(readfile(path))
+	end)
+	if not ok or type(data) ~= "table" then return end
+	local meta = type(data.meta) == "table" and data.meta or {}
+	local units = meta.units or collectUnits(data.actions or {})
+	local lines = {}
+	lines[#lines + 1] = "Карта: "..tostring(meta.map or "неизвестна")
+	lines[#lines + 1] = "Юниты: "..(#units > 0 and table.concat(units, ", ") or "—")
+	lines[#lines + 1] = "Действий: "..#(data.actions or {})
+	local ms = meta.matches
+	if type(ms) == "table" and #ms > 0 then
+		local s = string.format("Каток: %d", #ms)
+		if meta.coinsPerHour then s = s.." | Монет/ч: "..meta.coinsPerHour end
+		lines[#lines + 1] = s
+		local last = ms[1]
+		lines[#lines + 1] = string.format("Последняя катка: %s | %s | %s монет",
+			tostring(last.time or (last.dur and last.dur.."s") or "?"),
+			tostring(last.result or "?"),
+			tostring(last.coins or "?"))
+	end
+	if data.savedAt then lines[#lines + 1] = "Сохранён: "..data.savedAt end
+	settingMetaUI = true
+	pcall(function() if macroMapRef then macroMapRef:SetValue(tostring(meta.map or "")) end end)
+	pcall(function() if macroModeRef then macroModeRef:SetValue(tostring(meta.mode or "")) end end)
+	settingMetaUI = false
+	pcall(function() infoLabelRef:SetText(table.concat(lines, "\n")) end)
+end
+
+applyConfigToUI = function()
+	pcall(function()
+		if Toggles then
+			if Toggles.SmartUpgrade then
+				Toggles.SmartUpgrade:SetValue(Macro.Settings.SmartUpgrade ~= false)
+			end
+			if Toggles.AutoSkipBefore then
+				Toggles.AutoSkipBefore:SetValue(Macro.Settings.AutoSkipBeforeRecord == true)
+			end
+			if Toggles.PlaceByTimer then
+				Toggles.PlaceByTimer:SetValue(Macro.Settings.PlaceByTimer == true)
+			end
+			if Toggles.AutoJoinToggle then
+				Toggles.AutoJoinToggle:SetValue(Config.autoJoin == true)
+			end
+			if Toggles.AutoloadToggle then
+				Toggles.AutoloadToggle:SetValue(Config.autoload == true)
+			end
+			if Toggles.AntiAfkToggle then
+				Toggles.AntiAfkToggle:SetValue(Macro.Settings.AntiAfk ~= false)
+			end
+			if Toggles.Speed15Toggle then
+				Toggles.Speed15Toggle:SetValue(Macro.Settings.Speed15 == true)
+			end
+			if Toggles.MenuToggle then
+				Toggles.MenuToggle:SetValue(Macro.Settings.MenuVisible ~= false)
+			end
+		end
+		if Options and Options.VoteMode and Macro.Settings.VoteMode then
+			Options.VoteMode:SetValue(Macro.Settings.VoteMode)
+		end
+		if Options and Options.AfterMatch and Macro.Settings.AfterMatch then
+			Options.AfterMatch:SetValue(Macro.Settings.AfterMatch)
+		end
+	end)
+	updateFarmLabel()
+end
+
+	-- ========== Макросы: автозагрузка и persist meta ==========
+	local function ensureLoaded()
+		if #Macro.Actions > 0 then return true end
+		local n = Macro.CurrentMacroName
+		if n and isfile(MACRO_DIR..n..".json") then
+			local ok = Macro.Load(n)
+			if ok then notify("Loaded", n.." ("..#Macro.Actions.." actions)") end
+			return ok
+		end
+		return false
+	end
+
+	local function persistMetaFields()
+		if Macro.Recording then return end
+		local n = Macro.CurrentMacroName
+		local path = MACRO_DIR..tostring(n)..".json"
+		if not isfile(path) then return end
+		pcall(function()
+			local data = HttpService:JSONDecode(readfile(path))
+			if type(data) ~= "table" then return end
+			data.meta = type(data.meta) == "table" and data.meta or {}
+			data.meta.map = Macro.Meta.map
+			data.meta.mapManual = Macro.Meta.mapManual
+			data.meta.mode = Macro.Meta.mode
+			data.meta.modeManual = Macro.Meta.modeManual
+			writefile(path, HttpService:JSONEncode(data))
+		end)
+		if updateMacroInfo then pcall(updateMacroInfo, n) end
+	end
+
+local function makeUI()
+	pcall(function()
+		local prev = getgenv().MacroObsidianLib
+		if prev and prev.Unload then prev:Unload() end
+	end)
+	pcall(function()
+		local getHui = getgenv().get_hui
+		if typeof(getHui) == "function" then
+			local hui = getHui()
+			if hui then
+				for _, c in ipairs(hui:GetChildren()) do
+					if c.Name == "WindUI" then
+						c:Destroy()
+					end
+				end
+			end
+		end
+	end)
+
+	local ok, result = pcall(function()
+		local path = MACRO_DIR.."Obsidian.lua"
+		if not isfile(path) then
+			local url = "https://raw.githubusercontent.com/deividcomsono/Obsidian/refs/heads/main/Library.lua"
+			local src
+			if typeof(HttpGet) == "function" then
+				src = HttpGet(url)
+			elseif typeof(game.HttpGet) == "function" then
+				src = game:HttpGet(url)
+			elseif typeof(request) == "function" then
+				src = request({ Url = url, Method = "GET" }).Body
+			else
+				error("no http available")
+			end
+			if not src or #src < 1000 then error("download failed") end
+			writefile(path, src)
+		end
+		return loadfile(path)()
+	end)
+	if not ok or not result then
+		warn("[Macro] Obsidian load failed: "..tostring(result))
+		return
+	end
+	Library = result
+	getgenv().MacroObsidianLib = Library
+	Toggles = Library.Toggles
+	Options = Library.Options
+
+	Window = Library:CreateWindow({
+		Title = "CameraTD Macro",
+		Footer = "JustRat",
+		Center = true,
+		AutoShow = true,
+	})
+
+	-- ===== Вкладка MACRO =====
+	MainTab = Window:AddTab("Macro", "zap")
+
+	local SettingsBox = MainTab:AddGroupbox({ Side = "Left", Name = "Настройки до записи", IconName = "settings" })
+
+	SettingsBox:AddDropdown("VoteMode", {
+		Text = "Голосование за мод",
+		Tooltip = "Голосует автоматически при старте записи/воспроизведения",
+		Values = { "None", "Easy", "Normal", "Hard", "Insane" },
+		Default = Macro.Settings.VoteMode or "Normal",
+		Callback = function(v)
+			Macro.Settings.VoteMode = v
+			saveConfig()
+			print("[Macro] VoteMode = "..tostring(v))
+		end,
+	})
+
+	SettingsBox:AddToggle("SmartUpgrade", {
+		Text = "Smart Auto-Upgrade",
+		Tooltip = "Качает башни по уровням из записи. Включается при Play (если не выключен здесь).",
+		Default = Macro.Settings.SmartUpgrade ~= false,
+		Callback = function(v)
+			Macro.Settings.SmartUpgrade = v
+			saveConfig()
+			Macro.SetAutoUpgrade(v)
+		end,
+	})
+
+	SettingsBox:AddToggle("AutoSkipBefore", {
+		Text = "Auto-Skip волн (по remote)",
+		Tooltip = "Шлёт WaveSkip каждые 0.12с — сервер сам решает, когда можно скипнуть",
+		Default = Macro.Settings.AutoSkipBeforeRecord == true,
+		Callback = function(v)
+			Macro.Settings.AutoSkipBeforeRecord = v
+			saveConfig()
+			Macro.SetAutoSkip(v)
+		end,
+	})
+
+	SettingsBox:AddToggle("PlaceByTimer", {
+		Text = "Ставить башни по таймеру",
+		Tooltip = "ВКЛ: по времени из записи. ВЫКЛ (по умолч.): ставит сразу, как хватает денег, автоапгрейд копит на постройки",
+		Default = Macro.Settings.PlaceByTimer == true,
+		Callback = function(v)
+			Macro.Settings.PlaceByTimer = v
+			saveConfig()
+			print("[Macro] PlaceByTimer = "..tostring(v))
+		end,
+	})
+
+	-- Секция: Запись
+	local RecordBox = MainTab:AddGroupbox({ Side = "Right", Name = "Запись", IconName = "circle" })
+
+	RecordBox:AddButton({
+		Text = "● Начать / Остановить запись",
+		Tooltip = "F6 — горячая клавиша. Запись автосейвится каждые 15с",
+		Func = function()
+			if Macro.Recording then
+				Macro.StopRecording()
+				notify("Recording stopped", #Macro.Actions.." actions (rec сохранён)")
+			else
+				Macro.StartRecording()
+				notify("Recording started", "Действия записываются...")
+			end
+		end,
+	})
+
+	RecordBox:AddButton({
+		Text = "▶ Воспроизвести",
+		Tooltip = "F7 — запуск макро (auto-upgrade + голосование включатся сами)",
+		Func = function()
+			if not ensureLoaded() then
+				notify("Error", "Нет действий — выбери макрос в списке")
+				return
+			end
+			track(function() Macro.Play() end)
+		end,
+	})
+
+	RecordBox:AddButton({
+		Text = "■ Остановить воспроизведение",
+		Tooltip = "F8",
+		Func = function() Macro.Stop() end,
+	})
+
+	-- Секция: Авто-вход и фарм
+	local FarmBox = MainTab:AddGroupbox({ Side = "Right", Name = "Авто-вход и фарм", IconName = "log-in" })
+
+	FarmBox:AddToggle("AutoJoinToggle", {
+		Text = "Авто-заход в лифт",
+		Tooltip = "В лобби сам заходит в пустой лифт (с картой макроса) и жмёт Start. Если внутри кто-то есть — выходит и ищет другой",
+		Default = Config.autoJoin == true,
+		Callback = function(v)
+			Config.autoJoin = v
+			saveConfig()
+			if v and inLobby() then startAutoJoin() end
+		end,
+	})
+
+	FarmBox:AddToggle("AutoloadToggle", {
+		Text = "Продолжать после перезахода",
+		Tooltip = "После телепорта скрипт сам перезапускается и продолжает макросить (в катке — Play, в лобби — лифт)",
+		Default = Config.autoload == true,
+		Callback = function(v)
+			Config.autoload = v
+			saveConfig()
+		end,
+	})
+
+	farmLabelRef = FarmBox:AddLabel("Фарм выключен", true)
+
+	FarmBox:AddButton({
+		Text = "🌾 Фарм 5 каток (монет/ч)",
+		Tooltip = "Играет макросом катку за каткой: катка → результат → лобби → лифт → катка... Считает монет/ч по 5 каткам",
+		Func = function()
+			Config.farm = { active = true, target = Config.farm and Config.farm.target or 5, done = 0 }
+			saveConfig()
+			updateFarmLabel()
+			notify("Фарм запущен", "0/"..Config.farm.target.." каток")
+			if inLobby() then startAutoJoin() end
+		end,
+	})
+
+	FarmBox:AddButton({
+		Text = "■ Стоп фарм",
+		Func = function()
+			Config.farm = { active = false, target = Config.farm and Config.farm.target or 5, done = 0 }
+			saveConfig()
+			updateFarmLabel()
+			notify("Фарм остановлен", "")
+		end,
+	})
+
+	-- Секция: Макросы
+	local MacrosBox = MainTab:AddGroupbox({ Side = "Left", Name = "Макросы", IconName = "folder" })
+
+	macroDropdownRef = MacrosBox:AddDropdown("MacroSelect", {
+		Text = "Выбрать макрос",
+		Tooltip = "Список сохранённых макросов",
+		Values = refreshMacroList(),
+		Default = Macro.CurrentMacroName,
+		Callback = function(v)
+			local prev = Macro.CurrentMacroName
+			Macro.CurrentMacroName = v
+			Config.lastMacro = v
+			saveConfig()
+			if not Macro.Recording and type(v) == "string" and v ~= "" and (prev ~= v or #Macro.Actions == 0) then
+				pcall(function() Macro.Load(v) end)
+			end
+			updateMacroInfo(v)
+			print("[Macro] Selected: "..tostring(v))
+		end,
+	})
+
+	infoLabelRef = MacrosBox:AddLabel("—", true)
+
+	macroMapRef = MacrosBox:AddInput("MetaMap", {
+		Text = "Карта макроса (Enter — сохранить)",
+		Placeholder = "Toilet City / Cameraman HQ / Desert",
+		AllowEmpty = true,
+		Finished = true,
+		Callback = function(v)
+			if settingMetaUI then return end
+			v = (type(v) == "string" and v ~= "") and v or nil
+			Macro.Meta.map = v
+			Macro.Meta.mapManual = v ~= nil
+			persistMetaFields()
+			notify("Карта макроса", v and ("Задана: "..v) or "Авто (по катке)")
+		end,
+	})
+
+	macroModeRef = MacrosBox:AddInput("MetaMode", {
+		Text = "Режим макроса (Enter — сохранить)",
+		Placeholder = "например: 2x Coins Event",
+		AllowEmpty = true,
+		Finished = true,
+		Callback = function(v)
+			if settingMetaUI then return end
+			v = (type(v) == "string" and v ~= "") and v or nil
+			Macro.Meta.mode = v
+			Macro.Meta.modeManual = v ~= nil
+			persistMetaFields()
+			notify("Режим макроса", v and ("Задан: "..v) or "Авто (по катке)")
+		end,
+	})
+
+	MacrosBox:AddInput("MacroName", {
+		Text = "Имя нового макроса",
+		Placeholder = "Введите имя...",
+		Callback = function(v)
+			if v and v ~= "" then
+				Macro.CurrentMacroName = v
+			end
+		end,
+	})
+
+	MacrosBox:AddButton({
+		Text = "💾 Сохранить текущий",
+		Tooltip = "F9 — сохранить под именем из поля выше",
+		Func = function()
+			Macro.Save(Macro.CurrentMacroName)
+			if macroDropdownRef then
+				macroDropdownRef:SetValues(refreshMacroList())
+			end
+			notify("Saved", Macro.CurrentMacroName.." ("..#Macro.Actions.." actions)")
+		end,
+	})
+
+	MacrosBox:AddButton({
+		Text = "📂 Загрузить выбранный",
+		Tooltip = "F10 — загрузить выбранный макрос",
+		Func = function()
+			if Macro.Load(Macro.CurrentMacroName) then
+				notify("Loaded", Macro.CurrentMacroName.." ("..#Macro.Actions.." actions)")
+			else
+				notify("Error", "Макрос не найден")
+			end
+		end,
+	})
+
+	MacrosBox:AddButton({
+		Text = "🗑 Удалить выбранный",
+		Tooltip = "Удалить выбранный макрос",
+		Func = function()
+			if Macro.DeleteMacro(Macro.CurrentMacroName) then
+				Macro.CurrentMacroName = "default"
+				if macroDropdownRef then
+					macroDropdownRef:SetValues(refreshMacroList())
+				end
+				updateMacroInfo()
+				notify("Deleted", "Макрос удалён")
+			end
+		end,
+	})
+
+	-- ===== Вкладка AUTOMATION =====
+	local AutoTab = Window:AddTab("Automation", "settings")
+
+	local QuickBox = AutoTab:AddGroupbox({ Side = "Left", Name = "Быстрые действия", IconName = "dollar-sign" })
+
+	QuickBox:AddButton({
+		Text = "⬆ Upgrade All (max)",
+		Func = function() track(function() Macro.UpgradeAllOwned() end) end,
+	})
+
+	QuickBox:AddButton({
+		Text = "💰 Sell All",
+		Func = function() track(function() Macro.SellAllOwned() end) end,
+	})
+
+	-- ===== Вкладка OPTIONS =====
+	local OptTab = Window:AddTab("Options", "settings")
+
+	local AntiBox = OptTab:AddGroupbox({ Side = "Left", Name = "Anti-AFK и перезаход", IconName = "settings" })
+
+	AntiBox:AddToggle("AntiAfkToggle", {
+		Text = "Anti-AFK",
+		Tooltip = "Каждые 2 минуты — микро-движение мыши (VIM), по событию Idled — VirtualUser. Не кикает за AFK",
+		Default = Macro.Settings.AntiAfk ~= false,
+		Callback = function(v)
+			Macro.Settings.AntiAfk = v
+			saveConfig()
+			print("[Macro] AntiAfk = "..tostring(v))
+		end,
+	})
+
+	AntiBox:AddDropdown("AfterMatch", {
+		Text = "После конца катки",
+		Tooltip = "PlayAgain — сразу новая катка (не вышло — в лобби). Lobby — в лобби. Off — стоять на финальном экране",
+		Values = { "PlayAgain", "Lobby", "Off" },
+		Default = Macro.Settings.AfterMatch or "PlayAgain",
+		Callback = function(v)
+			Macro.Settings.AfterMatch = v
+			saveConfig()
+			print("[Macro] AfterMatch = "..tostring(v))
+		end,
+	})
+
+	AntiBox:AddToggle("Speed15Toggle", {
+		Text = "Скорость 1.5x",
+		Tooltip = "Встроенная скорость игры (RemoteFunction ChangeSpeed). Ставится при Play; в лобби не применяется",
+		Default = Macro.Settings.Speed15 == true,
+		Callback = function(v)
+			Macro.Settings.Speed15 = v
+			saveConfig()
+			if not inLobby() then
+				Macro.SetSpeed(v and 1.5 or 1)
+			end
+		end,
+	})
+
+	local MenuBox = OptTab:AddGroupbox({ Side = "Right", Name = "Меню", IconName = "settings" })
+
+	MenuBox:AddToggle("MenuToggle", {
+		Text = "Показывать меню",
+		Tooltip = "F1 — показать/скрыть окно меню в любой момент",
+		Default = Macro.Settings.MenuVisible ~= false,
+		Callback = function(v)
+			Macro.Settings.MenuVisible = v
+			saveConfig()
+			if Window and Window.Toggle then
+				Window:Toggle(v)
+			end
+		end,
+	})
+	MenuBox:AddLabel("F1 = показать/скрыть меню", true)
+
+	-- ===== Вкладка INFO =====
+	local InfoTab = Window:AddTab("Info", "info")
+	local InfoBox = InfoTab:AddGroupbox({ Side = "Left", Name = "Горячие клавиши" })
+
+	InfoBox:AddLabel("F1=Меню | F6=Rec | F7=Play | F8=Stop | F9=Save | F10=Load", true)
+	InfoBox:AddLabel("Auto-execute: скрипт сам перезапускается после телепорта (queue_on_teleport + autoexec/MacroSystem.lua). Авто-конфиг: настройки, последний макрос и прогресс фарма хранятся в CameraTD_Macros/config.json.", true)
+	InfoBox:AddLabel("Smart Auto-Upgrade качает башни по уровням из записи (не до фула). Auto-Skip шлёт WaveSkip по remote. Фарм 5 каток считает монет/ч по итогам каток (время берётся из финального экрана).", true)
+
+	return Window
+end
+
+-- ========== Anti-AFK ==========
+
+local function initAntiAfk()
+	if G.CameraTDAntiAfk then return end
+	G.CameraTDAntiAfk = true
+	if LocalPlayer then
+		pcall(function()
+			LocalPlayer.Idled:Connect(function()
+				if Macro.Settings.AntiAfk == false then return end
+				pcall(function()
+					local VirtualUser = game:GetService("VirtualUser")
+					VirtualUser:CaptureController()
+					VirtualUser:ClickButton2(Vector2.new(0, 0))
+				end)
+				print("[Macro] Anti-AFK: простой сброшен (Idled)")
+			end)
+		end)
+	end
+	track(function()
+		while true do
+			task.wait(120)
+			if Macro.Settings.AntiAfk ~= false then
+				pcall(function()
+					local loc = UserInputService:GetMouseLocation()
+					VirtualInputManager:SendMouseMoveEvent(loc.X + 2, loc.Y + 2)
+					VirtualInputManager:SendMouseMoveEvent(loc.X, loc.Y)
+				end)
+			end
+		end
+	end)
+	print("[Macro] Anti-AFK активен (проверка каждые 120с)")
+end
+
+-- ========== Hotkeys ==========
+
+UserInputService.InputBegan:Connect(function(input, gp)
+	if gp then return end
+	if input.KeyCode == Enum.KeyCode.F1 then
+		if Window and Window.Toggle then
+			Window:Toggle()
+			if Toggles and Toggles.MenuToggle then
+				Toggles.MenuToggle:SetValue(Library.Toggled)
+			end
+		end
+	elseif input.KeyCode == Enum.KeyCode.F6 then
+		if Macro.Recording then Macro.StopRecording() else Macro.StartRecording() end
+	elseif input.KeyCode == Enum.KeyCode.F7 then
+		if ensureLoaded() then
+			track(function() Macro.Play() end)
+		else
+			notify("Error", "Нет действий — загрузи макрос (F10)")
+		end
+	elseif input.KeyCode == Enum.KeyCode.F8 then
+		Macro.Stop()
+	elseif input.KeyCode == Enum.KeyCode.F9 then
+		Macro.Save(Macro.CurrentMacroName)
+		if macroDropdownRef then macroDropdownRef:SetValues(refreshMacroList()) end
+	elseif input.KeyCode == Enum.KeyCode.F10 then
+		Macro.Load(Macro.CurrentMacroName)
+	end
+end)
+
+-- ========== Boot ==========
+
+local recName, recCount = recoverRec()
+
+makeUI()
+
+if recName then
+	notify("Восстановлено", recName..": "..recCount.." действий (незавершённая запись)")
+	if macroDropdownRef then macroDropdownRef:SetValues(refreshMacroList()) end
+	updateMacroInfo(recName)
+elseif (Config.autoload or (Config.farm and Config.farm.active)) and Config.lastMacro then
+	if Macro.Load(Config.lastMacro) then
+		notify("Autoload", "Макрос: "..Config.lastMacro.." ("..#Macro.Actions.." действий)")
+	end
+else
+	updateMacroInfo(Macro.CurrentMacroName)
+end
+
+applyConfigToUI()
+
+if Config.settings.MenuVisible == false then
+	task.delay(1.5, function()
+		pcall(function()
+			if Library and Library.Toggled then
+				Window:Toggle(false)
+			end
+		end)
+	end)
+end
+
+if not ConfigRead then
+	task.delay(3, function()
+		loadConfig()
+		if not ConfigRead then return end
+		Macro.Settings = Config.settings
+		applyConfigToUI()
+		if not next(Macro.Actions) and (Config.autoload or (Config.farm and Config.farm.active)) and Config.lastMacro then
+			pcall(function() Macro.Load(Config.lastMacro) end)
+		end
+		updateMacroInfo(Macro.CurrentMacroName)
+		updateFarmLabel()
+		print("[Macro] Конфиг подгружен с повтора: autoJoin="..tostring(Config.autoJoin).." lastMacro="..tostring(Config.lastMacro))
+	end)
+end
+
+armTeleportQueue()
+pcall(function()
+	writefile("autoexec/MacroSystem.lua", LOADER_SRC)
+end)
+
+track(function()
+	while true do
+		if Macro.Recording then pcall(autosaveRecording) end
+		task.wait(15)
+	end
+end)
+
+initAntiAfk()
+
+if inLobby() then
+	connectElevatorEvents()
+	if autoJoinWanted() then startAutoJoin() end
+else
+	track(matchWatcher)
+	if (Config.autoload or (Config.farm and Config.farm.active)) and #Macro.Actions > 0 then
+		track(function()
+			local pg = LocalPlayer and LocalPlayer.PlayerGui
+			local gui = pg and pg:WaitForChild("GameUI", 40)
+			if not gui then return end
+			task.wait(2.5)
+			local final = gui:FindFirstChild("FinalUI")
+			if final and final.Visible then return end
+			if Macro.Recording or Macro.Playing then return end
+			notify("Autoload", "Продолжаю макрос: "..tostring(Macro.CurrentMacroName))
+			Macro.Play()
+		end)
+	end
+end
+
+print("[Macro] System v4 loaded! place="..game.PlaceId.." autoload="..tostring(Config.autoload).." autoJoin="..tostring(Config.autoJoin))
+print("[Macro] F1=Menu F6=Rec F7=Play F8=Stop F9=Save F10=Load")
+getgenv().CameraTDMacro = Macro
