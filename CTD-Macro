@@ -5,6 +5,16 @@
 local __bootG = getgenv()
 local __bootNow = tick()
 if __bootG.CameraTDLastBoot and (__bootNow - __bootG.CameraTDLastBoot) < 3 then return end
+local __bootSkip
+pcall(function()
+	local LOCK = "CameraTD_Macros/.bootstamp"
+	if isfile(LOCK) then
+		local last = tonumber(readfile(LOCK))
+		if last and (__bootNow - last) < 3 then __bootSkip = true end
+	end
+	if not __bootSkip then writefile(LOCK, tostring(__bootNow)) end
+end)
+if __bootSkip then return end
 __bootG.CameraTDLastBoot = __bootNow
 
 local Players = game:GetService("Players")
@@ -46,6 +56,84 @@ local function getReplicationModule()
 		end
 	end
 	return _replication or nil
+end
+
+local _towerConfig
+local function getTowerConfig()
+	if _towerConfig == nil then
+		local mod = RS.ModuleLoader.Configs and RS.ModuleLoader.Configs:FindFirstChild("Config")
+		if mod then
+			local ok, res = pcall(require, mod)
+			_towerConfig = (ok and type(res) == "table" and type(res.Towers) == "table") and res.Towers or false
+		else
+			_towerConfig = false
+		end
+	end
+	return _towerConfig or nil
+end
+local function getUpgradePrice(unitName, currentLevel)
+	local towers = getTowerConfig()
+	if not towers or not unitName then return nil end
+	local def = towers[unitName]
+	if not def or type(def.Upgrades) ~= "table" then return nil end
+	local up = def.Upgrades[currentLevel or 1]
+	return (up and up.Price) or nil
+end
+
+local Config
+local _areaBounds, _areaRef
+local function getAreaBounds()
+	local area = workspace:FindFirstChild("Game") and workspace.Game:FindFirstChild("TowerArea")
+	if not area then
+		_areaBounds, _areaRef = nil, nil
+		return nil
+	end
+	if _areaRef ~= area or _areaBounds == nil then
+		_areaRef = area
+		_areaBounds = false
+		local minP, maxP
+		for _, p in ipairs(area:GetDescendants()) do
+			if p:IsA("BasePart") then
+				local cf, s = p.CFrame, p.Size
+				for _, dx in ipairs({ -s.X / 2, s.X / 2 }) do
+					for _, dy in ipairs({ -s.Y / 2, s.Y / 2 }) do
+						for _, dz in ipairs({ -s.Z / 2, s.Z / 2 }) do
+							local c = (cf * CFrame.new(dx, dy, dz)).Position
+							if not minP then
+								minP, maxP = c, c
+							else
+								minP = Vector3.new(math.min(minP.X, c.X), math.min(minP.Y, c.Y), math.min(minP.Z, c.Z))
+								maxP = Vector3.new(math.max(maxP.X, c.X), math.max(maxP.Y, c.Y), math.max(maxP.Z, c.Z))
+							end
+						end
+					end
+				end
+			end
+		end
+		if minP then _areaBounds = { min = minP, max = maxP } end
+	end
+	return _areaBounds or nil
+end
+local function posInArea(pos, margin)
+	local b = getAreaBounds()
+	if not b then return true end
+	margin = margin or 20
+	return pos.X >= b.min.X - margin and pos.X <= b.max.X + margin
+		and pos.Z >= b.min.Z - margin and pos.Z <= b.max.Z + margin
+		and pos.Y >= b.min.Y - margin and pos.Y <= b.max.Y + margin
+end
+local function applyOffset(p)
+	if not p or typeof(p) ~= "Vector3" then return p end
+	if posInArea(p) then return p end
+	local o = Config and Config.posOffset
+	if o then
+		local dx, dy, dz = o.x or 0, o.y or 0, o.z or 0
+		if dx ~= 0 or dy ~= 0 or dz ~= 0 then
+			local shifted = p + Vector3.new(dx, dy, dz)
+			if posInArea(shifted) then return shifted end
+		end
+	end
+	return p
 end
 
 local MACRO_DIR = "CameraTD_Macros/"
@@ -104,7 +192,6 @@ end
 
 -- ========== Конфиг ==========
 
-local Config
 local function mergeConfig(decoded)
 	local c = {
 		version = 4,
@@ -112,8 +199,9 @@ local function mergeConfig(decoded)
 		autoJoin = false,
 		lastMacro = nil,
 		lastMap = nil,
+		posOffset = { x = 0, y = 0, z = 0 },
 		farm = { active = false, target = 5, done = 0 },
-		settings = { VoteMode = "Normal", AutoSkipBeforeRecord = false, PlaceByTimer = false, SmartUpgrade = true, AntiAfk = true, AfterMatch = "PlayAgain", Speed15 = false, MenuVisible = true },
+		settings = { VoteMode = "Normal", AutoSkipBeforeRecord = false, PlaceByTimer = false, SmartUpgrade = true, AntiAfk = true, AfterMatch = "PlayAgain", Speed15 = false, MenuVisible = true, AutoReconnect = true },
 	}
 	if type(decoded) == "table" then
 		for k, v in pairs(decoded) do
@@ -121,6 +209,8 @@ local function mergeConfig(decoded)
 				for sk, sv in pairs(v) do c.settings[sk] = sv end
 			elseif k == "farm" and type(v) == "table" then
 				for sk, sv in pairs(v) do c.farm[sk] = sv end
+			elseif k == "posOffset" and type(v) == "table" then
+				for sk, sv in pairs(v) do c.posOffset[sk] = sv end
 			else
 				c[k] = v
 			end
@@ -354,7 +444,7 @@ function Macro.BuildTargetLevels()
 	local order = {}
 	for _, a in ipairs(Macro.Actions) do
 		if a.type == "TowerUpgrade" and a.pos then
-			local key = makePosKey(Vector3.new(a.pos.x, a.pos.y, a.pos.z))
+			local key = makePosKey(applyOffset(Vector3.new(a.pos.x, a.pos.y, a.pos.z)))
 			local targetLevel = (a.levelBefore or 1) + 1
 			if not targets[key] then
 				targets[key] = targetLevel
@@ -382,9 +472,14 @@ function Macro.SetAutoUpgrade(enabled)
 						if not target then return false end
 						for _, t in ipairs(getPlacedTowers()) do
 							if t.OwnerUserId == LocalPlayer.UserId and t.Pos and makePosKey(t.Pos) == key then
-								if (t.Level or 1) < target then
+								local level = t.Level or 1
+								if level < target then
+									local price = getUpgradePrice(t.Name, level)
+									if price and Macro.GetMoney() < price then
+										return "wait"
+									end
 									fireRemote("TowerUpgrade", { Id = t.Id })
-									task.wait(0.15)
+									task.wait(0.8)
 									return true
 								end
 								return false
@@ -396,15 +491,21 @@ function Macro.SetAutoUpgrade(enabled)
 					if order and #order > 0 then
 						for _, key in ipairs(order) do
 							if not Macro.AutoUpgrade then return end
-							if tryKey(key) then break end
+							local r = tryKey(key)
+							if r == "wait" or r then break end
 						end
 					else
 						for _, t in ipairs(getPlacedTowers()) do
 							if t.OwnerUserId == LocalPlayer.UserId and t.Pos then
+								local level = t.Level or 1
 								local target = Macro.TargetLevels[makePosKey(t.Pos)]
-								if target and (t.Level or 1) < target then
+								if target and level < target then
+									local price = getUpgradePrice(t.Name, level)
+									if price and Macro.GetMoney() < price then
+										break
+									end
 									fireRemote("TowerUpgrade", { Id = t.Id })
-									task.wait(0.15)
+									task.wait(0.8)
 								end
 							end
 						end
@@ -431,6 +532,79 @@ function Macro.SetAutoSkip(enabled)
 		end)
 	end
 	print("[Macro] AutoSkip = "..tostring(Macro.AutoSkip))
+end
+
+-- ========== Auto-Reconnect при дисконнекте ==========
+
+local function findDisconnectPrompt()
+	local promptGui = game:GetService("CoreGui"):FindFirstChild("RobloxPromptGui")
+	local overlay = promptGui and promptGui:FindFirstChild("promptOverlay")
+	if not overlay then return nil end
+	local ep = overlay:FindFirstChild("ErrorPrompt")
+	if ep and ep.Visible then return ep end
+	for _, ch in ipairs(overlay:GetChildren()) do
+		if ch:IsA("GuiObject") and ch.Visible and ch.Name:lower():find("error") then
+			return ch
+		end
+	end
+	return nil
+end
+
+local function clickDisconnectButton(prompt)
+	local best
+	for _, d in ipairs(prompt:GetDescendants()) do
+		if (d:IsA("TextButton") or d:IsA("ImageButton")) and d.Visible then
+			local n = d.Name:lower()
+			local t = (d:IsA("TextButton") and d.Text or ""):lower()
+			if n:find("reconnect") or t:find("reconnect") or t:find("retry") or t:find("try again") then
+				best = d
+				break
+			end
+		end
+	end
+	if not best then
+		for _, d in ipairs(prompt:GetDescendants()) do
+			if d:IsA("TextButton") and d.Visible then
+				local t = (d.Text or ""):lower()
+				if not t:find("leave") and not d.Name:lower():find("leave") then
+					best = d
+					break
+				end
+			end
+		end
+	end
+	if not best then return false end
+	if type(firesignal) == "function" then
+		if pcall(firesignal, best.Activated) then return true end
+	end
+	pcall(function() best:FireSignal("Activated") end)
+	return true
+end
+
+local reconnectThread
+function Macro.SetAutoReconnect(enabled)
+	Macro.AutoReconnect = enabled and true or false
+	Macro.Settings.AutoReconnect = Macro.AutoReconnect
+	saveConfig()
+	if reconnectThread then pcall(task.cancel, reconnectThread); reconnectThread = nil end
+	if Macro.AutoReconnect then
+		reconnectThread = track(function()
+			local lastClick = 0
+			while Macro.AutoReconnect do
+				pcall(function()
+					local ep = findDisconnectPrompt()
+					if ep and os.clock() - lastClick > 12 then
+						lastClick = os.clock()
+						if clickDisconnectButton(ep) then
+							print("[Macro] Обнаружен дисконнект — кликаю Reconnect")
+						end
+					end
+				end)
+				task.wait(2)
+			end
+		end)
+		print("[Macro] AutoReconnect = true")
+	end
 end
 
 -- ========== Multi-Macro Save/Load ==========
@@ -517,14 +691,19 @@ function Macro.Load(name)
 		return false
 	end
 	Macro.Actions = data.actions or {}
-	Macro.TargetLevels = data.targetLevels or {}
+	Macro.TargetLevels = {}
 	Macro.Meta = type(data.meta) == "table" and data.meta or { matches = {} }
 	if type(Macro.Meta.matches) ~= "table" then Macro.Meta.matches = {} end
 	if type(data.settings) == "table" then
-		for k, v in pairs(data.settings) do Macro.Settings[k] = v end
+		-- из макроса берём только «макросные» настройки; пользовательские
+		-- (AfterMatch, SmartUpgrade, AntiAfk, Speed15, MenuVisible, AutoReconnect)
+		-- живут в config.json и не должны затираться при загрузке записи
+		for _, k in ipairs({ "VoteMode", "PlaceByTimer", "AutoSkipBeforeRecord" }) do
+			if data.settings[k] ~= nil then Macro.Settings[k] = data.settings[k] end
+		end
 		saveConfig()
 	end
-	if not next(Macro.TargetLevels) then Macro.BuildTargetLevels() end
+	Macro.BuildTargetLevels()
 	Config.lastMacro = name
 	saveConfig()
 	print(string.format("[Macro] Loaded %s: %d actions", name, #Macro.Actions))
@@ -592,42 +771,109 @@ local placementWorker
 local function tryPlaceEntry(e)
 	local place = e.place
 	if not place then return true end
-	local pos = place.Pos and Vector3.new(place.Pos.x, place.Pos.y, place.Pos.z) or nil
+	local rawPos = place.Pos and Vector3.new(place.Pos.x, place.Pos.y, place.Pos.z) or nil
+	local pos = applyOffset(rawPos)
+	if pos and not posInArea(pos) then
+		return false, "позиция вне карты — запись от старой карты, перезапиши (F6) или поправь posOffset (pos="..string.format("%.0f,%.0f,%.0f", pos.X, pos.Y, pos.Z)..")"
+	end
 	if pos and findTowerByPos(pos, 1.0) then return true end
 	local price = getSlotPriceForUnit(place.UnitId)
 	local money = Macro.GetMoney()
-	if price and money < price then return false end
+	if price and money < price then return false, "жду деньги "..money.."/"..price end
 	local cf = place.CFrame and deserializeArg(place.CFrame) or (pos and CFrame.new(pos)) or nil
 	if not cf then return true end
+	if pos and rawPos and pos ~= rawPos then cf = cf + (pos - rawPos) end
 	fireRemote("TowerAdd", { UnitId = place.UnitId, Name = place.Name, Pos = pos or cf.Position, CFrame = cf })
 	task.wait(0.4)
-	if pos then return findTowerByPos(pos, 1.5) ~= nil end
+	if pos then
+		local found = findTowerByPos(pos, 1.5) ~= nil
+		return found, found and nil or "TowerAdd не принял: проверь карту/сторону (pos="..string.format("%.0f,%.0f,%.0f", pos.X, pos.Y, pos.Z)..")"
+	end
 	return true
+end
+
+local function targetForPlace(pos)
+	local best
+	for _, a in ipairs(Macro.Actions) do
+		if a.type == "TowerUpgrade" and a.pos then
+			local ap = applyOffset(Vector3.new(a.pos.x, a.pos.y, a.pos.z))
+			if (ap - pos).Magnitude <= 2.0 then
+				local lv = (a.levelBefore or 1) + 1
+				if not best or lv > best then best = lv end
+			end
+		end
+	end
+	return best
+end
+
+local function prevTowerReady(item)
+	if not item.prevPos then return true end
+	if not Macro.AutoUpgrade then return true end
+	if not item.prevTarget then return true end
+	local best, bestDist
+	for _, t in ipairs(getPlacedTowers()) do
+		if t.OwnerUserId == LocalPlayer.UserId and t.Pos then
+			local d = (Vector3.new(t.Pos.X, t.Pos.Y, t.Pos.Z) - item.prevPos).Magnitude
+			if d <= 1.5 and (not bestDist or d < bestDist) then
+				best, bestDist = t, d
+			end
+		end
+	end
+	if not best then return true, nil end
+	local lv = best.Level or 1
+	return lv >= item.prevTarget, lv
 end
 
 local function startPlacementQueue()
 	placementQueue = {}
+	local lastPos = nil
 	for _, e in ipairs(Macro.Actions) do
 		if e.type == "TowerAdd" and e.place then
-			table.insert(placementQueue, { entry = e, placed = false, attempts = 0 })
+			local pos = e.place.Pos and applyOffset(Vector3.new(e.place.Pos.x, e.place.Pos.y, e.place.Pos.z)) or nil
+			table.insert(placementQueue, {
+				entry = e, placed = false, attempts = 0,
+				gateWait = 0, blockPrevLevel = -1,
+				prevPos = lastPos, prevTarget = lastPos and targetForPlace(lastPos) or nil,
+			})
+			lastPos = pos or lastPos
 		end
 	end
 	queueMode = #placementQueue > 0
 	if not queueMode then return end
-	print("[Macro] Queue mode: "..#placementQueue.." towers to place ASAP")
+	print("[Macro] Queue mode: "..#placementQueue.." towers, строго по очереди (следующая — после прокачки предыдущей до цели)")
 	if placementWorker then pcall(task.cancel, placementWorker) end
 	placementWorker = track(function()
 		while Macro.Playing and #placementQueue > 0 do
 			local progressed = false
+			local first = nil
 			for _, item in ipairs(placementQueue) do
-				if not item.placed and Macro.Playing then
-					item.attempts = item.attempts + 1
-					local ok, perr = pcall(tryPlaceEntry, item.entry)
-					if not ok and item.attempts <= 2 then warn("[Macro] place error: "..tostring(perr)) end
-					if ok and (not item.entry.place.Pos or findTowerByPos(Vector3.new(item.entry.place.Pos.x, item.entry.place.Pos.y, item.entry.place.Pos.z), 1.5)) then
-						item.placed = true
+				if not item.placed then first = item break end
+			end
+			if first and Macro.Playing then
+				local ready, curLevel = prevTowerReady(first)
+				if not ready then
+					if curLevel ~= first.blockPrevLevel then
+						first.blockPrevLevel = curLevel
+						first.gateWait = 0
+					else
+						first.gateWait = first.gateWait + 1
+					end
+					if first.gateWait > 1000 then ready = true end
+					if first.gateWait == 100 then
+						print("[Macro] жду прокачку предыдущей башни до L"..tostring(first.prevTarget or "?").." (сейчас L"..tostring(curLevel or "?")..")")
+					end
+				end
+				if ready then
+					first.attempts = first.attempts + 1
+					local ok, res, why = pcall(tryPlaceEntry, first.entry)
+					if not ok and first.attempts <= 2 then warn("[Macro] place error: "..tostring(res)) end
+					if ok and res == false and why and (first.attempts == 1 or first.attempts % 100 == 0) then
+						print("[Macro] "..tostring(first.entry.place.Name)..": "..why)
+					end
+					if ok and (not first.entry.place.Pos or findTowerByPos(Vector3.new(first.entry.place.Pos.x, first.entry.place.Pos.y, first.entry.place.Pos.z), 1.5)) then
+						first.placed = true
 						progressed = true
-						print("[Macro] Queued tower placed: "..tostring(item.entry.place.Name))
+						print("[Macro] Queued tower placed: "..tostring(first.entry.place.Name))
 					end
 				end
 			end
@@ -702,13 +948,13 @@ local function recoverRec()
 			end)
 			if ok and type(data) == "table" and type(data.actions) == "table" and #data.actions > 0 then
 				Macro.Actions = data.actions
-				Macro.TargetLevels = data.targetLevels or {}
+				Macro.TargetLevels = {}
 				if type(data.meta) == "table" then Macro.Meta = data.meta end
 				if type(Macro.Meta.matches) ~= "table" then Macro.Meta.matches = {} end
 				Macro.CurrentMacroName = n
 				Config.lastMacro = n
 				saveConfig()
-				if not next(Macro.TargetLevels) then Macro.BuildTargetLevels() end
+				Macro.BuildTargetLevels()
 				return n, #data.actions
 			end
 		end
@@ -1310,6 +1556,9 @@ applyConfigToUI = function()
 			if Toggles.AutoSkipBefore then
 				Toggles.AutoSkipBefore:SetValue(Macro.Settings.AutoSkipBeforeRecord == true)
 			end
+			if Toggles.AutoReconnectToggle then
+				Toggles.AutoReconnectToggle:SetValue(Macro.Settings.AutoReconnect ~= false)
+			end
 			if Toggles.PlaceByTimer then
 				Toggles.PlaceByTimer:SetValue(Macro.Settings.PlaceByTimer == true)
 			end
@@ -1689,6 +1938,15 @@ local function makeUI()
 		end,
 	})
 
+	AntiBox:AddToggle("AutoReconnectToggle", {
+		Text = "Auto-Reconnect",
+		Tooltip = "При ошибке дисконнекта (277, 279, 288, нет интернета) сам жмёт Reconnect и возвращается в игру",
+		Default = Macro.Settings.AutoReconnect ~= false,
+		Callback = function(v)
+			Macro.SetAutoReconnect(v)
+		end,
+	})
+
 	AntiBox:AddDropdown("AfterMatch", {
 		Text = "После конца катки",
 		Tooltip = "PlayAgain — сразу новая катка (не вышло — в лобби). Lobby — в лобби. Off — стоять на финальном экране",
@@ -1862,6 +2120,10 @@ end)
 
 initAntiAfk()
 
+if Macro.Settings.AutoReconnect ~= false then
+	Macro.SetAutoReconnect(true)
+end
+
 if inLobby() then
 	connectElevatorEvents()
 	if autoJoinWanted() then startAutoJoin() end
@@ -1883,5 +2145,11 @@ else
 end
 
 print("[Macro] System v4 loaded! place="..game.PlaceId.." autoload="..tostring(Config.autoload).." autoJoin="..tostring(Config.autoJoin))
+do
+	local o = Config.posOffset or {}
+	if (o.x or 0) ~= 0 or (o.y or 0) ~= 0 or (o.z or 0) ~= 0 then
+		print(string.format("[Macro] posOffset active: %.1f, %.1f, %.1f", o.x or 0, o.y or 0, o.z or 0))
+	end
+end
 print("[Macro] F1=Menu F6=Rec F7=Play F8=Stop F9=Save F10=Load")
 getgenv().CameraTDMacro = Macro
