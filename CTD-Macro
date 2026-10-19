@@ -3,8 +3,9 @@
 -- GUI: Obsidian (mspaint)
 
 local __bootG = getgenv()
-if __bootG.CameraTDLastBoot and (os.clock() - __bootG.CameraTDLastBoot) < 3 then return end
-__bootG.CameraTDLastBoot = os.clock()
+local __bootNow = tick()
+if __bootG.CameraTDLastBoot and (__bootNow - __bootG.CameraTDLastBoot) < 3 then return end
+__bootG.CameraTDLastBoot = __bootNow
 
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
