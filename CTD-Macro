@@ -338,9 +338,6 @@ local function vimClick(btn)
 	VirtualInputManager:SendMouseButtonEvent(cx, cy, 0, false, nil, 0)
 end
 
-local placementQueue = {}
-local queueMode = false
-
 local function parseDigits(text)
 	local s = (tostring(text or ""):gsub("%D", ""))
 	return tonumber(s)
@@ -764,127 +761,109 @@ local function deserializeArg(a)
 	end
 end
 
--- ========== Очередь построек ==========
+-- ========== Replay-движок: точное повторение записи (порядок + деньги) ==========
 
-local placementWorker
-
-local function tryPlaceEntry(e)
-	local place = e.place
-	if not place then return true end
-	local rawPos = place.Pos and Vector3.new(place.Pos.x, place.Pos.y, place.Pos.z) or nil
-	local pos = applyOffset(rawPos)
-	if pos and not posInArea(pos) then
-		return false, "позиция вне карты — запись от старой карты, перезапиши (F6) или поправь posOffset (pos="..string.format("%.0f,%.0f,%.0f", pos.X, pos.Y, pos.Z)..")"
+local function waitMoneyAtLeast(need, label)
+	if not need then return true end
+	local printed = false
+	local lastPrint = 0
+	while not Macro.StopFlag do
+		local money = Macro.GetMoney()
+		if money >= need then return true end
+		if not printed or (os.clock() - lastPrint) > 30 then
+			printed = true
+			lastPrint = os.clock()
+			print(string.format("[Macro] жду деньги %d/%d (%s)", money, need, label))
+		end
+		task.wait(0.25)
 	end
-	if pos and findTowerByPos(pos, 1.0) then return true end
-	local price = getSlotPriceForUnit(place.UnitId)
-	local money = Macro.GetMoney()
-	if price and money < price then return false, "жду деньги "..money.."/"..price end
-	local cf = place.CFrame and deserializeArg(place.CFrame) or (pos and CFrame.new(pos)) or nil
-	if not cf then return true end
-	if pos and rawPos and pos ~= rawPos then cf = cf + (pos - rawPos) end
-	fireRemote("TowerAdd", { UnitId = place.UnitId, Name = place.Name, Pos = pos or cf.Position, CFrame = cf })
-	task.wait(0.4)
-	if pos then
-		local found = findTowerByPos(pos, 1.5) ~= nil
-		return found, found and nil or "TowerAdd не принял: проверь карту/сторону (pos="..string.format("%.0f,%.0f,%.0f", pos.X, pos.Y, pos.Z)..")"
-	end
-	return true
+	return false
 end
 
-local function targetForPlace(pos)
-	local best
-	for _, a in ipairs(Macro.Actions) do
-		if a.type == "TowerUpgrade" and a.pos then
-			local ap = applyOffset(Vector3.new(a.pos.x, a.pos.y, a.pos.z))
-			if (ap - pos).Magnitude <= 2.0 then
-				local lv = (a.levelBefore or 1) + 1
-				if not best or lv > best then best = lv end
+local function findOwnTowerNear(pos, radius)
+	local best, bestDist
+	for _, t in ipairs(getPlacedTowers()) do
+		if t.OwnerUserId == LocalPlayer.UserId and t.Pos and t.Id then
+			local d = (Vector3.new(t.Pos.X, t.Pos.Y, t.Pos.Z) - pos).Magnitude
+			if d <= radius and (not bestDist or d < bestDist) then
+				best, bestDist = t, d
 			end
 		end
 	end
 	return best
 end
 
-local function prevTowerReady(item)
-	if not item.prevPos then return true end
-	if not Macro.AutoUpgrade then return true end
-	if not item.prevTarget then return true end
-	local best, bestDist
-	for _, t in ipairs(getPlacedTowers()) do
-		if t.OwnerUserId == LocalPlayer.UserId and t.Pos then
-			local d = (Vector3.new(t.Pos.X, t.Pos.Y, t.Pos.Z) - item.prevPos).Magnitude
-			if d <= 1.5 and (not bestDist or d < bestDist) then
-				best, bestDist = t, d
+local function replayPlace(entry)
+	local place = entry.place
+	if not place then return end
+	local rawPos = place.Pos and Vector3.new(place.Pos.x, place.Pos.y, place.Pos.z) or nil
+	local pos = rawPos and applyOffset(rawPos) or nil
+	if pos and findOwnTowerNear(pos, 1.0) then return end -- уже стоит
+	if pos and not posInArea(pos) then
+		warn("[Macro] пропуск постройки "..tostring(place.Name)..": позиция вне карты (pos="..string.format("%.0f,%.0f,%.0f", pos.X, pos.Y, pos.Z)..") — перезапиши макрос (F6) или поправь posOffset")
+		return
+	end
+	local price = getSlotPriceForUnit(place.UnitId)
+	if not waitMoneyAtLeast(price, "Place "..tostring(place.Name)) then return end
+	local cf = place.CFrame and deserializeArg(place.CFrame) or (pos and CFrame.new(pos)) or nil
+	if not cf then return end
+	if pos and rawPos and pos ~= rawPos then cf = cf + (pos - rawPos) end
+	for attempt = 1, 5 do
+		if Macro.StopFlag then return end
+		if pos and findOwnTowerNear(pos, 1.0) then return end
+		fireRemote("TowerAdd", { UnitId = place.UnitId, Name = place.Name, Pos = pos or cf.Position, CFrame = cf })
+		for _ = 1, 12 do -- до ~3с проверяю постановку
+			task.wait(0.25)
+			if Macro.StopFlag then return end
+			if pos and findOwnTowerNear(pos, 1.5) then
+				print("[Macro] поставил: "..tostring(place.Name))
+				return
 			end
 		end
+		warn("[Macro] TowerAdd не подтвердился: "..tostring(place.Name).." (попытка "..attempt..")")
+		task.wait(0.5)
 	end
-	if not best then return true, nil end
-	local lv = best.Level or 1
-	return lv >= item.prevTarget, lv
+	warn("[Macro] не удалось поставить: "..tostring(place.Name))
 end
 
-local function startPlacementQueue()
-	placementQueue = {}
-	local lastPos = nil
-	for _, e in ipairs(Macro.Actions) do
-		if e.type == "TowerAdd" and e.place then
-			local pos = e.place.Pos and applyOffset(Vector3.new(e.place.Pos.x, e.place.Pos.y, e.place.Pos.z)) or nil
-			table.insert(placementQueue, {
-				entry = e, placed = false, attempts = 0,
-				gateWait = 0, blockPrevLevel = -1,
-				prevPos = lastPos, prevTarget = lastPos and targetForPlace(lastPos) or nil,
-			})
-			lastPos = pos or lastPos
+local function replayUpgrade(entry)
+	if not entry.pos then return end
+	local name = entry.towerName or "?"
+	local target = (entry.levelBefore or 1) + 1
+	local rawPos = Vector3.new(entry.pos.x, entry.pos.y, entry.pos.z)
+	local pos = applyOffset(rawPos)
+	for attempt = 1, 15 do
+		if Macro.StopFlag then return end
+		local tower = findOwnTowerNear(pos, 1.5)
+		if not tower then
+			warn("[Macro] апгрейд: башня "..name.." не найдена ("..string.format("%.0f,%.0f,%.0f", pos.X, pos.Y, pos.Z)..") — пропускаю шаг до L"..target)
+			return
+		end
+		local level = tower.Level or 1
+		if level >= target then return end -- уже на нужном уровне (прошлые шаги/катка)
+		local price = getUpgradePrice(tower.Name or name, level)
+		if not waitMoneyAtLeast(price, string.format("Upgrade %s L%d→L%d", name, level, target)) then return end
+		fireRemote("TowerUpgrade", { Id = tower.Id })
+		local up = false
+		for _ = 1, 14 do -- до ~3.5с проверяю, что уровень рос
+			task.wait(0.25)
+			if Macro.StopFlag then return end
+			local t2 = findOwnTowerNear(pos, 1.5)
+			if t2 and (t2.Level or 1) > level then up = true break end
+		end
+		if up then
+			local cur = findOwnTowerNear(pos, 1.5)
+			local lv = cur and (cur.Level or (level + 1)) or (level + 1)
+			if lv >= target then
+				print(string.format("[Macro] %s → L%d", name, target))
+			end
+			-- цель не достигнута — следующий проход цикла докачает
+		else
+			warn(string.format("[Macro] %s: сервер не применил L%d→L%d (попытка %d)", name, level, target, attempt))
+			task.wait(1.2)
 		end
 	end
-	queueMode = #placementQueue > 0
-	if not queueMode then return end
-	print("[Macro] Queue mode: "..#placementQueue.." towers, строго по очереди (следующая — после прокачки предыдущей до цели)")
-	if placementWorker then pcall(task.cancel, placementWorker) end
-	placementWorker = track(function()
-		while Macro.Playing and #placementQueue > 0 do
-			local progressed = false
-			local first = nil
-			for _, item in ipairs(placementQueue) do
-				if not item.placed then first = item break end
-			end
-			if first and Macro.Playing then
-				local ready, curLevel = prevTowerReady(first)
-				if not ready then
-					if curLevel ~= first.blockPrevLevel then
-						first.blockPrevLevel = curLevel
-						first.gateWait = 0
-					else
-						first.gateWait = first.gateWait + 1
-					end
-					if first.gateWait > 1000 then ready = true end
-					if first.gateWait == 100 then
-						print("[Macro] жду прокачку предыдущей башни до L"..tostring(first.prevTarget or "?").." (сейчас L"..tostring(curLevel or "?")..")")
-					end
-				end
-				if ready then
-					first.attempts = first.attempts + 1
-					local ok, res, why = pcall(tryPlaceEntry, first.entry)
-					if not ok and first.attempts <= 2 then warn("[Macro] place error: "..tostring(res)) end
-					if ok and res == false and why and (first.attempts == 1 or first.attempts % 100 == 0) then
-						print("[Macro] "..tostring(first.entry.place.Name)..": "..why)
-					end
-					if ok and (not first.entry.place.Pos or findTowerByPos(Vector3.new(first.entry.place.Pos.x, first.entry.place.Pos.y, first.entry.place.Pos.z), 1.5)) then
-						first.placed = true
-						progressed = true
-						print("[Macro] Queued tower placed: "..tostring(first.entry.place.Name))
-					end
-				end
-			end
-			for i = #placementQueue, 1, -1 do
-				if placementQueue[i].placed then table.remove(placementQueue, i) end
-			end
-			if not progressed then task.wait(0.3) else task.wait(0.1) end
-		end
-		queueMode = false
-		placementQueue = {}
-	end)
+	warn("[Macro] апгрейд не прошёл: "..name.." → L"..target)
 end
 
 local function recordAction(rmName, args)
@@ -1017,74 +996,92 @@ function Macro.Play()
 		Macro.SetSpeed(1.5)
 	end
 
-	if Macro.Settings.SmartUpgrade ~= false and next(Macro.TargetLevels) then
+	local timed = Macro.Settings.PlaceByTimer == true
+
+	if timed and Macro.Settings.SmartUpgrade ~= false and next(Macro.TargetLevels) then
 		Macro.SetAutoUpgrade(true)
 	end
 
-	queueMode = false
-	placementQueue = {}
-	if Macro.Settings.PlaceByTimer ~= true then
-		startPlacementQueue()
+	if not timed then
+		-- replay идёт строго по порядку записи — фоновый автоапгрейд мешал бы
+		if Macro.AutoUpgrade then
+			Macro.SetAutoUpgrade(false)
+			print("[Macro] Smart Upgrade выкл на время replay (включится после отработки записи)")
+		end
 	end
 
-	print("[Macro] === PLAYBACK START: "..#Macro.Actions.." actions ===")
+	if timed then
+		print("[Macro] === PLAYBACK START: "..#Macro.Actions.." actions (по таймеру записи) ===")
+	else
+		print("[Macro] === PLAYBACK START: "..#Macro.Actions.." actions (replay: порядок записи + ожидание денег) ===")
+	end
 
 	local lastT = 0
 	for i, entry in ipairs(Macro.Actions) do
 		if Macro.StopFlag then break end
-		local delay = (entry.t or 0) - lastT
-		if delay > 0 then task.wait(delay) end
-		lastT = entry.t or 0
+		if timed then
+			local delay = (entry.t or 0) - lastT
+			if delay > 0 then task.wait(delay) end
+			lastT = entry.t or 0
+		end
 
-		local skipAdd = queueMode and entry.type == "TowerAdd"
-
-		if entry.type ~= "TowerUpgrade" and not skipAdd then
-			local ok, err = pcall(function()
-				if entry.type == "TowerAdd" and entry.place then
-					if entry.place.Pos then
-						local existing = findTowerByPos(Vector3.new(entry.place.Pos.x, entry.place.Pos.y, entry.place.Pos.z), 1.0)
-						if existing then return end
-					end
-					local cf = entry.place.CFrame and deserializeArg(entry.place.CFrame) or nil
-					local pos = entry.place.Pos and Vector3.new(entry.place.Pos.x, entry.place.Pos.y, entry.place.Pos.z) or nil
-					if not cf and pos then cf = CFrame.new(pos) end
-					if cf then
-						fireRemote("TowerAdd", { UnitId = entry.place.UnitId, Name = entry.place.Name, Pos = pos or cf.Position, CFrame = cf })
-					end
-				elseif entry.type == "WaveSkip" then
-					Macro.SkipWave()
-				elseif entry.type == "TowerSell" then
-					if entry.pos then
-						Macro.SellTowerAt(Vector3.new(entry.pos.x, entry.pos.y, entry.pos.z))
-					elseif entry.args and entry.args[1] and entry.args[1].Id then
-						Macro.SellTower(entry.args[1].Id)
-					end
-				elseif entry.type == "TowerTarget" then
-					if entry.args and entry.args[1] then
-						fireRemote("TowerTarget", deserializeArg(entry.args[1]))
-					end
-				elseif entry.type == "TowerRemove" then
-					if entry.args and entry.args[1] and entry.args[1].Id then
-						fireRemote("TowerRemove", entry.args[1].Id)
+		local ok, err = pcall(function()
+			if entry.type == "TowerAdd" then
+				if timed then
+					if entry.place then
+						if entry.place.Pos then
+							local existing = findTowerByPos(Vector3.new(entry.place.Pos.x, entry.place.Pos.y, entry.place.Pos.z), 1.0)
+							if existing then return end
+						end
+						local cf = entry.place.CFrame and deserializeArg(entry.place.CFrame) or nil
+						local pos = entry.place.Pos and Vector3.new(entry.place.Pos.x, entry.place.Pos.y, entry.place.Pos.z) or nil
+						if not cf and pos then cf = CFrame.new(pos) end
+						if cf then
+							fireRemote("TowerAdd", { UnitId = entry.place.UnitId, Name = entry.place.Name, Pos = pos or cf.Position, CFrame = cf })
+						end
 					end
 				else
-					local args = {}
-					for j, a in ipairs(entry.args or {}) do args[j] = deserializeArg(a) end
-					fireRemote(entry.type, unpack(args))
+					replayPlace(entry)
 				end
-			end)
-			if not ok then warn("[Macro] Error #"..i..": "..tostring(err)) end
-		end
+			elseif entry.type == "TowerUpgrade" then
+				-- replay-режим: повторяем ТОТ шаг прокачки, что был при записи,
+				-- в том же порядке — перемежаясь с постройками, как ты играл руками
+				if not timed then
+					replayUpgrade(entry)
+				end
+			elseif entry.type == "WaveSkip" then
+				Macro.SkipWave()
+			elseif entry.type == "TowerSell" then
+				if entry.pos then
+					Macro.SellTowerAt(Vector3.new(entry.pos.x, entry.pos.y, entry.pos.z))
+				elseif entry.args and entry.args[1] and entry.args[1].Id then
+					Macro.SellTower(entry.args[1].Id)
+				end
+			elseif entry.type == "TowerTarget" then
+				if entry.args and entry.args[1] then
+					fireRemote("TowerTarget", deserializeArg(entry.args[1]))
+				end
+			elseif entry.type == "TowerRemove" then
+				if entry.args and entry.args[1] and entry.args[1].Id then
+					fireRemote("TowerRemove", entry.args[1].Id)
+				end
+			else
+				local args = {}
+				for j, a in ipairs(entry.args or {}) do args[j] = deserializeArg(a) end
+				fireRemote(entry.type, unpack(args))
+			end
+		end)
+		if not ok then warn("[Macro] Error #"..i..": "..tostring(err)) end
+		if not timed then task.wait(0.1) end
 	end
-	if queueMode and #placementQueue > 0 and not Macro.StopFlag then
-		print("[Macro] Waiting for placement queue: "..#placementQueue.." left")
-		local deadline = os.clock() + 60
-		while #placementQueue > 0 and not Macro.StopFlag and os.clock() < deadline do
-			task.wait(0.2)
-		end
-	end
+
 	Macro.Playing = false
 	print("[Macro] === PLAYBACK DONE ===")
+
+	-- после отработки записи — Smart Upgrade добирает цели (страховка)
+	if not timed and not Macro.StopFlag and Macro.Settings.SmartUpgrade ~= false and next(Macro.TargetLevels) then
+		Macro.SetAutoUpgrade(true)
+	end
 end
 
 -- ========== Конец катки: время/монеты/карта ==========
@@ -1713,7 +1710,7 @@ local function makeUI()
 
 	SettingsBox:AddToggle("PlaceByTimer", {
 		Text = "Ставить башни по таймеру",
-		Tooltip = "ВКЛ: по времени из записи. ВЫКЛ (по умолч.): ставит сразу, как хватает денег, автоапгрейд копит на постройки",
+		Tooltip = "ВЫКЛ (по умолч.): Replay — повторяет ровно порядок записи (поставив A, качает A, потом ставит B…), ждёт деньги под каждый шаг. ВКЛ: старое поведение по времени из записи.",
 		Default = Macro.Settings.PlaceByTimer == true,
 		Callback = function(v)
 			Macro.Settings.PlaceByTimer = v
