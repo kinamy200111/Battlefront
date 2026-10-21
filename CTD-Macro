@@ -2041,7 +2041,7 @@ local function gemText(frame)
 	return nil
 end
 
-local tradeGui, tradeTitle, tradeSub
+local tradeGui, tradeTitle, tradeGive, tradeGet
 local function tradeOverlay(state)
 	if state == nil and tradeGui == nil then return end
 	if tradeGui == nil then
@@ -2063,7 +2063,7 @@ local function tradeOverlay(state)
 		box.Name = "Box"
 		box.AnchorPoint = Vector2.new(0.5, 0)
 		box.Position = UDim2.new(0.5, 0, 0, 72)
-		box.Size = UDim2.fromOffset(320, 80)
+		box.Size = UDim2.fromOffset(360, 96)
 		box.BackgroundColor3 = Color3.fromRGB(20, 20, 26)
 		box.BackgroundTransparency = 0.12
 		box.BorderSizePixel = 0
@@ -2079,21 +2079,34 @@ local function tradeOverlay(state)
 		tradeTitle = Instance.new("TextLabel")
 		tradeTitle.BackgroundTransparency = 1
 		tradeTitle.Position = UDim2.new(0, 0, 0, 8)
-		tradeTitle.Size = UDim2.new(1, 0, 0, 38)
+		tradeTitle.Size = UDim2.new(1, 0, 0, 34)
 		tradeTitle.Font = Enum.Font.GothamBold
 		tradeTitle.TextSize = 24
 		tradeTitle.Text = ""
 		tradeTitle.TextStrokeTransparency = 0.85
 		tradeTitle.Parent = box
-		tradeSub = Instance.new("TextLabel")
-		tradeSub.BackgroundTransparency = 1
-		tradeSub.Position = UDim2.new(0, 0, 0, 48)
-		tradeSub.Size = UDim2.new(1, 0, 0, 24)
-		tradeSub.Font = Enum.Font.Gotham
-		tradeSub.TextSize = 14
-		tradeSub.TextColor3 = Color3.fromRGB(200, 200, 210)
-		tradeSub.Text = ""
-		tradeSub.Parent = box
+		tradeGive = Instance.new("TextLabel")
+		tradeGive.BackgroundTransparency = 1
+		tradeGive.Position = UDim2.new(0, 12, 0, 44)
+		tradeGive.Size = UDim2.new(1, -24, 0, 20)
+		tradeGive.Font = Enum.Font.Gotham
+		tradeGive.TextSize = 13
+		tradeGive.TextXAlignment = Enum.TextXAlignment.Left
+		tradeGive.TextColor3 = Color3.fromRGB(200, 200, 210)
+		tradeGive.Text = ""
+		tradeGive.TextTruncate = Enum.TextTruncate.AtEnd
+		tradeGive.Parent = box
+		tradeGet = Instance.new("TextLabel")
+		tradeGet.BackgroundTransparency = 1
+		tradeGet.Position = UDim2.new(0, 12, 0, 66)
+		tradeGet.Size = UDim2.new(1, -24, 0, 20)
+		tradeGet.Font = Enum.Font.Gotham
+		tradeGet.TextSize = 13
+		tradeGet.TextXAlignment = Enum.TextXAlignment.Left
+		tradeGet.TextColor3 = Color3.fromRGB(200, 200, 210)
+		tradeGet.Text = ""
+		tradeGet.TextTruncate = Enum.TextTruncate.AtEnd
+		tradeGet.Parent = box
 	end
 	if state == nil then
 		tradeGui.Enabled = false
@@ -2114,17 +2127,17 @@ local function tradeOverlay(state)
 		tradeTitle.Text = "ЖДЁМ ПРЕДЛОЖЕНИЯ"
 		tradeTitle.TextColor3 = Color3.fromRGB(180, 182, 195)
 	end
-	local g = ""
 	local mg, tg = tonumber(state.myG), tonumber(state.thG)
-	if (mg or 0) > 0 or (tg or 0) > 0 then
-		g = string.format("  |  гемы %d/%d", mg or 0, tg or 0)
+		local giveNames = (state.myNames and state.myNames ~= "") and state.myNames or "Ничего"
+		local getName = (state.thNames and state.thNames ~= "") and state.thNames or "Ничего"
+		tradeGive.Text = string.format("Отдаёшь:  %s  (%.2f)%s", giveNames, state.mySum or 0,
+			(mg or 0) > 0 and (" + "..tostring(mg).." гем.") or "")
+		tradeGet.Text = string.format("Получаешь:  %s  (%.2f)%s", getName, state.thSum or 0,
+			(tg or 0) > 0 and (" + "..tostring(tg).." гем.") or "")
 	end
-	tradeSub.Text = string.format("Ты %.2f (%d шт)  •  Соперник %.2f (%d шт)%s",
-		state.mySum or 0, state.myN or 0, state.thSum or 0, state.thN or 0, g)
-end
 getgenv().TradeOverlayTest = tradeOverlay
 
-local lastTradeSig = nil
+	local lastTradeSig = nil
 local function tradePollOnce()
 	if Macro.Settings.TradeHelper == false then
 		tradeOverlay(nil)
@@ -2151,6 +2164,12 @@ local function tradePollOnce()
 	local mySum, thSum = sumValues(myItems), sumValues(thItems)
 	local myG = gemText(menu:FindFirstChild("YourGems"))
 	local thG = gemText(menu:FindFirstChild("PlayerGems"))
+	local function namesOf(list)
+		local names = {}
+		for _, it in ipairs(list) do names[#names + 1] = it.name end
+		return table.concat(names, ", ")
+	end
+	local myNames, thNames = namesOf(myItems), namesOf(thItems)
 	local function sigOf(list, s, g)
 		local names = {}
 		for _, it in ipairs(list) do names[#names + 1] = it.name end
@@ -2160,12 +2179,13 @@ local function tradePollOnce()
 	local sig = sigOf(myItems, mySum, myG).."//"..sigOf(thItems, thSum, thG)
 	if sig == lastTradeSig then return end
 	lastTradeSig = sig
+	local net = thSum - mySum
 	local verdict
 	if #myItems > 0 or #thItems > 0 or (myG or 0) > 0 or (thG or 0) > 0 then
-		if mySum > thSum then
-			verdict = "WIN +"..string.format("%.2f", mySum - thSum)
-		elseif mySum < thSum then
-			verdict = "LOSE -"..string.format("%.2f", thSum - mySum)
+		if net > 0.005 then
+			verdict = "WIN +"..string.format("%.2f", net)
+		elseif net < -0.005 then
+			verdict = "LOSE -"..string.format("%.2f", -net)
 		else
 			verdict = "РАВНО"
 		end
@@ -2175,9 +2195,11 @@ local function tradePollOnce()
 		mySum = mySum, thSum = thSum,
 		myN = #myItems, thN = #thItems,
 		myG = myG, thG = thG,
+		myNames = myNames, thNames = thNames,
 	})
-	print(string.format("[Trade] Вы: %.2f (%d шт, гемы: %s) | Соперник: %.2f (%d шт, гемы: %s)%s",
-		mySum, #myItems, tostring(myG or "?"), thSum, #thItems, tostring(thG or "?"),
+	print(string.format("[Trade] Отдаёшь: %s (%.2f, гемы: %s) | Получаешь: %s (%.2f, гемы: %s)%s",
+		(myNames ~= "" and myNames or "Ничего"), mySum, tostring(myG or "?"),
+		(thNames ~= "" and thNames or "Ничего"), thSum, tostring(thG or "?"),
 		verdict and (" -> "..verdict) or ""))
 	local unk = {}
 	for _, n in ipairs(myUnknown) do unk[#unk + 1] = "вы:"..n end
