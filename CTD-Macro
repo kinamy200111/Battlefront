@@ -198,10 +198,19 @@ local CONFIG_PATH = MACRO_DIR.."config.json"
 local LOBBY_PLACE = 132929771812494
 
 local LOADER_SRC = [[
-getgenv().CameraTDAfterTeleport = true
-if isfile("CameraTD_Macros/MacroSystem.lua") then
-	local f, err = loadfile("CameraTD_Macros/MacroSystem.lua")
-	if f then f() else warn("[Macro] loader: "..tostring(err)) end
+local run = true
+pcall(function()
+	if isfile("CameraTD_Macros/config.json") then
+		local j = game:GetService("HttpService"):JSONDecode(readfile("CameraTD_Macros/config.json"))
+		if j and j.autoExecute == false then run = false end
+	end
+end)
+if run then
+	getgenv().CameraTDAfterTeleport = true
+	if isfile("CameraTD_Macros/MacroSystem.lua") then
+		local f, err = loadfile("CameraTD_Macros/MacroSystem.lua")
+		if f then f() else warn("[Macro] loader: "..tostring(err)) end
+	end
 end
 ]]
 
@@ -255,6 +264,7 @@ local function mergeConfig(decoded)
 		version = 4,
 		autoload = true,
 		autoJoin = false,
+		autoExecute = true,
 		lastMacro = nil,
 		lastMap = nil,
 		posOffset = { x = 0, y = 0, z = 0 },
@@ -551,7 +561,7 @@ function Macro.SetAutoUpgrade(enabled)
 										return "wait"
 									end
 									fireRemote("TowerUpgrade", { Id = t.Id })
-									task.wait(0.8)
+									task.wait(0.5)
 									return true
 								end
 								return false
@@ -564,7 +574,7 @@ function Macro.SetAutoUpgrade(enabled)
 						for _, key in ipairs(order) do
 							if not Macro.AutoUpgrade then return end
 							local r = tryKey(key)
-							if r == "wait" or r then break end
+							if r == true then break end
 						end
 					else
 						for _, t in ipairs(getPlacedTowers()) do
@@ -573,17 +583,16 @@ function Macro.SetAutoUpgrade(enabled)
 								local target = Macro.TargetLevels[makePosKey(t.Pos)]
 								if target and level < target then
 									local price = getUpgradePrice(t.Name, level)
-									if price and Macro.GetMoney() < price then
-										break
+									if not price or Macro.GetMoney() >= price then
+										fireRemote("TowerUpgrade", { Id = t.Id })
+										task.wait(0.5)
 									end
-									fireRemote("TowerUpgrade", { Id = t.Id })
-									task.wait(0.8)
 								end
 							end
 						end
 					end
 				end)
-				task.wait(0.3)
+				task.wait(0.2)
 			end
 		end)
 	end
@@ -1860,6 +1869,9 @@ applyConfigToUI = function()
 			if Toggles.AutoJoinToggle then
 				Toggles.AutoJoinToggle:SetValue(Config.autoJoin == true)
 			end
+			if Toggles.AutoExecuteToggle then
+				Toggles.AutoExecuteToggle:SetValue(Config.autoExecute ~= false)
+			end
 			if Toggles.AutoloadToggle then
 				Toggles.AutoloadToggle:SetValue(Config.autoload == true)
 			end
@@ -2493,6 +2505,26 @@ local function makeUI()
 			end
 		end,
 	})
+	MenuBox:AddToggle("AutoExecuteToggle", {
+		Text = "Авто-экзекут",
+		Tooltip = "Сам запускать скрипт после телепорта и при следующем входе в игру. Выключи — и больше ничего не подхватится само",
+		Default = Config.autoExecute ~= false,
+		Callback = function(v)
+			Config.autoExecute = v
+			saveConfig()
+			if v then
+				armTeleportQueue()
+				pcall(function()
+					writefile("autoexec/MacroSystem.lua", LOADER_SRC)
+				end)
+			else
+				pcall(function()
+					if isfile("autoexec/MacroSystem.lua") then deletefile("autoexec/MacroSystem.lua") end
+				end)
+			end
+			print("[Macro] Авто-экзекут = "..tostring(v))
+		end,
+	})
 	MenuBox:AddLabel("F1 = показать/скрыть меню", true)
 
 	-- ===== Вкладка INFO =====
@@ -2500,7 +2532,7 @@ local function makeUI()
 	local InfoBox = InfoTab:AddGroupbox({ Side = "Left", Name = "Горячие клавиши" })
 
 	InfoBox:AddLabel("F1=Меню | F6=Rec | F7=Play | F8=Stop | F9=Save | F10=Load", true)
-	InfoBox:AddLabel("После телепорта скрипт сам включается заново. Настройки и последний макрос сохраняются автоматически.", true)
+	InfoBox:AddLabel("После телепорта скрипт сам включается заново (можно выключить в настройках). Настройки и последний макрос сохраняются автоматически.", true)
 	InfoBox:AddLabel("Auto-Upgrade сам качает башни по твоей записи. Auto-Skip сам пропускает волны. Монет/ч и Конфет/ч считаются по последним каткам. Юниты из макроса надеваются сами при загрузке. Карта берётся из записи, голосование — из настроек.", true)
 
 	return Window
@@ -2613,10 +2645,16 @@ if not ConfigRead then
 	end)
 end
 
-armTeleportQueue()
-pcall(function()
-	writefile("autoexec/MacroSystem.lua", LOADER_SRC)
-end)
+if Config.autoExecute ~= false then
+	armTeleportQueue()
+	pcall(function()
+		writefile("autoexec/MacroSystem.lua", LOADER_SRC)
+	end)
+else
+	pcall(function()
+		if isfile("autoexec/MacroSystem.lua") then deletefile("autoexec/MacroSystem.lua") end
+	end)
+end
 
 track(function()
 	while true do
