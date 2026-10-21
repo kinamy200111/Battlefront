@@ -269,7 +269,7 @@ local function mergeConfig(decoded)
 		lastMap = nil,
 		posOffset = { x = 0, y = 0, z = 0 },
 		farm = { active = false, target = 5, done = 0 },
-		settings = { VoteMode = "Normal", AutoSkipBeforeRecord = false, PlaceByTimer = false, SmartUpgrade = true, AntiAfk = true, AfterMatch = "PlayAgain", Speed15 = false, MenuVisible = true, AutoReconnect = true, ElevatorHpMod = true, ElevatorSpeedMod = true, TradeHelper = true },
+		settings = { VoteMode = "Normal", AutoSkipBeforeRecord = false, PlaceByTimer = false, SmartUpgrade = true, AntiAfk = true, AfterMatch = "PlayAgain", Speed15 = false, MenuVisible = true, AutoReconnect = true, ElevatorHpMod = true, ElevatorSpeedMod = true, TradeHelper = true, WalkToElevator = false },
 	}
 	if type(decoded) == "table" then
 		for k, v in pairs(decoded) do
@@ -1053,49 +1053,38 @@ local function replayPlace(entry)
 	warn("[Macro] не удалось поставить: "..tostring(place.Name))
 end
 
-local function replayUpgrade(entry)
-	if not entry.pos then return end
+-- Неблокирующая прокачка для eager-очереди: «done» — шаг закрыт, «wait» — денег/башни пока нет
+local function tryUpgradeNow(entry)
+	if not entry.pos then return "done" end
+	if entry._cd and os.clock() < entry._cd then return "wait" end
 	local name = entry.towerName or "?"
 	local target = (entry.levelBefore or 1) + 1
-	local rawPos = Vector3.new(entry.pos.x, entry.pos.y, entry.pos.z)
-	local pos = applyOffset(rawPos)
-	for attempt = 1, 15 do
-		if Macro.StopFlag or matchEnded() then return end
-		local tower = findOwnTowerNear(pos, 1.5)
-		if not tower then
-			warn("[Macro] апгрейд: башня "..name.." не найдена ("..string.format("%.0f,%.0f,%.0f", pos.X, pos.Y, pos.Z)..") — пропускаю шаг до L"..target)
-			return
+	local pos = applyOffset(Vector3.new(entry.pos.x, entry.pos.y, entry.pos.z))
+	if Macro.StopFlag or matchEnded() then return "done" end
+	local tower = findOwnTowerNear(pos, 1.5)
+	if not tower then
+		if os.clock() - (entry._since or os.clock()) > 90 then
+			warn("[Macro] апгрейд: башня "..name.." так и не встала — пропускаю шаг до L"..target)
+			return "done"
 		end
-		local level = tower.Level or 1
-		if level >= target then return end -- уже на нужном уровне (прошлые шаги/катка)
-		local price = getUpgradePrice(tower.Name or name, level)
-		if price == nil and getTowerConfig() then
-			-- конфиг есть, а цены для этого уровня нет — выше максимума
-			print(string.format("[Macro] %s: шаг L%d→L%d отсутствует в конфиге — пропускаю (макс. уровень?)", name, level, target))
-			return
-		end
-		if not waitMoneyAtLeast(price, string.format("Upgrade %s L%d→L%d", name, level, target)) then return end
-		fireRemote("TowerUpgrade", { Id = tower.Id })
-		local up = false
-		for _ = 1, 40 do -- до ~10с проверяю, что уровень рос (сервер применяет с задержкой)
-			task.wait(0.25)
-			if Macro.StopFlag or matchEnded() then return end
-			local t2 = findOwnTowerNear(pos, 1.5)
-			if t2 and (t2.Level or 1) > level then up = true break end
-		end
-		if up then
-			local cur = findOwnTowerNear(pos, 1.5)
-			local lv = cur and (cur.Level or (level + 1)) or (level + 1)
-			if lv >= target then
-				print(string.format("[Macro] %s → L%d", name, target))
-			end
-			-- цель не достигнута — следующий проход цикла докачает
-		else
-			warn(string.format("[Macro] %s: сервер не применил L%d→L%d (попытка %d)", name, level, target, attempt))
-			task.wait(1.2)
-		end
+		return "wait"
 	end
-	warn("[Macro] апгрейд не прошёл: "..name.." → L"..target)
+	local level = tower.Level or 1
+	if level >= target then return "done" end
+	local price = getUpgradePrice(tower.Name or name, level)
+	if price == nil and getTowerConfig() then
+		print(string.format("[Macro] %s: шаг L%d→L%d отсутствует в конфиге — пропускаю (макс. уровень?)", name, level, target))
+		return "done"
+	end
+	if price and Macro.GetMoney() < price then return "wait" end
+	fireRemote("TowerUpgrade", { Id = tower.Id })
+	entry._tries = (entry._tries or 0) + 1
+	entry._cd = os.clock() + 1.5
+	if entry._tries >= 15 then
+		warn("[Macro] апгрейд не прошёл: "..name.." → L"..target)
+		return "done"
+	end
+	return "wait"
 end
 
 local function recordAction(rmName, args)
@@ -1235,17 +1224,38 @@ function Macro.Play()
 	end
 
 	if not timed then
-		-- replay идёт строго по порядку записи — фоновый автоапгрейд мешал бы
+		-- replay идёт строго по порядку записи — фоновый автоапгрейд мешал бы;
+		-- прокачки идут в отдельной eager-очереди: тратятся сразу, как хватает денег
 		if Macro.AutoUpgrade then
 			Macro.SetAutoUpgrade(false)
 			print("[Macro] Smart Upgrade выкл на время replay (включится после отработки записи)")
 		end
 	end
 
+	local pendingUpg = {}
+	if not timed then
+		track(function()
+			while not Macro.StopFlag and not matchEnded() and (#pendingUpg > 0 or Macro.Playing) do
+				if #pendingUpg == 0 then
+					task.wait(0.15)
+				else
+					local e = pendingUpg[1]
+					local r = "wait"
+					pcall(function() r = tryUpgradeNow(e) end)
+					if r == "done" then
+						table.remove(pendingUpg, 1)
+					else
+						task.wait(0.15)
+					end
+				end
+			end
+		end)
+	end
+
 	if timed then
 		print("[Macro] === PLAYBACK START: "..#Macro.Actions.." actions (по таймеру записи) ===")
 	else
-		print("[Macro] === PLAYBACK START: "..#Macro.Actions.." actions (replay: порядок записи + ожидание денег) ===")
+		print("[Macro] === PLAYBACK START: "..#Macro.Actions.." actions (replay: постройки по порядку, апгрейды — сразу как хватает денег) ===")
 	end
 
 	local lastT = 0
@@ -1276,10 +1286,11 @@ function Macro.Play()
 					replayPlace(entry)
 				end
 			elseif entry.type == "TowerUpgrade" then
-				-- replay-режим: повторяем ТОТ шаг прокачки, что был при записи,
-				-- в том же порядке — перемежаясь с постройками, как ты играл руками
+				-- replay-режим: прокачки не блокируют очередь — их качает
+				-- фоновая eager-очередь в момент, когда появляются деньги
 				if not timed then
-					replayUpgrade(entry)
+					entry._since = os.clock()
+					pendingUpg[#pendingUpg + 1] = entry
 				end
 			elseif entry.type == "WaveSkip" then
 				Macro.SkipWave()
@@ -1347,6 +1358,19 @@ local function getCandy()
 			local n = parseDigits(label.Text)
 			if n then return n end
 		end
+		-- универсальный поиск: любой фрейм с "candy" в имени рядом со Stats
+		if other then
+			for _, c in ipairs(other:GetChildren()) do
+				if tostring(c.Name):lower():find("candy") then
+					for _, d in ipairs(c:GetDescendants()) do
+						if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Visible then
+							local n = parseDigits(d.Text)
+							if n then return n end
+						end
+					end
+				end
+			end
+		end
 	end
 	local hud = pg:FindFirstChild("HUD")
 	local cur = hud and hud:FindFirstChild("Currencies")
@@ -1365,11 +1389,38 @@ local function parseDurationText(text)
 	return nil
 end
 
+-- Конфеты на финальном экране: FrameCandy_Clone содержит строки наград,
+-- где Mode = "Match Won (Candy)", а сумма лежит в CoinAmount
+local function candyFromStats(stats)
+	local earned, found = 0, false
+	for _, d in ipairs(stats:GetDescendants()) do
+		if d:IsA("Frame") and tostring(d.Name):lower():find("candy") then
+			for _, row in ipairs(d:GetDescendants()) do
+				if row:IsA("Frame") and row.Visible then
+					local mode = row:FindFirstChild("Mode")
+					local coin = row:FindFirstChild("CoinAmount")
+					if mode and coin and mode.Visible and coin.Visible then
+						local mt = tostring(mode.Text or "")
+						if mt:lower():find("candy") then
+							local n = parseDigits(coin.Text)
+							if n then
+								earned = earned + n
+								found = true
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	return found and earned or nil
+end
+
 local function parseCoins(final)
 	local content = final:FindFirstChild("Content")
 	local stats = content and content:FindFirstChild("Stats")
 	if not stats then return nil, "" end
-	local rawParts, sum, largest, candySum = {}, 0, nil, nil
+	local rawParts, sum, largest = {}, 0, nil
 	for _, d in ipairs(stats:GetDescendants()) do
 		if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Visible then
 			local t = d.Text or ""
@@ -1377,10 +1428,7 @@ local function parseCoins(final)
 				rawParts[#rawParts + 1] = d.Name.."="..t
 				local plus = tonumber(t:match("^%+(%d+)"))
 				local plain = tonumber(t:match("(%d+)"))
-				local isCandy = d.Name:lower():find("candy") ~= nil
-				if plus and isCandy then
-					candySum = (candySum or 0) + plus
-				elseif plus then
+				if plus then
 					sum = sum + plus
 				elseif plain and (not largest or plain > largest) then
 					largest = plain
@@ -1391,6 +1439,10 @@ local function parseCoins(final)
 	local dump = table.concat(rawParts, " | ")
 	print("[Macro] FinalUI Stats dump: "..dump)
 	local coins = (sum > 0) and sum or largest
+	local candySum = candyFromStats(stats)
+	if candySum then
+		print("[Macro] Конфеты за катку: "..tostring(candySum))
+	end
 	return coins, dump, candySum
 end
 
@@ -1641,6 +1693,24 @@ local function pivotInto(model)
 	local char = LocalPlayer.Character
 	local hrp = char and char:FindFirstChild("HumanoidRootPart")
 	if not (part and hrp) then return false end
+	if Macro.Settings.WalkToElevator ~= false then
+		local hum = char:FindFirstChildOfClass("Humanoid")
+		if hum and hum.Health > 0 then
+			local t0 = os.clock()
+			local lastMove = 0
+			while os.clock() - t0 < 10 do
+				if Macro.StopFlag or not model.Parent then break end
+				local dist = (hrp.Position - part.Position).Magnitude
+				if dist < 6 then return true end
+				if os.clock() - lastMove > 1.2 then
+					lastMove = os.clock()
+					hum:MoveTo(part.Position)
+				end
+				task.wait(0.12)
+			end
+			return (hrp.Position - part.Position).Magnitude < 12
+		end
+	end
 	hrp.CFrame = part.CFrame
 	return true
 end
@@ -1889,6 +1959,9 @@ applyConfigToUI = function()
 			end
 			if Toggles.ElevatorSpeedToggle then
 				Toggles.ElevatorSpeedToggle:SetValue(Macro.Settings.ElevatorSpeedMod ~= false)
+			end
+			if Toggles.WalkToElevatorToggle then
+				Toggles.WalkToElevatorToggle:SetValue(Macro.Settings.WalkToElevator == true)
 			end
 			if Toggles.TradeHelperToggle then
 				Toggles.TradeHelperToggle:SetValue(Macro.Settings.TradeHelper ~= false)
@@ -2237,7 +2310,7 @@ local function makeUI()
 
 	SettingsBox:AddToggle("PlaceByTimer", {
 		Text = "Ставить башни по таймеру",
-		Tooltip = "ВЫКЛ (по умолч.): повторяет запись шаг за шагом и ждёт, пока накопятся деньги. ВКЛ: ставит башни по времени из записи — быстрее, но денег может не хватить",
+		Tooltip = "ВЫКЛ (по умолч.): постройки повторяются по порядку записи, а прокачки тратятся сразу, как хватает денег. ВКЛ: всё по таймеру записи — быстрее, но денег может не хватить",
 		Default = Macro.Settings.PlaceByTimer == true,
 		Callback = function(v)
 			Macro.Settings.PlaceByTimer = v
@@ -2327,6 +2400,17 @@ local function makeUI()
 			Macro.Settings.ElevatorSpeedMod = v
 			saveConfig()
 			print("[Macro] Лифт Speed x2 = "..tostring(v))
+		end,
+	})
+
+	FarmBox:AddToggle("WalkToElevatorToggle", {
+		Text = "Ходить до лифта пешком",
+		Tooltip = "Вместо мгновенного телепорта внутрь — идёт туда пешком. Медленнее, но выглядит как обычная игра",
+		Default = Macro.Settings.WalkToElevator == true,
+		Callback = function(v)
+			Macro.Settings.WalkToElevator = v
+			saveConfig()
+			print("[Macro] Ходьба до лифта = "..tostring(v))
 		end,
 	})
 
