@@ -249,6 +249,11 @@ local st = {
 	allyList = "villanarc, blaster tank, cam turret, attacker drone, missile rocket, [ ai ], [ai, camera drone, skibidifriend, speaker pulse tank",
 	m1 = true,
 	m1Spam = false,
+	silentAim = false,
+	silentAimRate = 0.05,
+	astroCounter = true,
+	astroAwayDistance = 150,
+	astroNames = "Astro Entrapper",
 	skills = false,
 	skillCombatList = "SoundWave | SoundWave_Cooldown | SoundImprovement\nSwing | Swing_Cooldown",
 	skillWaveList = "SpeakerCarrier | SpeakerCarrier_Cooldown\nBuffSpeakerMan | Buff_Cooldown",
@@ -272,11 +277,12 @@ local st = {
 	titanSpeed = 1200,
 	titanRadius = 40,
 	titanOrbitDeg = 180,
-	titanFeetOffset = 58.4,
+	titanFeetOffset = 0,
 	titanPriority = "",
 	titanAutoRequest = true,
 	titanRequestWave = 1,
 	titanShopItem = "Titan-Request",
+	titanRequestRemote = "RequestTitan",
 	titanPreset = "Titan TV",
 	titanPrice = 2200,
 	titanM1 = true,
@@ -313,8 +319,8 @@ local st = {
 	masteryDefault = 80,
 	masteryDelay = 3,
 	god = false,
-	godHP = 800,
-	godSkipTimer0 = true,
+	godHP = 5,
+	godSkipTimer0 = false,
 	antiAfk = true,
 	lowGfx = false,
 	noShadow = false,
@@ -325,7 +331,11 @@ local st = {
 	webhookUrl = "",
 	webhookDelay = 60,
 	healTry = 12,
+	skillTreeAuto = false,
+	autoSave = true,
 }
+
+_G.__RATHUB_ST = st
 
 local WEBHOOK_FILE = "RATHUB_webhook.cfg"
 
@@ -362,6 +372,7 @@ local angleInit = false
 local lastHrp = nil
 local mobs = {}
 local isHealing = false
+local healBusy = false
 local healRequested = false
 local lastHealT = 0
 local resetDone = false
@@ -376,9 +387,41 @@ local titanRequestUsed = false
 -- the moment of becoming titan => everything works afterwards)
 local transformQuietUntil = 0
 
+-- titan forms add a script named like "TitanCameraScript"/"TitanTVScript"
+-- to the character. ValuesFolder.UsingTitan is NOT a titan flag: it stays
+-- false in Titan Camera form (verified in-game), so relying on it broke the
+-- whole titan branch.
+local function titanFormScript(ch)
+	if not ch then
+		return nil
+	end
+	for _, c in ipairs(ch:GetChildren()) do
+		if (c:IsA("Script") or c:IsA("LocalScript")) then
+			local n = c.Name:lower()
+			if n:find("titan", 1, true) and n:find("script", 1, true) then
+				return c
+			end
+		end
+	end
+	return nil
+end
+
+-- the game itself treats "ValuesFolder.UsingTitan exists" as titan form
+-- (its VALUE is false for Titan Camera, so never compare it to true)
 local function isTitanForm()
 	local ch = lp.Character
-	return ch ~= nil and ch:FindFirstChild("TitanTVScript") ~= nil
+	if not ch then
+		return false
+	end
+	local vf = ch:FindFirstChild("ValuesFolder")
+	if vf and vf:FindFirstChild("UsingTitan") then
+		return true
+	end
+	if titanFormScript(ch) then
+		return true
+	end
+	local hrp = ch:FindFirstChild("HumanoidRootPart")
+	return hrp ~= nil and hrp.Size.Y >= 8
 end
 
 -- titan farm includes the normal farm: regular character until the request
@@ -433,7 +476,7 @@ end
 
 local function parseSkillList(text)
 	local out = {}
-	for line in tostring(text or ""):gmatch("[^\r\n]+") do
+	for line in tostring(text or ""):gmatch("[^\r\n;]+") do
 		local cleaned = line:gsub("^%s+", ""):gsub("%s+$", "")
 		if cleaned ~= "" and cleaned:sub(1, 1) ~= "#" then
 			local parts = {}
@@ -491,7 +534,7 @@ end
 local function runSkillNext(list, char, cdf, busy, from)
 	local n = #list
 	if n == 0 then
-		return from
+		return from, false
 	end
 	if type(from) ~= "number" or from < 1 or from > n then
 		from = 1
@@ -504,7 +547,9 @@ local function runSkillNext(list, char, cdf, busy, from)
 			local ok = not busy
 			if ok and s.cooldown then
 				local cd = cdf and cdf:FindFirstChild(s.cooldown)
-				if cd and cd.Value == true then
+				-- cooldown must exist: protects against stale/wrong preset
+				-- entries firing every tick
+				if not cd or cd.Value == true then
 					ok = false
 				end
 			end
@@ -515,11 +560,11 @@ local function runSkillNext(list, char, cdf, busy, from)
 				pcall(function()
 					rem:FireServer(table.unpack(s.args))
 				end)
-				return i % n + 1
+				return i % n + 1, true, s
 			end
 		end
 	end
-	return from
+	return from, false, nil
 end
 
 local function yawTo(pos, at)
@@ -662,8 +707,9 @@ end
 
 bootSet("building UI...")
 
+do
 local Window = ele(WindUI, "CreateWindow", {
-	Title = "RATHUB | Blockade",
+	Title = "RATHUB | Blockade 1.5",
 	Folder = "RATHUB-Blockade",
 	Icon = "star",
 	Size = UDim2.fromOffset(700, 520),
@@ -695,6 +741,51 @@ pcall(function()
 	Window:SetToggleKey(Enum.KeyCode.M)
 end)
 
+local CONFIG_NAME = "STBB15"
+local Config
+if Window.ConfigManager then
+	local okCfg, cfg = pcall(function()
+		return Window.ConfigManager:CreateConfig(CONFIG_NAME, false)
+	end)
+	if okCfg and cfg then
+		Config = cfg
+		_G.__STBB15_CONFIG = Config
+	end
+end
+
+-- WindUI's own Load ignores an existing file in some versions, so apply the
+-- saved element values directly through each element's Set/Select
+local function applySavedConfig()
+	if not Config then
+		return false
+	end
+	local ok, data = pcall(function()
+		return game:GetService("HttpService"):JSONDecode(readfile(Config.Path))
+	end)
+	if not ok or type(data) ~= "table" or type(data.__elements) ~= "table" then
+		return false
+	end
+	for key, d in pairs(data.__elements) do
+		local el = Config.Elements[key]
+		if el and type(d) == "table" then
+			pcall(function()
+				if d.__type == "Dropdown" then
+					if el.Select then
+						el:Select(d.value)
+					end
+				elseif d.__type == "Slider" then
+					if el.Set then
+						el:Set(tonumber(d.value) or d.value)
+					end
+				elseif el.Set then
+					el:Set(d.value)
+				end
+			end)
+		end
+	end
+	return true
+end
+
 local FarmTab = ele(Window, "Tab", { Title = "Farm", Icon = "crosshair", Border = true })
 local AstroTab = ele(Window, "Tab", { Title = "Astro", Icon = "star", Border = true })
 local TitansTab = ele(Window, "Tab", { Title = "Farm titans", Icon = "crown", Border = true })
@@ -721,6 +812,7 @@ farmToggle = ele(FarmSec, "Toggle", {
 	end,
 })
 ele(FarmSec, "Keybind", {
+	Flag = "cfg1",
 	Title = "Бинд для фарма",
 	Value = "X",
 	Callback = function()
@@ -730,6 +822,7 @@ ele(FarmSec, "Keybind", {
 	end,
 })
 ele(FarmSec, "Slider", {
+	Flag = "cfg2",
 	Title = "Скорость полёта типа",
 	Step = 25,
 	Value = { Min = 100, Max = 4000, Default = 600 },
@@ -738,6 +831,7 @@ ele(FarmSec, "Slider", {
 	end,
 })
 ele(FarmSec, "Slider", {
+	Flag = "cfg3",
 	Title = "Радиус орбиты",
 	Step = 1,
 	Value = { Min = 3, Max = 40, Default = 10 },
@@ -746,6 +840,7 @@ ele(FarmSec, "Slider", {
 	end,
 })
 ele(FarmSec, "Slider", {
+	Flag = "cfg4",
 	Title = "Скорость орбиты",
 	Step = 1,
 	Value = { Min = 10, Max = 360, Default = 90 },
@@ -754,6 +849,7 @@ ele(FarmSec, "Slider", {
 	end,
 })
 ele(FarmSec, "Input", {
+	Flag = "cfg5",
 	Title = "Приоритет на атаку",
 	Value = "G-Toilet 3.0",
 	Placeholder = "name1, name2",
@@ -762,6 +858,7 @@ ele(FarmSec, "Input", {
 	end,
 })
 ele(FarmSec, "Toggle", {
+	Flag = "cfg6",
 	Title = "М1 спам",
 	Desc = "Название само за себя говорит",
 	Value = true,
@@ -770,6 +867,7 @@ ele(FarmSec, "Toggle", {
 	end,
 })
 ele(FarmSec, "Toggle", {
+	Flag = "cfg7",
 	Title = "М1 спам второй эдишен",
 	Value = false,
 	Callback = function(v)
@@ -779,6 +877,7 @@ ele(FarmSec, "Toggle", {
 
 local SkillSec = ele(FarmTab, "Section", { Title = "Auto Skills (remote)" })
 ele(SkillSec, "Toggle", {
+	Flag = "cfg8",
 	Title = "Авто скиллы",
 	Value = false,
 	Callback = function(v)
@@ -799,6 +898,7 @@ local SKILL_PRESETS = {
 	},
 }
 ele(SkillSec, "Dropdown", {
+	Flag = "cfg9",
 	Title = "Пресеты",
 	Desc = "Fills combat / wave / wave list below",
 	Values = { "Dark Speaker (default)", "Speaker Strider" },
@@ -829,6 +929,7 @@ ele(SkillSec, "Dropdown", {
 	end,
 })
 skillCombatInput = ele(SkillSec, "Input", {
+	Flag = "cfg10",
 	Title = "Комбат скиллы",
 	Desc = "Remote | Cooldown | RequireChild | args  (one per line)",
 	Type = "Textarea",
@@ -838,6 +939,7 @@ skillCombatInput = ele(SkillSec, "Input", {
 	end,
 })
 skillWaveInput = ele(SkillSec, "Input", {
+	Flag = "cfg11",
 	Title = "Скиллы на определенных волнах",
 	Desc = "Fired on waves from the wave list",
 	Type = "Textarea",
@@ -846,13 +948,16 @@ skillWaveInput = ele(SkillSec, "Input", {
 		st.skillWaveList = v
 	end,
 })
-ele(SkillSec, "Toggle", { Title = "Во время М1 не юзать абилку", Value = true, Callback = function(v)
+ele(SkillSec, "Toggle", {
+	Flag = "cfg12", Title = "Во время М1 не юзать абилку", Value = true, Callback = function(v)
 	st.skillBusy = v
 end })
-ele(SkillSec, "Toggle", { Title = "Юзать абилку только во время орбиты", Value = false, Callback = function(v)
+ele(SkillSec, "Toggle", {
+	Flag = "cfg13", Title = "Юзать абилку только во время орбиты", Value = false, Callback = function(v)
 	st.skillOrbitOnly = v
 end })
 ele(SkillSec, "Slider", {
+	Flag = "cfg14",
 	Title = "Интервал спама",
 	Step = 0.05,
 	Value = { Min = 0.05, Max = 2, Default = 0.3 },
@@ -861,6 +966,7 @@ ele(SkillSec, "Slider", {
 	end,
 })
 skillWaveListInput = ele(SkillSec, "Input", {
+	Flag = "cfg15",
 	Title = "Волна на которых абилка типа",
 	Value = "2,9,17,26,29,30,31",
 	Callback = function(v)
@@ -868,9 +974,65 @@ skillWaveListInput = ele(SkillSec, "Input", {
 	end,
 })
 
+do
+local AimSec = ele(FarmTab, "Section", { Title = "Silent Aim" })
+ele(AimSec, "Toggle", {
+	Flag = "cfg16",
+	Title = "Silent Aim",
+	Desc = "Отправляет MouseStream в цель: для стрелков и парного фарма",
+	Value = false,
+	Callback = function(v)
+		st.silentAim = v
+		if not v and st._clearAim then
+			st._clearAim()
+		end
+	end,
+})
+ele(AimSec, "Slider", {
+	Flag = "cfg17",
+	Title = "Silent Aim rate",
+	Step = 10,
+	Value = { Min = 20, Max = 200, Default = 50 },
+	Callback = function(v)
+		st.silentAimRate = v / 1000
+	end,
+})
+
+local EntSec = ele(FarmTab, "Section", { Title = "Контра Astro Entrapper" })
+ele(EntSec, "Toggle", {
+	Flag = "cfg18",
+	Title = "Контра Astro Entrapper",
+	Desc = "Когда босс включает UsingMagnet: отлетать от него",
+	Value = true,
+	Callback = function(v)
+		st.astroCounter = v
+	end,
+})
+ele(EntSec, "Slider", {
+	Flag = "cfg19",
+	Title = "Дистанция отлёта",
+	Step = 10,
+	Value = { Min = 40, Max = 400, Default = 150 },
+	Callback = function(v)
+		st.astroAwayDistance = v
+	end,
+})
+ele(EntSec, "Input", {
+	Flag = "cfg20",
+	Title = "Имена боссов",
+	Value = "Astro Entrapper",
+	Placeholder = "Astro Entrapper",
+	Callback = function(v)
+		st.astroNames = v
+	end,
+})
+end
+
 local HealSec = ele(FarmTab, "Section", { Title = "Auto Heal" })
 ele(HealSec, "Toggle", {
-	Title = "Авто хил (мне лень эту хуйню фиксить)",
+	Flag = "cfg21",
+	Title = "Авто хил",
+	Desc = "Покупает FillHP на вертолёте",
 	Value = false,
 	Callback = function(v)
 		st.heal = v
@@ -880,6 +1042,7 @@ ele(HealSec, "Toggle", {
 	end,
 })
 ele(HealSec, "Slider", {
+	Flag = "cfg22",
 	Title = "Хилится ниже хп",
 	Step = 1,
 	Value = { Min = 1, Max = 100, Default = 100 },
@@ -888,6 +1051,7 @@ ele(HealSec, "Slider", {
 	end,
 })
 ele(HealSec, "Slider", {
+	Flag = "cfg23",
 	Title = "Попытатся похилится",
 	Desc = "Спамит хиллом по интервалу",
 	Step = 1,
@@ -909,6 +1073,7 @@ ele(LootSec, "Toggle", {
 	end,
 })
 ele(LootSec, "Slider", {
+	Flag = "cfg24",
 	Title = "Вещь, которой никогда пользоватся не буду",
 	Step = 50,
 	Value = { Min = 25, Max = 2000, Default = 1000 },
@@ -917,6 +1082,7 @@ ele(LootSec, "Slider", {
 	end,
 })
 ele(LootSec, "Slider", {
+	Flag = "cfg25",
 	Title = "Тоже бесполезно",
 	Step = 5,
 	Value = { Min = 10, Max = 300, Default = 35 },
@@ -927,6 +1093,7 @@ ele(LootSec, "Slider", {
 
 local ResetSec = ele(FarmTab, "Section", { Title = "Reset wave" })
 ele(ResetSec, "Toggle", {
+	Flag = "cfg26",
 	Title = "На какой волне ресет",
 	Value = false,
 	Callback = function(v)
@@ -937,6 +1104,7 @@ ele(ResetSec, "Toggle", {
 	end,
 })
 ele(ResetSec, "Slider", {
+	Flag = "cfg27",
 	Title = "Волна на которой ресетнутся",
 	Step = 1,
 	Value = { Min = 1, Max = 200, Default = 5 },
@@ -948,6 +1116,7 @@ ele(ResetSec, "Slider", {
 local GodSec = ele(FarmTab, "Section", { Title = "Холи бессмертие" })
 local godToggle
 godToggle = ele(GodSec, "Toggle", {
+	Flag = "cfg28",
 	Title = "Ресет до смерти (бог режим крч)",
 	Desc = "Ну типа хазе",
 	Value = false,
@@ -957,15 +1126,17 @@ godToggle = ele(GodSec, "Toggle", {
 	end,
 })
 ele(GodSec, "Slider", {
+	Flag = "cfg29",
 	Title = "Тут типо на какой шкале хп ресетать",
 	Desc = "Хорни кроссточкапнг",
 	Step = 1,
-	Value = { Min = 1, Max = 10000, Default = 800 },
+	Value = { Min = 1, Max = 10000, Default = 5 },
 	Callback = function(v)
 		st.godHP = v
 	end,
 })
 ele(GodSec, "Keybind", {
+	Flag = "cfg30",
 	Title = "Респаун",
 	Value = "R",
 	Callback = function()
@@ -984,6 +1155,23 @@ ele(GodSec, "Keybind", {
 		end)
 	end,
 })
+
+do
+local SkillTreeSec = ele(FarmTab, "Section", { Title = "Skill Tree" })
+ele(SkillTreeSec, "Toggle", {
+	Flag = "cfg31",
+	Title = "Авто-покупка Skill Tree",
+	Desc = "Покупает доступные ноды текущего персонажа за MoneysInShop",
+	Value = false,
+	Callback = function(v)
+		st.skillTreeAuto = v
+	end,
+})
+st._skillTreeLabel = ele(SkillTreeSec, "Paragraph", {
+	Title = "Skill Tree",
+	Desc = "idle",
+})
+end
 
 local AstroSec = ele(AstroTab, "Section", { Title = "Астро токены авто-фап" })
 ele(AstroSec, "Paragraph", {
@@ -1005,6 +1193,7 @@ astroToggle = ele(AstroSec, "Toggle", {
 	end,
 })
 ele(AstroSec, "Keybind", {
+	Flag = "cfg32",
 	Title = "Бинд",
 	Value = "K",
 	Callback = function()
@@ -1014,6 +1203,7 @@ ele(AstroSec, "Keybind", {
 	end,
 })
 ele(AstroSec, "Slider", {
+	Flag = "cfg33",
 	Title = "Скорость полёта",
 	Step = 10,
 	Value = { Min = 100, Max = 2000, Default = 600 },
@@ -1022,6 +1212,7 @@ ele(AstroSec, "Slider", {
 	end,
 })
 ele(AstroSec, "Toggle", {
+	Flag = "cfg34",
 	Title = "Только вантуз: Авто-хил с помощью декларации",
 	Value = true,
 	Callback = function(v)
@@ -1029,6 +1220,7 @@ ele(AstroSec, "Toggle", {
 	end,
 })
 ele(AstroSec, "Input", {
+	Flag = "cfg35",
 	Title = "Не пользуйся этим, я хз зачем добавил",
 	Desc = "Paste Vector3 lines from pos_copier. Leave empty to use default 9 points.",
 	Type = "Textarea",
@@ -1039,6 +1231,7 @@ ele(AstroSec, "Input", {
 	end,
 })
 ele(AstroSec, "Toggle", {
+	Flag = "cfg36",
 	Title = "Год мод (я хз вроде норм работает)",
 	Desc = "пизда",
 	Value = false,
@@ -1048,18 +1241,20 @@ ele(AstroSec, "Toggle", {
 	end,
 })
 ele(AstroSec, "Slider", {
+	Flag = "cfg37",
 	Title = "Год мод слайдер хп",
 	Desc = "Шэрит",
 	Step = 1,
-	Value = { Min = 1, Max = 10000, Default = 100 },
+	Value = { Min = 1, Max = 10000, Default = 5 },
 	Callback = function(v)
 		st.godHP = v
 	end,
 })
 ele(AstroSec, "Toggle", {
-	Title = "Бессмертие не будет работать после 20 секунд",
-	Desc = "Это засейвит твой токен я думаю",
-	Value = true,
+	Flag = "cfg38",
+	Title = "Не ресетать первые 20 сек волны",
+	Desc = "Полезно для Astro-токенов",
+	Value = false,
 	Callback = function(v)
 		st.godSkipTimer0 = v
 	end,
@@ -1117,6 +1312,7 @@ titanToggle = ele(TitanSec, "Toggle", {
 	end,
 })
 ele(TitanSec, "Keybind", {
+	Flag = "cfg39",
 	Title = "Бинд",
 	Value = "B",
 	Callback = function()
@@ -1125,18 +1321,36 @@ ele(TitanSec, "Keybind", {
 		setToggle(titanToggle, nv)
 	end,
 })
+do
+local TITAN_FARM = {
+	["Titan TV"] = { radius = 40, item = "Titan-Request", remote = "RequestTitan", price = 2200 },
+	["Titan Cameraman"] = { radius = 45, item = "Titan-Request", remote = "RequestTitan", price = 2200 },
+}
+local titanRadiusSlider
 ele(TitanSec, "Dropdown", {
+	Flag = "cfg40",
 	Title = "Пресет титана",
-	Desc = "Скиллы и атаки настроены под него. Реквест одинаковый.",
+	Desc = "Оба пресета используют Titan-Request; какой титан призывается, задаётся в игре",
 	Values = { "Titan TV", "Titan Cameraman" },
 	Value = st.titanPreset,
 	Callback = function(v)
 		st.titanPreset = v
-		-- same request item for every titan
-		st.titanShopItem = "Titan-Request"
+		local farm = TITAN_FARM[v]
+		if farm then
+			st.titanShopItem = farm.item
+			st.titanRequestRemote = farm.remote
+			st.titanPrice = farm.price
+			st.titanRadius = farm.radius
+			pcall(function()
+				if titanRadiusSlider then
+					titanRadiusSlider:Set(farm.radius)
+				end
+			end)
+		end
 	end,
 })
 ele(TitanSec, "Slider", {
+	Flag = "cfg41",
 	Title = "Скорость",
 	Step = 50,
 	Value = { Min = 100, Max = 4000, Default = 1200 },
@@ -1144,7 +1358,8 @@ ele(TitanSec, "Slider", {
 		st.titanSpeed = v
 	end,
 })
-ele(TitanSec, "Slider", {
+titanRadiusSlider = ele(TitanSec, "Slider", {
+	Flag = "cfg42",
 	Title = "Орбита радиус",
 	Desc = "сирин пидор",
 	Step = 1,
@@ -1153,7 +1368,9 @@ ele(TitanSec, "Slider", {
 		st.titanRadius = v
 	end,
 })
+end
 ele(TitanSec, "Slider", {
+	Flag = "cfg43",
 	Title = "Орбита спид",
 	Desc = "шприц",
 	Step = 1,
@@ -1163,15 +1380,17 @@ ele(TitanSec, "Slider", {
 	end,
 })
 ele(TitanSec, "Slider", {
-	Title = "Это тебе не надо",
-	Desc = "ы",
-	Step = 0.1,
-	Value = { Min = 20, Max = 100, Default = 58.4 },
+	Flag = "cfg44",
+	Title = "Смещение ног (0 = авто)",
+	Desc = "Авто считается по модели титана; трогай только если проваливается",
+	Step = 0.5,
+	Value = { Min = 0, Max = 120, Default = 0 },
 	Callback = function(v)
 		st.titanFeetOffset = v
 	end,
 })
 ele(TitanSec, "Input", {
+	Flag = "cfg45",
 	Title = "По желанию, приоритет",
 	Value = "",
 	Placeholder = "name1, name2",
@@ -1180,6 +1399,7 @@ ele(TitanSec, "Input", {
 	end,
 })
 ele(TitanSec, "Toggle", {
+	Flag = "cfg46",
 	Title = "М1 атака",
 	Desc = "ы, я заебался",
 	Value = true,
@@ -1190,6 +1410,7 @@ ele(TitanSec, "Toggle", {
 
 local TitanSkillSec = ele(TitansTab, "Section", { Title = "Titan abilities" })
 ele(TitanSkillSec, "Toggle", {
+	Flag = "cfg47",
 	Title = "Авто абилки",
 	Value = true,
 	Callback = function(v)
@@ -1197,6 +1418,7 @@ ele(TitanSkillSec, "Toggle", {
 	end,
 })
 ele(TitanSkillSec, "Toggle", {
+	Flag = "cfg48",
 	Title = "Скиллы только во время орбиты",
 	Desc = "шкуллшутер",
 	Value = true,
@@ -1205,6 +1427,7 @@ ele(TitanSkillSec, "Toggle", {
 	end,
 })
 ele(TitanSkillSec, "Slider", {
+	Flag = "cfg49",
 	Title = "Интервал спама",
 	Step = 0.05,
 	Value = { Min = 0.05, Max = 2, Default = 0.35 },
@@ -1227,6 +1450,7 @@ ele(TitanReqSec, "Toggle", {
 	end,
 })
 ele(TitanReqSec, "Slider", {
+	Flag = "cfg50",
 	Title = "На какой волне покупать (не юзать)",
 	Desc = "алах акбар",
 	Step = 1,
@@ -1236,6 +1460,7 @@ ele(TitanReqSec, "Slider", {
 	end,
 })
 ele(TitanReqSec, "Toggle", {
+	Flag = "cfg51",
 	Title = "Авто-покупок колонок титану тв",
 	Desc = "абвговно",
 	Value = true,
@@ -1244,6 +1469,7 @@ ele(TitanReqSec, "Toggle", {
 	end,
 })
 ele(TitanReqSec, "Slider", {
+	Flag = "cfg52",
 	Title = "Ресетатся на какой то волне",
 	Desc = "0 значит вырублено",
 	Step = 1,
@@ -1254,10 +1480,12 @@ ele(TitanReqSec, "Slider", {
 })
 
 local LobbySec = ele(LobbyTab, "Section", { Title = "Auto Lobby" })
-ele(LobbySec, "Toggle", { Title = "Авто-голосование", Value = false, Callback = function(v)
+ele(LobbySec, "Toggle", {
+	Flag = "cfg53", Title = "Авто-голосование", Value = false, Callback = function(v)
 	st.vote = v
 end })
 ele(LobbySec, "Dropdown", {
+	Flag = "cfg54",
 	Title = "За какой мод голосовать",
 	Values = MODES,
 	Value = idxOf(MODES, "Astro"),
@@ -1265,13 +1493,15 @@ ele(LobbySec, "Dropdown", {
 		st.voteMode = v
 	end,
 })
-ele(LobbySec, "Toggle", { Title = "Авто-рейди", Value = false, Callback = function(v)
+ele(LobbySec, "Toggle", {
+	Flag = "cfg55", Title = "Авто-рейди", Value = false, Callback = function(v)
 	st.ready = v
 end })
 
 local MasterySec = ele(MasteryTab, "Section", { Title = "Путь мастери" })
 local masteryToggle
 masteryToggle = ele(MasterySec, "Toggle", {
+	Flag = "cfg56",
 	Title = "Авто поменка перса",
 	Desc = "Как одного персонажа докачает до определенного уровня, перейдёт на другого",
 	Value = false,
@@ -1284,6 +1514,7 @@ masteryToggle = ele(MasterySec, "Toggle", {
 	end,
 })
 ele(MasterySec, "Keybind", {
+	Flag = "cfg57",
 	Title = "Переключить путь мастери",
 	Value = "P",
 	Callback = function()
@@ -1295,6 +1526,7 @@ ele(MasterySec, "Keybind", {
 	end,
 })
 ele(MasterySec, "Input", {
+	Flag = "cfg58",
 	Title = "Не юзай это",
 	Desc = "Бабах",
 	Type = "Textarea",
@@ -1304,6 +1536,7 @@ ele(MasterySec, "Input", {
 	end,
 })
 ele(MasterySec, "Slider", {
+	Flag = "cfg59",
 	Title = "Какое мастери обычно таргетить",
 	Step = 5,
 	Value = { Min = 10, Max = 200, Default = 80 },
@@ -1312,6 +1545,7 @@ ele(MasterySec, "Slider", {
 	end,
 })
 ele(MasterySec, "Slider", {
+	Flag = "cfg60",
 	Title = "Проверять интервал в секунду",
 	Step = 1,
 	Value = { Min = 1, Max = 30, Default = 3 },
@@ -1336,6 +1570,7 @@ gachaToggle = ele(GachaSec, "Toggle", {
 	end,
 })
 ele(GachaSec, "Keybind", {
+	Flag = "cfg61",
 	Title = "Переключить дэп",
 	Value = "L",
 	Callback = function()
@@ -1344,10 +1579,12 @@ ele(GachaSec, "Keybind", {
 		setToggle(gachaToggle, nv)
 	end,
 })
-ele(GachaSec, "Toggle", { Title = "Тоже переключить дэп", Value = false, Callback = function(v)
+ele(GachaSec, "Toggle", {
+	Flag = "cfg62", Title = "Тоже переключить дэп", Value = false, Callback = function(v)
 	st.gachaAuto = v
 end })
 ele(GachaSec, "Toggle", {
+	Flag = "cfg63",
 	Title = "Скипать хуйню с открытием",
 	Desc = "фыв",
 	Value = true,
@@ -1359,6 +1596,7 @@ ele(GachaSec, "Toggle", {
 	end,
 })
 ele(GachaSec, "Dropdown", {
+	Flag = "cfg64",
 	Title = "Метод скипа",
 	Desc = "сирин не умеет делать шансы",
 	Values = { "Multi (all)", "Click only", "Firesignal only", "Anim break", "Speed hack" },
@@ -1375,6 +1613,7 @@ ele(GachaSec, "Dropdown", {
 	end,
 })
 ele(GachaSec, "Dropdown", {
+	Flag = "cfg65",
 	Title = "Страничка",
 	Values = { "Characters", "Skins" },
 	Value = 1,
@@ -1383,6 +1622,7 @@ ele(GachaSec, "Dropdown", {
 	end,
 })
 ele(GachaSec, "Dropdown", {
+	Flag = "cfg66",
 	Title = "Сколько крутить",
 	Values = { "1Spin", "10Spins", "100Spins", "1SpinLucky", "10SpinLucky" },
 	Value = idxOf({ "1Spin", "10Spins", "100Spins", "1SpinLucky", "10SpinLucky" }, "100Spins"),
@@ -1391,6 +1631,7 @@ ele(GachaSec, "Dropdown", {
 	end,
 })
 ele(GachaSec, "Slider", {
+	Flag = "cfg67",
 	Title = "Интервал дэпа",
 	Step = 0.05,
 	Value = { Min = 0.05, Max = 5, Default = 0.5 },
@@ -1399,6 +1640,7 @@ ele(GachaSec, "Slider", {
 	end,
 })
 ele(GachaSec, "Slider", {
+	Flag = "cfg68",
 	Title = "Сколько выкрутить (0 значит инф)",
 	Step = 1,
 	Value = { Min = 0, Max = 1000, Default = 0 },
@@ -1417,6 +1659,7 @@ local SKIN_OPTIONS = {
 }
 
 ele(GachaSec, "Toggle", {
+	Flag = "cfg69",
 	Title = "Дэпать из списка",
 	Desc = "Если выбранный скин повляется в стоке, то будет депать пока не выбьет его",
 	Value = false,
@@ -1430,6 +1673,7 @@ ele(GachaSec, "Toggle", {
 	end,
 })
 ele(GachaSec, "Dropdown", {
+	Flag = "cfg70",
 	Title = "Какие скины хатите палучить?",
 	Desc = "изи",
 	Values = SKIN_OPTIONS,
@@ -1501,6 +1745,7 @@ ele(ShopSec, "Toggle", {
 	end,
 })
 ele(ShopSec, "Dropdown", {
+	Flag = "cfg71",
 	Title = "Что покупать",
 	Desc = "Multi-select. BSX2:30 = mastery 30min, BSX2:60 = mastery 60min.",
 	Values = SHOP_IDS,
@@ -1511,6 +1756,7 @@ ele(ShopSec, "Dropdown", {
 	end,
 })
 ele(ShopSec, "Slider", {
+	Flag = "cfg72",
 	Title = "Кол-во за предмет",
 	Step = 1,
 	Value = { Min = 1, Max = 50, Default = 1 },
@@ -1519,6 +1765,7 @@ ele(ShopSec, "Slider", {
 	end,
 })
 ele(ShopSec, "Slider", {
+	Flag = "cfg73",
 	Title = "В раз сколько покупать",
 	Desc = "ыыы",
 	Step = 1,
@@ -1552,6 +1799,7 @@ ele(BoostSec, "Toggle", {
 	end,
 })
 ele(BoostSec, "Dropdown", {
+	Flag = "cfg74",
 	Title = "Бустеры",
 	Desc = "Multi-select known boosters",
 	Values = BOOSTER_NAMES,
@@ -1562,6 +1810,7 @@ ele(BoostSec, "Dropdown", {
 	end,
 })
 ele(BoostSec, "Slider", {
+	Flag = "cfg75",
 	Title = "В раз сколько юзать бустер",
 	Step = 1,
 	Value = { Min = 5, Max = 300, Default = 30 },
@@ -1576,6 +1825,7 @@ local boostActiveInfo = ele(BoostSec, "Paragraph", {
 
 local SetSec = ele(SettingsTab, "Section", { Title = "Appearance" })
 ele(SetSec, "Keybind", {
+	Flag = "cfg76",
 	Title = "UI toggle key",
 	Value = "M",
 	Callback = function(v)
@@ -1588,6 +1838,7 @@ ele(SetSec, "Keybind", {
 	end,
 })
 ele(SetSec, "Slider", {
+	Flag = "cfg77",
 	Title = "Scale",
 	Step = 5,
 	Value = { Min = 70, Max = 130, Default = 100 },
@@ -1598,6 +1849,7 @@ ele(SetSec, "Slider", {
 	end,
 })
 ele(SetSec, "Toggle", {
+	Flag = "cfg78",
 	Title = "Panel background",
 	Value = true,
 	Callback = function(on)
@@ -1609,6 +1861,7 @@ ele(SetSec, "Toggle", {
 
 local AfkSec = ele(SettingsTab, "Section", { Title = "Anti AFK" })
 ele(AfkSec, "Toggle", {
+	Flag = "cfg79",
 	Title = "Anti AFK",
 	Desc = "Clears the idle state with VirtualUser (fires on Player.Idled)",
 	Value = true,
@@ -1622,6 +1875,7 @@ ele(AfkSec, "Toggle", {
 
 local OptSec = ele(SettingsTab, "Section", { Title = "Performance" })
 ele(OptSec, "Toggle", {
+	Flag = "cfg80",
 	Title = "Low graphics",
 	Desc = "Sets QualityLevel to 1 (minimum). Big FPS boost on weak GPUs.",
 	Value = false,
@@ -1634,6 +1888,7 @@ ele(OptSec, "Toggle", {
 	end,
 })
 ele(OptSec, "Toggle", {
+	Flag = "cfg81",
 	Title = "No shadows",
 	Desc = "Disables global shadows (Lighting.GlobalShadows)",
 	Value = false,
@@ -1646,6 +1901,7 @@ ele(OptSec, "Toggle", {
 	end,
 })
 ele(OptSec, "Toggle", {
+	Flag = "cfg82",
 	Title = "No fog",
 	Desc = "Removes fog rendering (FogEnd = huge)",
 	Value = false,
@@ -1665,6 +1921,7 @@ ele(OptSec, "Toggle", {
 	end,
 })
 ele(OptSec, "Toggle", {
+	Flag = "cfg83",
 	Title = "Strip particles",
 	Desc = "Hides ParticleEmitters and Beams in Workspace (visual only)",
 	Value = false,
@@ -1689,6 +1946,7 @@ ele(OptSec, "Toggle", {
 	end,
 })
 ele(OptSec, "Toggle", {
+	Flag = "cfg84",
 	Title = "FPS unlock",
 	Desc = "Removes frame rate cap via Rendering quality settings",
 	Value = false,
@@ -1707,6 +1965,7 @@ ele(OptSec, "Toggle", {
 
 local HookSec = ele(SettingsTab, "Section", { Title = "Webhook (Discord)" })
 ele(HookSec, "Input", {
+	Flag = "cfg85",
 	Title = "Webhook URL",
 	Desc = "https://discord.com/api/webhooks/...",
 	Value = st.webhookUrl,
@@ -1716,6 +1975,7 @@ ele(HookSec, "Input", {
 	end,
 })
 ele(HookSec, "Toggle", {
+	Flag = "cfg86",
 	Title = "Send status periodically",
 	Desc = "Character, wave, HP, money and inventory",
 	Value = st.webhook,
@@ -1728,6 +1988,7 @@ ele(HookSec, "Toggle", {
 	end,
 })
 ele(HookSec, "Slider", {
+	Flag = "cfg87",
 	Title = "Interval (sec)",
 	Step = 5,
 	Value = { Min = 10, Max = 600, Default = st.webhookDelay },
@@ -1748,6 +2009,47 @@ ele(HookSec, "Button", {
 	end,
 })
 
+local CfgSec = ele(SettingsTab, "Section", { Title = "Configs" })
+ele(CfgSec, "Paragraph", {
+	Title = "Файл конфига",
+	Desc = "WindUI/RATHUB-Blockade/config/" .. CONFIG_NAME .. ".json",
+})
+ele(CfgSec, "Toggle", {
+	Flag = "cfg88",
+	Title = "Авто-сохранение",
+	Desc = "Каждые 10 секунд, если включено",
+	Value = true,
+	Callback = function(v)
+		st.autoSave = v
+	end,
+})
+ele(CfgSec, "Button", {
+	Title = "Сохранить конфиг",
+	Color = Color3.fromHex("#4f8cff"),
+	Callback = function()
+		if not Config then
+			notify("Config", "config manager unavailable", "triangle-alert", 3)
+			return
+		end
+		local okS = pcall(function()
+			Config:Save()
+		end)
+		notify("Config", okS and "saved" or "save failed", okS and "check" or "triangle-alert", 3)
+	end,
+})
+ele(CfgSec, "Button", {
+	Title = "Загрузить конфиг",
+	Color = Color3.fromHex("#2ecc71"),
+	Callback = function()
+		if not Config then
+			notify("Config", "config manager unavailable", "triangle-alert", 3)
+			return
+		end
+		local good = applySavedConfig()
+		notify("Config", good and "loaded" or "no config / load failed", good and "check" or "triangle-alert", 3)
+	end,
+})
+
 local actionsSec = ele(SettingsTab, "Section", { Title = "Actions" })
 ele(actionsSec, "Button", {
 	Title = "Destroy UI",
@@ -1762,6 +2064,31 @@ ele(actionsSec, "Button", {
 pcall(function()
 	Window:SelectTab(1)
 end)
+
+-- auto-load the saved config (WindUI config manager, Flag-based)
+	if Config then
+	task.delay(1.5, function()
+		if applySavedConfig() then
+			notify("Config", "loaded " .. CONFIG_NAME, "check", 3)
+		end
+	end)
+	task.spawn(function()
+		while alive() do
+			task.wait(10)
+			if alive() and st.autoSave then
+				pcall(function()
+					Config:Save()
+				end)
+			end
+		end
+	end)
+end
+
+st._window = Window
+st._masteryToggle = masteryToggle
+st._gachaSkinInfo = gachaSkinInfo
+st._boostActiveInfo = boostActiveInfo
+end
 
 local VOTE_PAGES = {
 	{ "Normal", "Hard", "VeryHard", "Insane", "Nightmare" },
@@ -1977,7 +2304,41 @@ local function shopRemote()
 	return ShopRem
 end
 
-local function buyFillHP()
+do
+local HEAL_POS = Vector3.new(39.84444046020508, 2.7063474655151367, -24.393577575683594)
+
+local function healButton()
+	local pgui = lp:FindFirstChild("PlayerGui")
+	local inv = pgui and pgui:FindFirstChild("003-A")
+	local main = inv and inv:FindFirstChild("Main")
+	return main and main:FindFirstChild("Heal")
+end
+
+local function clickHealButton()
+	local btn = healButton()
+	if not btn then
+		return false
+	end
+	local fired = false
+	pcall(function()
+		if type(firesignal) == "function" then
+			firesignal(btn.MouseButton1Up)
+			fired = true
+		end
+	end)
+	if not fired then
+		pcall(function()
+			btn:Click()
+			fired = true
+		end)
+	end
+	return fired
+end
+
+local function buyFillHP(viaButton)
+	if viaButton and clickHealButton() then
+		return true
+	end
 	local rem = shopRemote()
 	if not rem then
 		return false
@@ -1993,20 +2354,47 @@ local function hpNow()
 	return hum and hum.Health or 0
 end
 
+local function goToShop()
+	if not canUseShop() then
+		return false
+	end
+	local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+	if not hrp then
+		return false
+	end
+	hrp.CFrame = CFrame.new(HEAL_POS.X, HEAL_POS.Y, HEAL_POS.Z)
+	hrp.AssemblyLinearVelocity = Vector3.zero
+	hrp.AssemblyAngularVelocity = Vector3.zero
+	task.wait(0.2)
+	return canUseShop()
+end
+
 local function doHeal()
 	if not shopRemote() then
 		print("[rathub-heal] ReplicatedStorage.ShopSystem missing")
 		return false
 	end
+	if not canUseShop() then
+		return false
+	end
 	local before = hpNow()
 	local t0 = now()
 	local shots = 0
-	local limit = math.max(tonumber(st.healTry) or 12, 3)
+	local limit = math.min(math.max(tonumber(st.healTry) or 6, 3), 6)
+	if not goToShop() then
+		print("[rathub-heal] shop disappeared before heal")
+		return false
+	end
 	while alive() and now() - t0 < limit do
-		if buyFillHP() then
+		if not canUseShop() then
+			print("[rathub-heal] shop disappeared during heal")
+			return false
+		end
+		local viaButton = shots < 3
+		if buyFillHP(viaButton) then
 			shots = shots + 1
 		end
-		task.wait(0.18)
+		task.wait(0.22)
 		local hp = hpNow()
 		if hp > before + 1 then
 			print(string.format("[rathub-heal] healed %d -> %d (%d shots, %.1fs)", before, hp, shots, now() - t0))
@@ -2020,24 +2408,119 @@ end
 task.spawn(function()
 	while alive() do
 		task.wait(0.5)
-		if st.heal and st.farm and now() >= transformQuietUntil then
+		local wave = ws:FindFirstChild("Wave") and ws.Wave.Value or 0
+		local living = ws:FindFirstChild("Living")
+		local inGame = wave > 0 or (lp.Character and living and lp.Character.Parent == living)
+		if st.heal and inGame and not st.astro and not isTitanForm() and now() >= transformQuietUntil then
 			local t = now()
 			local hum = lp.Character and lp.Character:FindFirstChild("Humanoid")
 			if hum then
 				local hp, mx = hum.Health, hum.MaxHealth
 				local needHeal = healRequested or (mx > 0 and hp / mx * 100 < st.healHP)
 				if needHeal and not isHealing and t - lastHealT > 4 then
-					isHealing = true
-					local okH = doHeal()
-					isHealing = false
-					healRequested = false
-					if okH then
-						lastHealT = now()
-						notify("Farm", "healed at shop", "check", 2)
-					else
-						lastHealT = now() + 15
-						print("[rathub-heal] failed, cooldown 15s")
+					if canUseShop() then
+						isHealing = true
+						healBusy = true
+						local okH = doHeal()
+						healBusy = false
+						isHealing = false
+						healRequested = false
+						if okH then
+							lastHealT = now()
+							notify("Farm", "healed at shop", "check", 2)
+						else
+							lastHealT = now() + 6
+							print("[rathub-heal] failed, cooldown 6s")
+						end
 					end
+				end
+			end
+		end
+	end
+end)
+end
+
+task.spawn(function()
+	local module
+	while alive() do
+		task.wait(0.4)
+		if st.skillTreeAuto then
+			if not module then
+				local m = rs:FindFirstChild("SkillsTree")
+				if m then
+					local ok, res = pcall(require, m)
+					if ok then
+						module = res
+					end
+				end
+			end
+			if module then
+				local pv = lp:FindFirstChild("PlayerValues")
+				local ch = lp.Character
+				local vf = ch and ch:FindFirstChild("ValuesFolder")
+				local charName
+				if vf and vf:FindFirstChild("UsingTitan") then
+					charName = pv and pv:FindFirstChild("Titan") and pv.Titan.Value
+				else
+					charName = pv and pv:FindFirstChild("Character") and pv.Character.Value
+				end
+				local tree = charName and module.Tree(charName)
+				local folder = lp:FindFirstChild("SkillTreesFolder")
+				local data = lp:FindFirstChild("Data")
+				local money = data and data:FindFirstChild("MoneysInShop")
+				local rawCash = money and tostring(money.Value) or ""
+				local cash = (rawCash:lower() == "inf") and math.huge or (tonumber(rawCash) or 0)
+				local bought = nil
+				if tree and folder then
+					for skill, node in pairs(tree) do
+						if not folder:FindFirstChild(skill) then
+							local req = node[2]
+							local reqOk = true
+							if req then
+								if type(req) == "table" then
+									for _, r in ipairs(req) do
+										if not folder:FindFirstChild(r) then
+											reqOk = false
+											break
+										end
+									end
+								else
+									reqOk = folder:FindFirstChild(req) ~= nil
+								end
+							end
+							local price = node[3]
+							if type(price) == "table" then
+								price = price[1]
+							end
+							price = tonumber(price) or 0
+							if reqOk and cash >= price then
+								local rem = rs:FindFirstChild("SkillTrees")
+								if rem then
+									pcall(function()
+										rem:FireServer(skill)
+									end)
+									bought = skill
+								end
+								break
+							end
+						end
+					end
+				end
+				if st._skillTreeLabel then
+					local txt
+					if not charName then
+						txt = "no character"
+					elseif not tree then
+						txt = "no tree for " .. tostring(charName)
+					elseif bought then
+						txt = "buying " .. tostring(bought) .. " (" .. tostring(cash) .. " C)"
+						task.wait(0.6)
+					else
+						txt = "no affordable nodes (" .. tostring(cash) .. " C)"
+					end
+					pcall(function()
+						st._skillTreeLabel:SetDesc(txt)
+					end)
 				end
 			end
 		end
@@ -2053,7 +2536,7 @@ end
 task.spawn(function()
 	while alive() do
 		task.wait(0.05)
-		if st.m1Spam and farmOn() and now() >= transformQuietUntil then
+		if st.m1Spam and farmOn() and not healBusy and now() >= transformQuietUntil then
 			fireLMB()
 		end
 	end
@@ -2063,7 +2546,7 @@ task.spawn(function()
 	local lastErr = 0
 	while alive() do
 		task.wait(st.skillDelay)
-		if farmOn() and (st.skills or st.titanFarm) and now() >= transformQuietUntil then
+		if farmOn() and (st.skills or st.titanFarm) and not healBusy and now() >= transformQuietUntil then
 			local t = now()
 			local ok, err = pcall(function()
 				if st.skillOrbitOnly and not isOrbiting then
@@ -2202,7 +2685,7 @@ task.spawn(function()
 						break
 					end
 				end
-				if gachaSkinInfo then
+				if st._gachaSkinInfo then
 					local n = #missing
 					local preview = ""
 					for i = 1, math.min(3, n) do
@@ -2221,10 +2704,10 @@ task.spawn(function()
 						txt = "Waiting for banner... | missing: " .. preview .. " | banner: " .. bannerTxt
 					end
 					pcall(function()
-						if gachaSkinInfo.Set then
-							gachaSkinInfo:Set(txt)
+						if st._gachaSkinInfo.Set then
+							st._gachaSkinInfo:Set(txt)
 						else
-							gachaSkinInfo.Content = txt
+							st._gachaSkinInfo.Content = txt
 						end
 					end)
 				end
@@ -2828,10 +3311,10 @@ task.spawn(function()
 		if txt ~= lastText then
 			lastText = txt
 			pcall(function()
-				if boostActiveInfo.Set then
-					boostActiveInfo:Set(txt)
+				if st._boostActiveInfo.Set then
+					st._boostActiveInfo:Set(txt)
 				else
-					boostActiveInfo.Content = txt
+					st._boostActiveInfo.Content = txt
 				end
 			end)
 		end
@@ -3240,7 +3723,257 @@ end
 local SHOP_POS = Vector3.new(39.84444046020508, 2.7063474655151367, -24.393577575683594)
 local shopHold = false
 
-local FS = { namesT = 0, scanT = 0, lmbT = 0, errT = 0 }
+-- ============================================================
+-- Silent aim (BotBridge) + Astro Entrapper counter
+-- ============================================================
+do
+local BOT_BRIDGE = nil
+local AIM_OVERRIDE_FORCED = false
+
+local function getBotBridge()
+	if BOT_BRIDGE and type(BOT_BRIDGE) == "table" and BOT_BRIDGE.GetAimPosition then
+		return BOT_BRIDGE
+	end
+	local mod = rs:FindFirstChild("BotBridge")
+	if not mod then
+		return nil
+	end
+	local ok, bb = pcall(require, mod)
+	if ok and type(bb) == "table" then
+		BOT_BRIDGE = bb
+		return bb
+	end
+	return nil
+end
+
+local function clearAimOverride()
+	local bb = getBotBridge()
+	if bb and AIM_OVERRIDE_FORCED then
+		pcall(function()
+			bb.AimPosition = nil
+			bb.Enabled = false
+		end)
+	end
+	AIM_OVERRIDE_FORCED = false
+end
+st._clearAim = clearAimOverride
+
+-- The game already wraps MouseStream through BotBridge: when Enabled +
+-- AimPosition are set, every stream packet is redirected to that point.
+local function setAimTarget(pos)
+	local bb = getBotBridge()
+	if not bb then
+		return false
+	end
+	if not pos then
+		clearAimOverride()
+		return false
+	end
+	if not bb.Enabled then
+		AIM_OVERRIDE_FORCED = true
+	end
+	pcall(function()
+		bb.Enabled = true
+		bb.AimPosition = pos
+	end)
+	return true
+end
+
+local function sendSilentAim(target, hrp)
+	if not target or not hrp then
+		return
+	end
+	local aimPart = target.mob and target.mob:FindFirstChild("Head") or target.root
+	local pos = aimPart and aimPart.Position or target.pos
+	if not pos then
+		return
+	end
+	if setAimTarget(pos) then
+		pcall(function()
+			if _G.SendMouseNow then
+				_G.SendMouseNow()
+			end
+		end)
+		return
+	end
+	local ms = rs:FindFirstChild("MouseStream")
+	if not ms then
+		return
+	end
+	local dir = pos - hrp.Position
+	if dir.Magnitude < 0.01 then
+		return
+	end
+	pcall(function()
+		ms:FireServer(pos, dir.Unit, false)
+	end)
+end
+
+local ASTRO_CANDIDATES = {}
+local astroScanAt = 0
+local astroNoticeAt = 0
+
+local function refreshAstroCandidates()
+	local living = ws:FindFirstChild("Living")
+	if not living then
+		table.clear(ASTRO_CANDIDATES)
+		return
+	end
+	local names = splitList(st.astroNames)
+	table.clear(ASTRO_CANDIDATES)
+	for _, m in ipairs(living:GetChildren()) do
+		local low = m.Name:lower()
+		for _, p in ipairs(names) do
+			if low:find(p, 1, true) then
+				ASTRO_CANDIDATES[#ASTRO_CANDIDATES + 1] = m
+				break
+			end
+		end
+	end
+end
+
+local function activeAstroMagnet()
+	local t = now()
+	if t - astroScanAt >= 0.25 then
+		astroScanAt = t
+		refreshAstroCandidates()
+	end
+	for _, m in ipairs(ASTRO_CANDIDATES) do
+		if m.Parent then
+			local hum = m:FindFirstChildOfClass("Humanoid")
+			if not (hum and hum.Health <= 0) then
+				local vf = m:FindFirstChild("ValuesFolder")
+				local um = vf and vf:FindFirstChild("UsingMagnet")
+				if um and um.Value == true then
+					local root = m:FindFirstChild("HumanoidRootPart") or m:FindFirstChildWhichIsA("BasePart")
+					if root then
+						return m, root
+					end
+				end
+			end
+		end
+	end
+	return nil
+end
+
+local function barrierModel()
+	local map = workspace:FindFirstChild("Map")
+	return map and map:FindFirstChild("Barrier") or nil
+end
+
+local function barrierBounds()
+	local barrier = barrierModel()
+	if not barrier then
+		return nil
+	end
+	local minX, maxX, minZ, maxZ
+	local maxThick = 0
+	for _, p in ipairs(barrier:GetDescendants()) do
+		if p:IsA("BasePart") then
+			local pos, sz = p.Position, p.Size
+			local ax, bx = pos.X - sz.X / 2, pos.X + sz.X / 2
+			local az, bz = pos.Z - sz.Z / 2, pos.Z + sz.Z / 2
+			minX = minX and math.min(minX, ax) or ax
+			maxX = maxX and math.max(maxX, bx) or bx
+			minZ = minZ and math.min(minZ, az) or az
+			maxZ = maxZ and math.max(maxZ, bz) or bz
+			maxThick = math.max(maxThick, math.min(sz.X, sz.Z))
+		end
+	end
+	if not minX then
+		return nil
+	end
+	local w, d = maxX - minX, maxZ - minZ
+	local inset = math.min(maxThick + 15, math.max(10, math.min(w, d) / 4))
+	return {
+		minX = minX + inset,
+		maxX = maxX - inset,
+		minZ = minZ + inset,
+		maxZ = maxZ - inset,
+	}
+end
+
+-- Pick an escape point that stays inside workspace.Map.Barrier and does not
+-- cross a barrier wall.
+local function safeEscape(origin, flat, want)
+	local barrier = barrierModel()
+	local bounds = barrierBounds()
+	local params = nil
+	if barrier then
+		params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Include
+		params.FilterDescendantsInstances = { barrier }
+		params.IgnoreWater = true
+	end
+	local base = origin - flat
+	if base.Magnitude < 0.01 then
+		base = Vector3.new(1, 0, 0)
+	else
+		base = base.Unit
+	end
+	local dirs = { 0, 45, -45, 90, -90, 135, -135, 180 }
+	local best, bestScore = nil, nil
+	local outside = bounds and (origin.X < bounds.minX or origin.X > bounds.maxX or origin.Z < bounds.minZ or origin.Z > bounds.maxZ)
+	for _, deg in ipairs(dirs) do
+		local ang = math.rad(deg)
+		local c, s = math.cos(ang), math.sin(ang)
+		local dir = Vector3.new(base.X * c - base.Z * s, 0, base.X * s + base.Z * c)
+		local target = flat + dir * (want + 25)
+		if bounds then
+			target = Vector3.new(
+				math.clamp(target.X, bounds.minX, bounds.maxX),
+				origin.Y,
+				math.clamp(target.Z, bounds.minZ, bounds.maxZ)
+			)
+		end
+		local goal = target
+		local delta = target - origin
+		if barrier and not outside and delta.Magnitude > 0.01 then
+			local hit = workspace:Raycast(origin, delta, params)
+			if hit then
+				goal = origin + delta.Unit * math.max(0, hit.Distance - 12)
+			end
+		end
+		local score = (goal - flat).Magnitude
+		if not bestScore or score > bestScore then
+			best, bestScore = goal, score
+		end
+	end
+	return best, bestScore
+end
+
+local function astroCounterStep(hrp)
+	if not st.astroCounter or not hrp then
+		return false
+	end
+	local ent, root = activeAstroMagnet()
+	if not ent then
+		return false
+	end
+	local pos = hrp.Position
+	local epos = root.Position
+	local flat = Vector3.new(epos.X, pos.Y, epos.Z)
+	local want = tonumber(st.astroAwayDistance) or 150
+	local dist = (pos - flat).Magnitude
+	if dist < want then
+		local goal, score = safeEscape(pos, flat, want)
+		if goal and score and score > dist + 5 then
+			setPosFacing(hrp, goal, epos)
+			if now() - astroNoticeAt > 3 then
+				astroNoticeAt = now()
+				notify("Farm", "Astro Entrapper: UsingMagnet -> away", "shield", 2)
+			end
+			return true
+		end
+	end
+	return false
+end
+
+st._sendSilentAim = sendSilentAim
+st._astroCounterStep = astroCounterStep
+end
+
+local FS = { namesT = 0, scanT = 0, lmbT = 0, errT = 0, aimT = 0 }
 
 RunService.Heartbeat:Connect(function(dt)
 	if not alive() or not (st.farm or st.loot) then
@@ -3275,11 +4008,19 @@ RunService.Heartbeat:Connect(function(dt)
 			return
 		end
 
+		if healBusy then
+			return
+		end
+
 		if st.astro then
 			return
 		end
 
 		if isTitanForm() then
+			return
+		end
+
+		if st._astroCounterStep and st._astroCounterStep(hrp) then
 			return
 		end
 
@@ -3314,6 +4055,9 @@ RunService.Heartbeat:Connect(function(dt)
 		if not target then
 			currentTarget = nil
 			isOrbiting = false
+			if st._clearAim and st.silentAim then
+				st._clearAim()
+			end
 			if lootStep(hrp, dt) then
 			elseif zoneGoal then
 				if moveToward(hrp, zoneGoal, zoneGoal, dt) then
@@ -3330,6 +4074,11 @@ RunService.Heartbeat:Connect(function(dt)
 			if isPriorityName(target.name) then
 				notify("Farm", "target: " .. target.name, "crosshair", 2)
 			end
+		end
+
+		if st.silentAim and t - FS.aimT >= (tonumber(st.silentAimRate) or 0.05) then
+			FS.aimT = t
+			st._sendSilentAim(target, hrp)
 		end
 
 		if (st.m1 or st.titanFarm) and t - FS.lmbT >= 0.1 then
@@ -3576,7 +4325,8 @@ task.spawn(function()
 	end
 end)
 
-local TS = { scan = 0, lmb = 0, mobs = {}, err = 0, hint = false, angle = 0, angleInit = false, buy = 0, use = 0, reqFired = 0, wasForm = false, wIdx = 1, sIdx = 1, target = nil, orbiting = false, lastY = nil, resetDone = false, cinemaLast = 0, cinemaTries = 0 }
+local TS = { scan = 0, lmb = 0, mobs = {}, err = 0, hint = false, angle = 0, angleInit = false, buy = 0, use = 0, reqFired = 0, wasForm = false, wIdx = 1, sIdx = 1, target = nil, orbiting = false, lastY = nil, resetDone = false, cinemaLast = 0, cinemaTries = 0, castUntil = 0, aimT = 0, holdUntil = 0, offsetChar = nil, feetOffset = nil }
+_G.__RATHUB_TS = TS
 
 local function titanPickTarget(list)
 	if #list == 0 then
@@ -3637,22 +4387,75 @@ local function titanGroundY(char, x, z, fromY)
 	return y
 end
 
--- test auto-skill version: abilities by enemy max HP (SoundWave removed -
--- it bugs the titan)
+-- abilities are filtered at runtime: a skill only fires if its cooldown
+-- BoolValue actually exists, so wrong preset entries can never spam
 local TITAN_PRESETS = {
-	["Titan TV"] = {
-		weak = parseSkillList("StompTitanTV | Stomp_Cooldown\nRadiantTitanTV | Radiant_Cooldown"),
-		strong = parseSkillList("StompTitanTV | Stomp_Cooldown\nStabTitanTV | Stab_Cooldown\nTackle | Tackle_Cooldown\nRadiantTitanTV | Radiant_Cooldown"),
-	},
-	["Titan Cameraman"] = {
-		weak = parseSkillList("KickTitanCamera\nJumpSlamTitanCam\nStompTitanCamera\nCoreFlameTitanCamera"),
-		strong = parseSkillList("KickTitanCamera\nJumpSlamTitanCam\nStompTitanCamera\nTackleTitanCam\nCoreFlameTitanCamera"),
-	},
+	["Titan Cameraman"] = parseSkillList(
+		"KickTitanCamera | Kick_Cooldown\n"
+		.. "JumpSlamTitanCam | JumpSlam_Cooldown\n"
+		.. "StompTitanCamera | Stomp_Cooldown\n"
+		.. "TackleTitanCam | Tackle_Cooldown\n"
+		.. "CoreFlameTitanCamera | CoreFlame_Cooldown\n"
+		.. "ShieldTitanCamera | Shield_Cooldown"
+	),
+	["Titan TV"] = parseSkillList(
+		"StompTitanTV | Stomp_Cooldown\n"
+		.. "StabTitanTV | Stab_Cooldown\n"
+		.. "Tackle | Tackle_Cooldown\n"
+		.. "RadiantTitanTV | Radiant_Cooldown"
+	),
 }
 
-local function titanPresetLists()
-	local p = TITAN_PRESETS[st.titanPreset] or TITAN_PRESETS["Titan TV"]
-	return p.weak, p.strong
+local function titanPresetLists(key)
+	return TITAN_PRESETS[key] or TITAN_PRESETS[st.titanPreset] or TITAN_PRESETS["Titan TV"]
+end
+
+-- pick the ability set from the real form, not the dropdown
+local function titanAbilityKey(ch)
+	local s = titanFormScript(ch)
+	local n = s and s.Name:lower() or ""
+	if n:find("camera", 1, true) then
+		return "Titan Cameraman"
+	end
+	if n:find("tv", 1, true) then
+		return "Titan TV"
+	end
+	local cdf = ch and ch:FindFirstChild("CooldownFolder")
+	if cdf then
+		if cdf:FindFirstChild("Kick_Cooldown") then
+			return "Titan Cameraman"
+		end
+		if cdf:FindFirstChild("Stab_Cooldown") or cdf:FindFirstChild("Radiant_Cooldown") then
+			return "Titan TV"
+		end
+	end
+	return st.titanPreset
+end
+
+-- geometric offset from HRP to the lowest part (ignores huge map-like parts
+-- that some characters carry around)
+local function titanFeetOffset(ch)
+	local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+	if not hrp then
+		return nil
+	end
+	local minY
+	for _, p in ipairs(ch:GetDescendants()) do
+		if p:IsA("BasePart") then
+			local s = p.Size
+			local nm = p.Name:lower()
+			if s.X <= 80 and s.Z <= 80 and nm ~= "ground" and nm ~= "ground2" and nm ~= "ground3" then
+				local y = p.Position.Y - s.Y / 2
+				if not minY or y < minY then
+					minY = y
+				end
+			end
+		end
+	end
+	if not minY then
+		return nil
+	end
+	return hrp.Position.Y - minY
 end
 
 local function titanIsFlyer(name)
@@ -3739,13 +4542,17 @@ task.spawn(function()
 		end
 
 		if not titanHasItem() then
-			-- the ShopSystem remote always works here: fire it whenever the
-			-- shop is open, no money checks
+			-- the Buy remote only works while standing at the shop helicopter
 			local t = now()
 			if t - TS.buy < 2 then
 				continue
 			end
 			if not canUseShop() then
+				continue
+			end
+			local sandboxMode = rs:FindFirstChild("SandboxMode")
+			local sandboxOn = sandboxMode and sandboxMode.Value == true
+			if not sandboxOn and titanMoney() < (tonumber(st.titanPrice) or 2200) then
 				continue
 			end
 			TS.buy = t
@@ -3864,7 +4671,7 @@ task.spawn(function()
 			-- clicks mid-transform bug the titan
 			transformQuietUntil = now() + 30
 			pcall(function()
-				rs:WaitForChild("RequestTitan"):FireServer()
+				rs:WaitForChild(st.titanRequestRemote or "RequestTitan"):FireServer()
 			end)
 			TS.reqFired = now()
 			-- wait for the form WITHOUT touching anything; only if the
@@ -3944,7 +4751,7 @@ end)
 task.spawn(function()
 	while alive() do
 		task.wait(1)
-		if not (st.titanFarm and st.titanCinema) then
+		if not (st.titanFarm and st.titanCinema and st.titanPreset == "Titan TV") then
 			TS.cinemaTries = 0
 			continue
 		end
@@ -4000,7 +4807,13 @@ task.spawn(function()
 		task.wait(st.titanSkillDelay)
 		if st.titanFarm and st.titanSkillsOn and isTitanForm() then
 			local t = now()
+			if shopHold then
+				continue
+			end
 			if t < transformQuietUntil then
+				continue
+			end
+			if t < (TS.castUntil or 0) then
 				continue
 			end
 			local ok, err = pcall(function()
@@ -4018,17 +4831,23 @@ task.spawn(function()
 				end
 				local char = lp.Character
 				local cdf = char and char:FindFirstChild("CooldownFolder")
-				-- wait only while a skill itself is casting (not M1), so the
-				-- M1 spam cannot starve abilities
-				local busy = false
+				if not cdf then
+					return
+				end
+				-- abilities take priority: M1 yields through TS.castUntil for
+				-- 0.9s after each cast, so it cannot starve the ability loop
 				local ask = cdf and cdf:FindFirstChild("ActiveSkill")
 				if ask and ask.Value == true then
-					busy = true
+					TS.castUntil = t + 0.2
+					return
 				end
-				-- presets: weak (<300 max HP) / strong (300+)
-				local weakL, strongL = titanPresetLists()
-				local list = ((tgt.mx or 0) < 300) and weakL or strongL
-				TS.sIdx = runSkillNext(list, char, cdf, busy, TS.sIdx)
+				-- ability set from the actual titan form
+				local list = titanPresetLists(titanAbilityKey(char))
+				local nextIdx, okFired = runSkillNext(list, char, cdf, false, TS.sIdx)
+				TS.sIdx = nextIdx
+				if okFired then
+					TS.castUntil = t + 0.9
+				end
 			end)
 			if not ok and t - TS.err > 5 then
 				TS.err = t
@@ -4042,6 +4861,9 @@ RunService.Heartbeat:Connect(function(dt)
 	if not alive() or not st.titanFarm then
 		return
 	end
+	if shopHold then
+		return
+	end
 	if not isTitanForm() then
 		if TS.wasForm then
 			-- the form was active and is now gone (died / round ended):
@@ -4049,6 +4871,8 @@ RunService.Heartbeat:Connect(function(dt)
 			TS.wasForm = false
 			transformQuietUntil = 0
 			titanRequestUsed = false
+			TS.castUntil = 0
+			TS.holdUntil = 0
 		end
 		if st.titanFarm and not TS.hint then
 			TS.hint = true
@@ -4065,6 +4889,21 @@ RunService.Heartbeat:Connect(function(dt)
 		if not hrp then
 			return
 		end
+		if TS.offsetChar ~= char then
+			TS.offsetChar = char
+			TS.feetOffset = titanFeetOffset(char)
+			TS.aimT = 0
+			TS.lastY = nil
+			TS.castUntil = 0
+		end
+		-- computed from the spawned titan model; the slider is a manual
+		-- override (0 = automatic)
+		local footOffset = (tonumber(st.titanFeetOffset) or 0) > 0
+			and tonumber(st.titanFeetOffset)
+			or (TS.feetOffset or 64.8)
+		if st._astroCounterStep and st._astroCounterStep(hrp) then
+			return
+		end
 		local wave = ws:FindFirstChild("Wave") and ws.Wave.Value or 0
 		-- reset wave (titan side, the normal farm heartbeat returns here)
 		if st.titanResetWave and st.titanResetWave > 0 then
@@ -4077,8 +4916,8 @@ RunService.Heartbeat:Connect(function(dt)
 				TS.resetDone = false
 			end
 		end
-		-- M1 spams all the time, together with abilities
-		if st.titanM1 and t - TS.lmb >= 0.1 then
+		-- M1 spams all the time, but yields while an ability is casting
+		if st.titanM1 and t - TS.lmb >= 0.1 and t >= (TS.castUntil or 0) then
 			TS.lmb = t
 			local cdf = char:FindFirstChild("CooldownFolder")
 			local am1 = cdf and cdf:FindFirstChild("ActiveM1")
@@ -4096,13 +4935,27 @@ RunService.Heartbeat:Connect(function(dt)
 		end
 		local target = titanPickTarget(TS.mobs)
 		if not target then
-			-- no enemies: stay in one position (like the normal farm)
+			-- no enemies: keep the titan standing on the ground (not buried)
 			TS.target = nil
 			TS.orbiting = false
 			TS.angleInit = false
+			local ppos = hrp.Position
+			local gy = titanGroundY(char, ppos.X, ppos.Z, ppos.Y)
+			if gy then
+				local y = gy + footOffset
+				if math.abs(ppos.Y - y) > 1 then
+					hrp.CFrame = CFrame.new(ppos.X, y, ppos.Z) * (hrp.CFrame - hrp.CFrame.Position)
+					pcall(function()
+						hrp.AssemblyLinearVelocity = Vector3.zero
+						hrp.AssemblyAngularVelocity = Vector3.zero
+					end)
+				end
+			end
+			if st._clearAim and st.silentAim then
+				st._clearAim()
+			end
 			return
 		end
-		TS.target = { name = target.name, mx = target.mx }
 		local tpos
 		pcall(function()
 			tpos = target.root.Position
@@ -4111,6 +4964,11 @@ RunService.Heartbeat:Connect(function(dt)
 			tpos = target.pos
 		end
 		target.pos = tpos
+		TS.target = { name = target.name, mx = target.mx, pos = tpos }
+		if st.silentAim and t - TS.aimT >= (tonumber(st.silentAimRate) or 0.05) then
+			TS.aimT = t
+			st._sendSilentAim(target, hrp)
+		end
 		local ppos = hrp.Position
 		local flatT = Vector3.new(tpos.X, ppos.Y, tpos.Z)
 		local dist = (flatT - ppos).Magnitude
@@ -4130,7 +4988,7 @@ RunService.Heartbeat:Connect(function(dt)
 			local toGoal = flat - ppos
 			local np = ppos + (toGoal.Magnitude > 0.01 and toGoal.Unit * math.min(step, toGoal.Magnitude) or Vector3.new(0, 0, 0))
 			local gy = titanGroundY(char, np.X, np.Z, ppos.Y)
-			local y = (gy or TS.lastY or ppos.Y) + st.titanFeetOffset
+			local y = gy and (gy + footOffset) or (TS.lastY or ppos.Y)
 			TS.lastY = y
 			setPosFacing(hrp, Vector3.new(np.X, y, np.Z), tpos)
 		else
@@ -4144,7 +5002,7 @@ RunService.Heartbeat:Connect(function(dt)
 			TS.angle = TS.angle + math.rad(st.titanOrbitDeg) * dt
 			local orb = tpos + Vector3.new(math.cos(TS.angle) * st.titanRadius, 0, math.sin(TS.angle) * st.titanRadius)
 			local gy = titanGroundY(char, orb.X, orb.Z, ppos.Y)
-			local y = (gy or TS.lastY or ppos.Y) + st.titanFeetOffset
+			local y = gy and (gy + footOffset) or (TS.lastY or ppos.Y)
 			TS.lastY = y
 			setPosFacing(hrp, Vector3.new(orb.X, y, orb.Z), tpos)
 		end
@@ -4276,7 +5134,7 @@ task.spawn(function()
 				if todo == 0 and unknown == 0 then
 					st.mastery = false
 					pcall(function()
-						setToggle(masteryToggle, false)
+						setToggle(st._masteryToggle, false)
 					end)
 					notify("Mastery", "path complete: all characters reached target", "check", 6)
 					return
@@ -4338,7 +5196,7 @@ local lastErrGod = 0
 task.spawn(function()
 	while alive() do
 		task.wait(0.25)
-		if st.god and not godBusy and now() >= transformQuietUntil then
+		if st.god and not godBusy and not healBusy and not isTitanForm() and now() >= transformQuietUntil then
 			local t = now()
 			local ok, err = pcall(function()
 				local char = lp.Character
@@ -4350,8 +5208,8 @@ task.spawn(function()
 				if mx <= 0 then
 					return
 				end
-				local limit = st.godHP >= mx and (mx * 0.5) or st.godHP
-				if not (hp < limit and hp < mx) then
+				local limit = math.min(st.godHP, mx)
+				if not (hp <= limit and hp < mx) then
 					return
 				end
 				local tw = ws:FindFirstChild("TimerWave")
@@ -4511,15 +5369,18 @@ end)
 _G.__RATHUB_REG = {
 	stop = function()
 		ALIVE = false
+		if st._clearAim then
+			pcall(st._clearAim)
+		end
 		pcall(function()
-			if Window then
-				Window:Destroy()
+			if st._window then
+				st._window:Destroy()
 			end
 		end)
 	end,
 }
 
-print("[RATHUB] Blockade loaded (WindUI, remote-only)")
+print("[RATHUB] Blockade 1.5 loaded (WindUI, remote-only)")
 bootOk()
 
 end
