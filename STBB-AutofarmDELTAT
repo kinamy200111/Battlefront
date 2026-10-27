@@ -126,32 +126,102 @@ local function httpGet(url)
 	return nil
 end
 
-bootSet("downloading Obsidian...")
-local OBSIDIAN_REPO = "https://raw.githubusercontent.com/deividcomsono/Obsidian/refs/heads/main/"
-local obsidianSrc = httpGet(OBSIDIAN_REPO .. "Library.lua")
-if not obsidianSrc then
-	obsidianSrc = httpGet("https://cdn.jsdelivr.net/gh/deividcomsono/Obsidian@main/Library.lua")
+local WINDUI_URLS = {
+	"https://cdn.jsdelivr.net/gh/Footagesus/WindUI@main/dist/main.lua",
+	"https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua",
+	"https://github.com/Footagesus/WindUI/releases/latest/download/main.lua",
+}
+
+local windBody
+bootSet("downloading WindUI...")
+for _, url in ipairs(WINDUI_URLS) do
+	windBody = httpGet(url)
+	if windBody then
+		break
+	end
 end
-if not obsidianSrc then
-	error("Obsidian download failed")
+if not windBody then
+	warn("[RATHUB] WindUI download failed (no CDN reachable)")
+	bootSet("ERR: WindUI download failed - enable Http in Delta settings", 255, 80, 80)
+	return
 end
-bootSet("loading Obsidian...")
-local obsidianLoader = loadstring or load
-if not obsidianLoader then
-	error("loadstring is unavailable")
+bootSet("loading WindUI...")
+
+local ICON_RAW = "https://raw.githubusercontent.com/Footagesus/Icons/refs/heads/main/"
+local ICON_CDN = "https://cdn.jsdelivr.net/gh/Footagesus/Icons@main/"
+windBody = windBody:gsub(ICON_RAW, ICON_CDN)
+
+windBody = windBody:gsub("game:HttpGet", "__RATHUB_HG")
+windBody = windBody:gsub("game%.HttpGet", "__RATHUB_HG")
+
+local thumbPatched = 0
+windBody = windBody:gsub("([%w_%.]+):GetUserThumbnailAsync%(", function()
+	thumbPatched = thumbPatched + 1
+	return "__RATHUB_THUMB("
+end)
+if thumbPatched == 0 then
+	warn("[RATHUB] WindUI thumbnail call not found (library layout changed?)")
 end
-local Library = assert(obsidianLoader(obsidianSrc))()
-local SaveManager
-local saveManagerSrc = httpGet(OBSIDIAN_REPO .. "addons/SaveManager.lua")
-if saveManagerSrc then
-	local ok, sm = pcall(function()
-		return obsidianLoader(saveManagerSrc)()
-	end)
-	if ok then
-		SaveManager = sm
+
+local windCache = {}
+local windReq = request or http_request or (type(syn) == "table" and syn.request) or nil
+local function windHttpGet(url)
+	if type(url) ~= "string" then
+		return ""
+	end
+	local hit = windCache[url]
+	if hit then
+		return hit
+	end
+	if windReq and url:sub(1, #ICON_CDN) == ICON_CDN then
+		local ok, res = pcall(function()
+			return windReq({ Url = url, Method = "GET" })
+		end)
+		local body = nil
+		if ok and type(res) == "string" then
+			body = res
+		elseif ok and type(res) == "table" then
+			body = res.Body or res.body
+		end
+		if type(body) == "string" and body ~= "" then
+			if not body:find("<html", 1, true) and body:find("return", 1, true) then
+				windCache[url] = body
+				return body
+			end
+		end
+	end
+	return ""
+end
+
+_G.__RATHUB_HG = windHttpGet
+_G.__RATHUB_THUMB = function()
+	return ""
+end
+
+local windChunk = (loadstring or load)(windBody)
+if not windChunk then
+	warn("[RATHUB] WindUI parse failed")
+	bootSet("ERR: WindUI parse failed - enable Loadstring in Delta", 255, 80, 80)
+	return
+end
+if type(getfenv) == "function" then
+	local okEnv, windEnv = pcall(getfenv, windChunk)
+	if okEnv and type(windEnv) == "table" then
+		windEnv.__RATHUB_HG = windHttpGet
+		windEnv.__RATHUB_THUMB = _G.__RATHUB_THUMB
 	end
 end
 
+local windOk, windRes = pcall(function()
+	return windChunk()
+end)
+
+if not windOk or not windRes then
+	warn("[RATHUB] WindUI load failed: " .. tostring(windRes))
+	bootSet("ERR: WindUI load failed: " .. tostring(windRes):sub(1, 80), 255, 80, 80)
+	return
+end
+local WindUI = windRes
 
 if _G.__RATHUB_REG and _G.__RATHUB_REG.stop then
 	task.spawn(function()
@@ -179,8 +249,6 @@ local st = {
 	allyList = "villanarc, blaster tank, cam turret, attacker drone, missile rocket, [ ai ], [ai, camera drone, skibidifriend, speaker pulse tank",
 	m1 = true,
 	m1Spam = false,
-	silentAim = false,
-	silentAimRate = 0.05,
 	skills = false,
 	skillCombatList = "SoundWave | SoundWave_Cooldown | SoundImprovement\nSwing | Swing_Cooldown",
 	skillWaveList = "SpeakerCarrier | SpeakerCarrier_Cooldown\nBuffSpeakerMan | Buff_Cooldown",
@@ -211,17 +279,10 @@ local st = {
 	titanShopItem = "Titan-Request",
 	titanPreset = "Titan TV",
 	titanPrice = 2200,
-	titanRequestType = "Titan Request",
-	titanRequestRemote = "RequestTitan",
-	utsmMode = "Upgrade",
-	utsmAuto = true,
-	utsmGatling = false,
-	utsmModeApplied = false,
 	titanM1 = true,
 	titanSkillDelay = 0.35,
-	holdDuration = 1.8,
 	titanSkillsOn = true,
-	titanOrbitOnly = false,
+	titanOrbitOnly = true,
 	titanCinema = true,
 	titanResetWave = 10,
 	vote = false,
@@ -248,24 +309,12 @@ local st = {
 	boostSel = { "Booster X2 Mastery : 1Hour", "Booster X2 Points : 1Hour" },
 	boostDelay = 30,
 	mastery = false,
-	masteryList = "Camera man | 30; Tv man | 80; TV woman | 80; Large Speaker man | 80; Speaker Strider | 80; Dark Speakerman | 80; Engineer Camera Man | 10; Scientist TV Man | 80; Large TV man | 80; Upgraded Titan TV | 80",
+	masteryList = "Camera man | 30\nTv man | 80\nTV woman | 80\nLarge Speaker man | 80\nSpeaker Strider | 80\nDark Speakerman | 80\nEngineer Camera Man | 10\nScientist TV Man | 80\nLarge TV man | 80",
 	masteryDefault = 80,
 	masteryDelay = 3,
-	pathPreset = "Quest UTTV + Carrier V2",
-	pathFallbackEnabled = false,
-	pathFallbackChar = "Dark Speakerman",
-	pathFallbackActive = false,
-	pathCoresZombie = false,
-	pathBoostFarmEnabled = false,
-	pathBoostFarmChar = "Dark Speakerman",
-	pathBoostFarmActive = false,
-	pathBoostFarmDone = false,
-	pathBoostFarmTarget = 4000,
-	pathBoostFarmResumeBelow = 1000,
-	pathBoostFarmResume = nil,
 	god = false,
-	godHP = 5,
-	godSkipTimer0 = false,
+	godHP = 800,
+	godSkipTimer0 = true,
 	antiAfk = true,
 	lowGfx = false,
 	noShadow = false,
@@ -276,184 +325,7 @@ local st = {
 	webhookUrl = "",
 	webhookDelay = 60,
 	healTry = 12,
-	skillTreeAuto = false,
-	_skillTreeLabel = nil,
 }
-
-_G.__RATHUB_ST = st
-
-local Party = {
-	role = "Main",
-	id = "duo1",
-	interval = 0.5,
-	followVote = true,
-	followChar = false,
-	supportMode = "None",
-	combatRole = "None",
-	followLeader = false,
-	followDistance = 12,
-	healBelow = 50,
-	healList = "HealClockTitan | Heal_Cooldown",
-	x18Anchor = nil,
-	clockDistance = 12,
-	seq = 0,
-	ui = {},
-	partner = nil,
-	assistTarget = nil,
-	lastError = nil,
-}
-Party.http = game:GetService("HttpService")
-_G.__RATHUB_PARTY = Party
-
-function Party.sanitizeId()
-	return tostring(Party.id or "duo1"):gsub("[^%w_%-]", "_")
-end
-
-function Party.statePath(role)
-	return "RATHUB_party_" .. Party.sanitizeId() .. "_" .. string.lower(role) .. ".json"
-end
-
-function Party.configPath()
-	return "RATHUB_party_" .. tostring(lp.Name):gsub("[^%w_%-]", "_") .. ".cfg"
-end
-
-function Party.saveConfig()
-	if not writefile then
-		return
-	end
-	pcall(function()
-		writefile(Party.configPath(), Party.http:JSONEncode({
-			role = Party.role,
-			id = Party.id,
-			interval = Party.interval,
-			followVote = Party.followVote,
-			followChar = Party.followChar,
-			supportMode = Party.supportMode,
-			combatRole = Party.combatRole,
-			followLeader = Party.followLeader,
-			followDistance = Party.followDistance,
-			healBelow = Party.healBelow,
-			healList = Party.healList,
-			x18Anchor = Party.x18Anchor,
-			clockDistance = Party.clockDistance,
-		}))
-	end)
-end
-
-function Party.loadConfig()
-	if not (isfile and readfile) then
-		return
-	end
-	pcall(function()
-		local path = Party.configPath()
-		if not isfile(path) then
-			return
-		end
-		local data = Party.http:JSONDecode(readfile(path))
-		if type(data) == "table" then
-			Party.role = data.role or Party.role
-			Party.id = data.id or Party.id
-			Party.interval = tonumber(data.interval) or Party.interval
-			Party.followVote = data.followVote ~= false
-			Party.followChar = data.followChar == true
-			Party.supportMode = data.supportMode
-				or ((data.combatRole == "X18" or data.combatRole == "Clock Titan") and data.combatRole)
-				or Party.supportMode
-			Party.combatRole = data.combatRole or Party.combatRole
-			Party.followLeader = data.followLeader == true
-			Party.followDistance = tonumber(data.followDistance) or Party.followDistance
-			Party.healBelow = tonumber(data.healBelow) or Party.healBelow
-			Party.healList = data.healList or Party.healList
-			if Party.supportMode ~= "X18" and Party.supportMode ~= "Clock Titan" then
-				Party.combatRole = "None"
-			else
-				Party.combatRole = Party.supportMode
-			end
-			Party.clockDistance = tonumber(data.clockDistance) or Party.clockDistance
-			if type(data.x18Anchor) == "table" then
-				Party.x18Anchor = data.x18Anchor
-			end
-		end
-	end)
-end
-
-function Party.read(role)
-	if not (isfile and readfile) then
-		return nil
-	end
-	local path = Party.statePath(role)
-	if not isfile(path) then
-		return nil
-	end
-	local ok, data = pcall(function()
-		return Party.http:JSONDecode(readfile(path))
-	end)
-	if ok and type(data) == "table" then
-		return data
-	end
-	return nil
-end
-
-function Party.write(role, data)
-	if not writefile then
-		Party.lastError = "executor has no writefile"
-		return false
-	end
-	Party.seq = Party.seq + 1
-	data.seq = Party.seq
-	data.updated = os.time()
-	data.role = role
-	data.name = lp.Name
-	local ok, err = pcall(function()
-		writefile(Party.statePath(role), Party.http:JSONEncode(data))
-	end)
-	if not ok then
-		Party.lastError = tostring(err)
-	end
-	return ok
-end
-
-function Party.fresh(data)
-	return data and (os.time() - (tonumber(data.updated) or 0) <= 5)
-end
-
-function Party.updateStatus()
-	local label = Party.ui.status
-	if not label then
-		return
-	end
-	local p = Party.partner
-	local text
-	if p then
-		local age = os.time() - (tonumber(p.updated) or 0)
-		local tgt = p.target and tostring(p.target.name or "?") or "-"
-		text = string.format(
-			"Role: %s   Support: %s\nPartner: %s  (seen %ss)\nMode: %s\nChar: %s\nWave: %s   Cen: %s\nTarget: %s\nFollow: %s\nHeal < %s%%\nFile: %s",
-			tostring(Party.role),
-			tostring(Party.supportMode),
-			tostring(p.name or "?"),
-			tostring(age),
-			tostring(p.mode or "?"),
-			tostring(p.char or "?"),
-			tostring(p.wave or "?"),
-			tostring(p.cen or "?"),
-			tgt,
-			Party.followLeader and "on" or "off",
-			tostring(Party.healBelow),
-			Party.statePath(Party.role == "Main" and "support" or "main")
-		)
-	else
-		text = string.format(
-			"Role: %s   Support: %s\nPartner: not connected\nFile: %s",
-			tostring(Party.role),
-			tostring(Party.supportMode),
-			Party.statePath(Party.role == "Main" and "support" or "main")
-		)
-	end
-	pcall(function()
-		label:SetText(text)
-	end)
-end
 
 local WEBHOOK_FILE = "RATHUB_webhook.cfg"
 
@@ -490,7 +362,6 @@ local angleInit = false
 local lastHrp = nil
 local mobs = {}
 local isHealing = false
-local healBusy = false
 local healRequested = false
 local lastHealT = 0
 local resetDone = false
@@ -507,52 +378,7 @@ local transformQuietUntil = 0
 
 local function isTitanForm()
 	local ch = lp.Character
-	if not ch then
-		return false
-	end
-	local vf = ch:FindFirstChild("ValuesFolder")
-	if vf and vf:FindFirstChild("UsingTitan") then
-		return true
-	end
-	if ch:FindFirstChild("TitanTVScript") then
-		return true
-	end
-	return false
-end
-
-local function getCoreCount()
-	local items = nil
-	local d = lp:FindFirstChild("_Data")
-	if d then
-		items = d:FindFirstChild("Items")
-	end
-	if not items then
-		items = lp:FindFirstChild("ItemsFolder")
-	end
-	if not items then
-		return 0
-	end
-	local names = { "X18 Core", "Genesis Core", "Green Core Energy" }
-	local sum = 0
-	for _, name in ipairs(names) do
-		local v = items:FindFirstChild(name)
-		if v then
-			local ok, n = pcall(function()
-				return tonumber(v.Value) or 0
-			end)
-			if ok then
-				sum = sum + n
-			end
-		end
-	end
-	return math.floor(sum)
-end
-
-local function getCen()
-	local d = lp:FindFirstChild("_Data")
-	local money = d and d:FindFirstChild("Money")
-	local v = money and money:FindFirstChild("Moneys")
-	return tonumber(v and v.Value) or 0
+	return ch ~= nil and ch:FindFirstChild("TitanTVScript") ~= nil
 end
 
 -- titan farm includes the normal farm: regular character until the request
@@ -607,7 +433,7 @@ end
 
 local function parseSkillList(text)
 	local out = {}
-	for line in tostring(text or ""):gmatch("[^\r\n;]+") do
+	for line in tostring(text or ""):gmatch("[^\r\n]+") do
 		local cleaned = line:gsub("^%s+", ""):gsub("%s+$", "")
 		if cleaned ~= "" and cleaned:sub(1, 1) ~= "#" then
 			local parts = {}
@@ -665,7 +491,7 @@ end
 local function runSkillNext(list, char, cdf, busy, from)
 	local n = #list
 	if n == 0 then
-		return from, false
+		return from
 	end
 	if type(from) ~= "number" or from < 1 or from > n then
 		from = 1
@@ -689,11 +515,11 @@ local function runSkillNext(list, char, cdf, busy, from)
 				pcall(function()
 					rem:FireServer(table.unpack(s.args))
 				end)
-				return i % n + 1, true, s
+				return i % n + 1
 			end
 		end
 	end
-	return from, false, nil
+	return from
 end
 
 local function yawTo(pos, at)
@@ -792,13 +618,27 @@ end
 
 st.idleVec = parseVec3("-22.430267333984375 3.0063483715057373 -3.2639551162719727")
 
+local function ele(parent, name, opts)
+	if not parent then
+		return nil
+	end
+	local ok, obj = pcall(function()
+		return parent[name](parent, opts)
+	end)
+	if not ok then
+		warn("[RATHUB] UI " .. tostring(name) .. " failed: " .. tostring(obj))
+		return nil
+	end
+	return obj
+end
+
 local function notify(title, content, icon, dur)
 	pcall(function()
-		Library:Notify({
+		WindUI:Notify({
 			Title = title,
-			Description = content or "",
+			Content = content or "",
 			Icon = icon,
-			Time = dur or 3,
+			Duration = dur or 3,
 		})
 	end)
 end
@@ -815,174 +655,62 @@ end
 local function setToggle(tgl, v)
 	if tgl then
 		pcall(function()
-			if tgl.SetValue then
-				tgl:SetValue(v)
-			else
-				tgl:Set(v)
-			end
+			tgl:Set(v)
 		end)
 	end
 end
 
-local function toOneLine(s)
-	local t = tostring(s or ""):gsub("[ \t]*\r?\n[ \t]*", "; ")
-	return t
-end
-
-local function toMultiMap(list)
-	local m = {}
-	if type(list) == "table" then
-		for k, v in pairs(list) do
-			if type(k) == "number" then
-				m[tostring(v)] = true
-			elseif v then
-				m[tostring(k)] = true
-			end
-		end
-	end
-	return m
-end
-
-local function multiNames(v)
-	local out = {}
-	if type(v) == "table" then
-		for k, x in pairs(v) do
-			if type(k) == "number" then
-				local s = tostring(x)
-				if s ~= "" then
-					out[#out + 1] = s
-				end
-			elseif x then
-				local s = tostring(k)
-				if s ~= "" then
-					out[#out + 1] = s
-				end
-			end
-		end
-	elseif v ~= nil and tostring(v) ~= "" then
-		out[1] = tostring(v)
-	end
-	return out
-end
-
-local SKILL_PRESETS = {
-	["Dark Speaker (default)"] = {
-		combat = "SoundWave | SoundWave_Cooldown | SoundImprovement; Swing | Swing_Cooldown",
-		wave = "SpeakerCarrier | SpeakerCarrier_Cooldown; BuffSpeakerMan | Buff_Cooldown",
-		waves = "2,9,17,26,29,30,31",
-	},
-	["Speaker Strider"] = {
-		combat = "SoundWave | SoundWave_Cooldown",
-		wave = "SpeakerCarrier | SpeakerCarrier_Cooldown",
-		waves = "2,9,17,26,29,30,31",
-	},
-}
-local SKILL_PRESET_ORDER = { "Dark Speaker (default)", "Speaker Strider" }
-
-local PATH_PRESETS = {
-	["Quest UTTV + Carrier V2"] = {
-		list = "Camera man | 30; Tv man | 80; TV woman | 80; Large Speaker man | 80; Speaker Strider | 80; Dark Speakerman | 80; Engineer Camera Man | 10; Scientist TV Man | 80; Large TV man | 80; Upgraded Titan TV | 80",
-		special = true,
-	},
-	["Carrier V2"] = {
-		list = "Speaker Strider | 80; Dark Speakerman | 80",
-		special = false,
-	},
-	["UTTV only"] = {
-		list = "Upgraded Titan TV | 80",
-		special = true,
-	},
-	["Custom"] = {
-		list = nil,
-		special = false,
-	},
-}
-local PATH_PRESET_ORDER = { "Quest UTTV + Carrier V2", "Carrier V2", "UTTV only", "Custom" }
-
-local TITAN_FARM = {
-	["Titan TV"] = { radius = 40, item = "Titan-Request", remote = "RequestTitan", price = 2200 },
-	["Titan Cameraman"] = { radius = 15, item = "Titan-Request", remote = "RequestTitan", price = 2200 },
-	["UTSM (Special)"] = { radius = 45, item = "SpecialTitan-Request", remote = "SpecialRequest", price = 7000 },
-}
-
-local SKIN_OPTIONS = {
-	"Jetpacked Double plunger:4 (Mini UTCM) Leg",
-	"Jetpacked Double plunger:2 (Hyper) Myth",
-	"Speaker woman:2 (Exo Speakerwoman) Leg",
-	"Dark Speakerman:2 (Mythical DSM) Myth",
-	"Dark Speakerman:3 (Brawler DSM) Leg",
-	"Scientist TV Man:1 (Betrayer) Myth",
-	"Energized TV:1 (Titan replica) Myth",
-}
-
-local BOOSTER_NAMES = {
-	"Booster X2 Mastery : 30Min",
-	"Booster X2 Mastery : 1Hour",
-	"Booster X2 Mastery : 6Hour",
-	"Booster X2 Points : 30Min",
-	"Booster X2 Points : 1Hour",
-	"Booster X2 Points : 6Hour",
-}
-
-local SHOP_IDS = {
-	"BSX2:30",
-	"BSX2:60",
-	"MasterCard:NormalIII",
-}
-
 bootSet("building UI...")
-local Window = Library:CreateWindow({
+
+local Window = ele(WindUI, "CreateWindow", {
 	Title = "RATHUB | Blockade",
-	Footer = "V2 | Obsidian",
-	Icon = "skull",
-	Size = UDim2.fromOffset(720, 520),
-	NotifySide = "Right",
-	ToggleKeybind = Enum.KeyCode.M,
+	Folder = "RATHUB-Blockade",
+	Icon = "star",
+	Size = UDim2.fromOffset(700, 520),
+	NewElements = true,
+	OpenButton = {
+		Title = "Open RATHUB",
+		Enabled = true,
+		Draggable = true,
+		Scale = 0.5,
+	},
+	Topbar = {
+		Height = 44,
+		ButtonsType = "Mac",
+	},
 })
+if not Window then
+	warn("[RATHUB] window not created")
+	pcall(function()
+		WindUI:Notify({
+			Title = "RATHUB",
+			Content = "WindUI loaded but the window could not be created",
+			Icon = "triangle-alert",
+			Duration = 6,
+		})
+	end)
+	return
+end
+pcall(function()
+	Window:SetToggleKey(Enum.KeyCode.M)
+end)
 
-Party.loadConfig()
+local FarmTab = ele(Window, "Tab", { Title = "Farm", Icon = "crosshair", Border = true })
+local AstroTab = ele(Window, "Tab", { Title = "Astro", Icon = "star", Border = true })
+local TitansTab = ele(Window, "Tab", { Title = "Farm titans", Icon = "crown", Border = true })
+local LobbyTab = ele(Window, "Tab", { Title = "Lobby", Icon = "user", Border = true })
+local MasteryTab = ele(Window, "Tab", { Title = "Mastery", Icon = "target", Border = true })
+local GachaTab = ele(Window, "Tab", { Title = "Gacha", Icon = "gift", Border = true })
+local ShopTab = ele(Window, "Tab", { Title = "Shop", Icon = "shopping-cart", Border = true })
+local SettingsTab = ele(Window, "Tab", { Title = "Settings", Icon = "settings", Border = true })
 
-local FarmTab = Window:AddTab("Farm", "swords")
-local TitansTab = Window:AddTab("Titans", "crown")
-local AstroTab = Window:AddTab("Astro", "star")
-local AutomationTab = Window:AddTab("Automation", "bot")
-local EconomyTab = Window:AddTab("Economy", "shopping-cart")
-local SettingsTab = Window:AddTab("Settings", "settings")
-local Groups = {}
-Party.ui.tab = Window:AddTab("Party", "users")
-
-Groups.Farm = FarmTab:AddGroupbox({ Side = "Left", Name = "Farm", IconName = "swords" })
-Groups.Skill = FarmTab:AddGroupbox({ Side = "Right", Name = "Skills", IconName = "sparkles" })
-Groups.Utility = FarmTab:AddGroupbox({ Side = "Right", Name = "Heal / Loot / Reset", IconName = "wrench" })
-Groups.Titan = TitansTab:AddGroupbox({ Side = "Left", Name = "Titan Farm", IconName = "crown" })
-Groups.TitanExtra = TitansTab:AddGroupbox({ Side = "Right", Name = "Abilities / Request", IconName = "sparkles" })
-Groups.Astro = AstroTab:AddGroupbox({ Side = "Left", Name = "Astro Tokens", IconName = "star" })
-Groups.God = AstroTab:AddGroupbox({ Side = "Right", Name = "God / Safety", IconName = "shield" })
-Groups.Lobby = AutomationTab:AddGroupbox({ Side = "Left", Name = "Lobby", IconName = "vote" })
-Groups.Path = AutomationTab:AddGroupbox({
-	Side = "Right",
-	Name = "Path",
-	IconName = "list-checks",
-	Description = "Мастерство по списку персонажей",
-})
-Groups.PathExtra = AutomationTab:AddGroupbox({
-	Side = "Right",
-	Name = "Path: доп. режимы",
-	IconName = "settings-2",
-	Description = "BossRush fallback, Cen farm и правило ядер",
-})
-Groups.Shop = EconomyTab:AddGroupbox({ Side = "Left", Name = "Shop / Boosts", IconName = "store" })
-Groups.Gacha = EconomyTab:AddGroupbox({ Side = "Right", Name = "Gacha", IconName = "gift" })
-Groups.General = SettingsTab:AddGroupbox({ Side = "Left", Name = "General", IconName = "settings" })
-Groups.Advanced = SettingsTab:AddGroupbox({ Side = "Right", Name = "Advanced", IconName = "wrench" })
-Party.ui.group = Party.ui.tab:AddGroupbox({ Side = "Left", Name = "Party", IconName = "users" })
-Party.ui.info = Party.ui.tab:AddGroupbox({ Side = "Right", Name = "Link", IconName = "activity" })
-
+local FarmSec = ele(FarmTab, "Section", { Title = "Farm" })
 local farmToggle
-farmToggle = Groups.Farm:AddToggle("v1_farm", {
-	Text = "Включит",
-	Tooltip = "Ну бля сам авто-фарм",
-	Default = st.farm,
+farmToggle = ele(FarmSec, "Toggle", {
+	Title = "Включит",
+	Desc = "Ну бля сам авто-фарм",
+	Value = false,
+	Flag = "farm",
 	Callback = function(on)
 		st.farm = on
 		if on then
@@ -992,104 +720,89 @@ farmToggle = Groups.Farm:AddToggle("v1_farm", {
 		end
 	end,
 })
-pcall(function()
-	farmToggle:AddKeyPicker("v1_farm_key", {
-		Text = "Бинд для фарма",
-		Default = "X",
-		Mode = "Toggle",
-		SyncToggleState = true,
-	})
-end)
-Groups.Farm:AddSlider("v1_speed", {
-	Text = "Скорость полёта типа",
-	Default = st.speed,
-	Min = 100,
-	Max = 4000,
-	Rounding = 0,
+ele(FarmSec, "Keybind", {
+	Title = "Бинд для фарма",
+	Value = "X",
+	Callback = function()
+		local nv = not st.farm
+		st.farm = nv
+		setToggle(farmToggle, nv)
+	end,
+})
+ele(FarmSec, "Slider", {
+	Title = "Скорость полёта типа",
+	Step = 25,
+	Value = { Min = 100, Max = 4000, Default = 600 },
 	Callback = function(v)
 		st.speed = v
 	end,
 })
-Groups.Farm:AddSlider("v1_radius", {
-	Text = "Радиус орбиты",
-	Default = st.radius,
-	Min = 3,
-	Max = 40,
-	Rounding = 0,
+ele(FarmSec, "Slider", {
+	Title = "Радиус орбиты",
+	Step = 1,
+	Value = { Min = 3, Max = 40, Default = 10 },
 	Callback = function(v)
 		st.radius = v
 	end,
 })
-Groups.Farm:AddSlider("v1_orbit", {
-	Text = "Скорость орбиты",
-	Default = st.orbitDeg,
-	Min = 10,
-	Max = 360,
-	Rounding = 0,
+ele(FarmSec, "Slider", {
+	Title = "Скорость орбиты",
+	Step = 1,
+	Value = { Min = 10, Max = 360, Default = 90 },
 	Callback = function(v)
 		st.orbitDeg = v
 	end,
 })
-Groups.Farm:AddInput("v1_priority", {
-	Text = "Приоритет на атаку",
-	Default = st.priority,
+ele(FarmSec, "Input", {
+	Title = "Приоритет на атаку",
+	Value = "G-Toilet 3.0",
 	Placeholder = "name1, name2",
 	Callback = function(v)
 		st.priority = v
 	end,
 })
-Groups.Farm:AddToggle("v1_m1", {
-	Text = "М1 спам",
-	Tooltip = "Название само за себя говорит",
-	Default = st.m1,
+ele(FarmSec, "Toggle", {
+	Title = "М1 спам",
+	Desc = "Название само за себя говорит",
+	Value = true,
 	Callback = function(v)
 		st.m1 = v
 	end,
 })
-Groups.Farm:AddToggle("v1_m1_spam", {
-	Text = "М1 спам второй эдишен",
-	Default = st.m1Spam,
+ele(FarmSec, "Toggle", {
+	Title = "М1 спам второй эдишен",
+	Value = false,
 	Callback = function(v)
 		st.m1Spam = v
 	end,
 })
-Groups.Farm:AddToggle("v1_silent_aim", {
-	Text = "Silent Aim",
-	Tooltip = "Отправляет MouseStream в цель — для стрелков и парного фарма",
-	Default = st.silentAim,
-	Callback = function(v)
-		st.silentAim = v
-		if not v and st._clearAim then
-			st._clearAim()
-		end
-	end,
-})
-Groups.Farm:AddSlider("v1_silent_aim_rate", {
-	Text = "Silent Aim rate",
-	Default = math.floor(st.silentAimRate * 1000),
-	Min = 20,
-	Max = 200,
-	Rounding = 0,
-	Suffix = " ms",
-	Callback = function(v)
-		st.silentAimRate = v / 1000
-	end,
-})
 
-Groups.Skill:AddLabel({ Text = "<b>Skills</b>", DoesWrap = false })
-Groups.Skill:AddToggle("v1_skills", {
-	Text = "Авто скиллы",
-	Default = st.skills,
+local SkillSec = ele(FarmTab, "Section", { Title = "Auto Skills (remote)" })
+ele(SkillSec, "Toggle", {
+	Title = "Авто скиллы",
+	Value = false,
 	Callback = function(v)
 		st.skills = v
 	end,
 })
-Groups.Skill:AddDropdown("v1_skill_preset", {
-	Text = "Пресеты",
-	Tooltip = "Пресет задаёт комбат-скиллы, волны и список волн",
-	Values = SKILL_PRESET_ORDER,
-	Default = "Dark Speaker (default)",
-	Searchable = false,
+local skillCombatInput, skillWaveInput, skillWaveListInput
+local SKILL_PRESETS = {
+	["Dark Speaker (default)"] = {
+		combat = "SoundWave | SoundWave_Cooldown | SoundImprovement\nSwing | Swing_Cooldown",
+		wave = "SpeakerCarrier | SpeakerCarrier_Cooldown\nBuffSpeakerMan | Buff_Cooldown",
+		waves = "2,9,17,26,29,30,31",
+	},
+	["Speaker Strider"] = {
+		combat = "SoundWave | SoundWave_Cooldown",
+		wave = "SpeakerCarrier | SpeakerCarrier_Cooldown",
+		waves = "2,9,17,26,29,30,31",
+	},
+}
+ele(SkillSec, "Dropdown", {
+	Title = "Пресеты",
+	Desc = "Fills combat / wave / wave list below",
+	Values = { "Dark Speaker (default)", "Speaker Strider" },
+	Value = 1,
 	Callback = function(v)
 		local p = SKILL_PRESETS[v]
 		if not p then
@@ -1098,38 +811,67 @@ Groups.Skill:AddDropdown("v1_skill_preset", {
 		st.skillCombatList = p.combat
 		st.skillWaveList = p.wave
 		st.waveList = p.waves
+		pcall(function()
+			if skillCombatInput then
+				skillCombatInput:Set(p.combat)
+			end
+		end)
+		pcall(function()
+			if skillWaveInput then
+				skillWaveInput:Set(p.wave)
+			end
+		end)
+		pcall(function()
+			if skillWaveListInput then
+				skillWaveListInput:Set(p.waves)
+			end
+		end)
 	end,
 })
-Groups.Skill:AddToggle("v1_skill_busy", {
-	Text = "Во время М1 не юзать абилку",
-	Default = st.skillBusy,
+skillCombatInput = ele(SkillSec, "Input", {
+	Title = "Комбат скиллы",
+	Desc = "Remote | Cooldown | RequireChild | args  (one per line)",
+	Type = "Textarea",
+	Value = "SoundWave | SoundWave_Cooldown | SoundImprovement\nSwing | Swing_Cooldown",
 	Callback = function(v)
-		st.skillBusy = v
+		st.skillCombatList = v
 	end,
 })
-Groups.Skill:AddToggle("v1_skill_orbit", {
-	Text = "Юзать абилку только во время орбиты",
-	Default = st.skillOrbitOnly,
+skillWaveInput = ele(SkillSec, "Input", {
+	Title = "Скиллы на определенных волнах",
+	Desc = "Fired on waves from the wave list",
+	Type = "Textarea",
+	Value = "SpeakerCarrier | SpeakerCarrier_Cooldown\nBuffSpeakerMan | Buff_Cooldown",
 	Callback = function(v)
-		st.skillOrbitOnly = v
+		st.skillWaveList = v
 	end,
 })
-Groups.Skill:AddSlider("v1_skill_delay", {
-	Text = "Интервал спама",
-	Default = st.skillDelay,
-	Min = 0.05,
-	Max = 2,
-	Rounding = 2,
+ele(SkillSec, "Toggle", { Title = "Во время М1 не юзать абилку", Value = true, Callback = function(v)
+	st.skillBusy = v
+end })
+ele(SkillSec, "Toggle", { Title = "Юзать абилку только во время орбиты", Value = false, Callback = function(v)
+	st.skillOrbitOnly = v
+end })
+ele(SkillSec, "Slider", {
+	Title = "Интервал спама",
+	Step = 0.05,
+	Value = { Min = 0.05, Max = 2, Default = 0.3 },
 	Callback = function(v)
 		st.skillDelay = v
 	end,
 })
+skillWaveListInput = ele(SkillSec, "Input", {
+	Title = "Волна на которых абилка типа",
+	Value = "2,9,17,26,29,30,31",
+	Callback = function(v)
+		st.waveList = v
+	end,
+})
 
-Groups.Utility:AddLabel({ Text = "<b>Heal</b>", DoesWrap = false })
-Groups.Utility:AddToggle("v1_heal", {
-	Text = "Авто хил",
-	Tooltip = "Мне лень эту хуйню фиксить",
-	Default = st.heal,
+local HealSec = ele(FarmTab, "Section", { Title = "Auto Heal" })
+ele(HealSec, "Toggle", {
+	Title = "Авто хил (мне лень эту хуйню фиксить)",
+	Value = false,
 	Callback = function(v)
 		st.heal = v
 		if v then
@@ -1137,63 +879,56 @@ Groups.Utility:AddToggle("v1_heal", {
 		end
 	end,
 })
-Groups.Utility:AddSlider("v1_heal_hp", {
-	Text = "Хилится ниже хп",
-	Default = st.healHP,
-	Min = 1,
-	Max = 100,
-	Rounding = 0,
+ele(HealSec, "Slider", {
+	Title = "Хилится ниже хп",
+	Step = 1,
+	Value = { Min = 1, Max = 100, Default = 100 },
 	Callback = function(v)
 		st.healHP = v
 	end,
 })
-Groups.Utility:AddSlider("v1_heal_try", {
-	Text = "Попытатся похилится",
-	Tooltip = "Спамит хиллом по интервалу",
-	Default = st.healTry,
-	Min = 4,
-	Max = 30,
-	Rounding = 0,
+ele(HealSec, "Slider", {
+	Title = "Попытатся похилится",
+	Desc = "Спамит хиллом по интервалу",
+	Step = 1,
+	Value = { Min = 4, Max = 30, Default = 12 },
 	Callback = function(v)
 		st.healTry = v
 	end,
 })
 
-Groups.Utility:AddLabel({ Text = "<b>Loot</b>", DoesWrap = false })
-Groups.Utility:AddToggle("v1_loot", {
-	Text = "Авто лут",
-	Tooltip = "Лутает говно",
-	Default = st.loot,
+local LootSec = ele(FarmTab, "Section", { Title = "Auto Loot" })
+ele(LootSec, "Toggle", {
+	Title = "Авто лут",
+	Desc = "Лутает говно",
+	Value = st.loot,
+	Flag = "loot",
 	Callback = function(v)
 		st.loot = v
 		notify("Loot", v and "auto loot on" or "auto loot off", v and "check" or "info", 2)
 	end,
 })
-Groups.Utility:AddSlider("v1_loot_range", {
-	Text = "Радиус лута",
-	Default = st.lootRange,
-	Min = 25,
-	Max = 2000,
-	Rounding = 0,
+ele(LootSec, "Slider", {
+	Title = "Вещь, которой никогда пользоватся не буду",
+	Step = 50,
+	Value = { Min = 25, Max = 2000, Default = 1000 },
 	Callback = function(v)
 		st.lootRange = v
 	end,
 })
-Groups.Utility:AddSlider("v1_loot_delay", {
-	Text = "Интервал лута",
-	Default = math.floor(st.lootDelay * 100),
-	Min = 10,
-	Max = 300,
-	Rounding = 0,
+ele(LootSec, "Slider", {
+	Title = "Тоже бесполезно",
+	Step = 5,
+	Value = { Min = 10, Max = 300, Default = 35 },
 	Callback = function(v)
 		st.lootDelay = v / 100
 	end,
 })
 
-Groups.Utility:AddLabel({ Text = "<b>Reset Wave</b>", DoesWrap = false })
-Groups.Utility:AddToggle("v1_reset_wave", {
-	Text = "На какой волне ресет",
-	Default = st.resetWave,
+local ResetSec = ele(FarmTab, "Section", { Title = "Reset wave" })
+ele(ResetSec, "Toggle", {
+	Title = "На какой волне ресет",
+	Value = false,
 	Callback = function(v)
 		st.resetWave = v
 		if v then
@@ -1201,359 +936,65 @@ Groups.Utility:AddToggle("v1_reset_wave", {
 		end
 	end,
 })
-Groups.Utility:AddSlider("v1_reset_wave_num", {
-	Text = "Волна на которой ресетнутся",
-	Default = st.resetWaveNum,
-	Min = 1,
-	Max = 200,
-	Rounding = 0,
+ele(ResetSec, "Slider", {
+	Title = "Волна на которой ресетнутся",
+	Step = 1,
+	Value = { Min = 1, Max = 200, Default = 5 },
 	Callback = function(v)
 		st.resetWaveNum = v
 	end,
 })
-Groups.Utility:AddLabel({ Text = "<b>Skill Tree</b>", DoesWrap = false })
-Groups.Utility:AddToggle("v1_skilltree_auto", {
-	Text = "Авто-покупка Skill Tree",
-	Tooltip = "Покупает доступные ноды текущего персонажа за MoneysInShop",
-	Default = st.skillTreeAuto,
+
+local GodSec = ele(FarmTab, "Section", { Title = "Холи бессмертие" })
+local godToggle
+godToggle = ele(GodSec, "Toggle", {
+	Title = "Ресет до смерти (бог режим крч)",
+	Desc = "Ну типа хазе",
+	Value = false,
 	Callback = function(v)
-		st.skillTreeAuto = v
+		st.god = v
+		notify("God", v and "auto reset armed" or "auto reset off", v and "check" or "info", 2)
 	end,
 })
-st._skillTreeLabel = Groups.Utility:AddLabel({ Text = "Skill Tree: idle", DoesWrap = true })
-
-task.spawn(function()
-	local module
-	while alive() do
-		task.wait(0.4)
-		if st.skillTreeAuto then
-			if not module then
-				local m = rs:FindFirstChild("SkillsTree")
-				if m then
-					local ok, res = pcall(require, m)
-					if ok then
-						module = res
-					end
-				end
-			end
-			if module then
-				local pv = lp:FindFirstChild("PlayerValues")
-				local ch = lp.Character
-				local vf = ch and ch:FindFirstChild("ValuesFolder")
-				local charName
-				if vf and vf:FindFirstChild("UsingTitan") then
-					charName = pv and pv:FindFirstChild("Titan") and pv.Titan.Value
-				else
-					charName = pv and pv:FindFirstChild("Character") and pv.Character.Value
-				end
-				local tree = charName and module.Tree(charName)
-				local folder = lp:FindFirstChild("SkillTreesFolder")
-				local data = lp:FindFirstChild("Data")
-				local money = data and data:FindFirstChild("MoneysInShop")
-				local rawCash = money and tostring(money.Value) or ""
-				local cash = (rawCash:lower() == "inf") and math.huge or (tonumber(rawCash) or 0)
-				local bought = nil
-				if tree and folder then
-					for skill, node in pairs(tree) do
-						if not folder:FindFirstChild(skill) then
-							local req = node[2]
-							local reqOk = true
-							if req then
-								if type(req) == "table" then
-									for _, r in ipairs(req) do
-										if not folder:FindFirstChild(r) then
-											reqOk = false
-											break
-										end
-									end
-								else
-									reqOk = folder:FindFirstChild(req) ~= nil
-								end
-							end
-							local price = node[3]
-							if type(price) == "table" then
-								price = price[1]
-							end
-							price = tonumber(price) or 0
-							if reqOk and cash >= price then
-								local rem = rs:FindFirstChild("SkillTrees")
-								if rem then
-									pcall(function()
-										rem:FireServer(skill)
-									end)
-									bought = skill
-								end
-								break
-							end
-						end
-					end
-				end
-				if st._skillTreeLabel then
-					if not charName then
-						st._skillTreeLabel:SetText("Skill Tree: no character")
-					elseif not tree then
-						st._skillTreeLabel:SetText("Skill Tree: no tree for " .. tostring(charName))
-					elseif bought then
-						st._skillTreeLabel:SetText("Skill Tree: buying " .. tostring(bought) .. " (" .. tostring(cash) .. " C)")
-						task.wait(0.6)
-					else
-						st._skillTreeLabel:SetText("Skill Tree: no affordable nodes (" .. tostring(cash) .. " C)")
-					end
-				end
-			end
+ele(GodSec, "Slider", {
+	Title = "Тут типо на какой шкале хп ресетать",
+	Desc = "Хорни кроссточкапнг",
+	Step = 1,
+	Value = { Min = 1, Max = 10000, Default = 800 },
+	Callback = function(v)
+		st.godHP = v
+	end,
+})
+ele(GodSec, "Keybind", {
+	Title = "Респаун",
+	Value = "R",
+	Callback = function()
+		if godBusy then
+			return
 		end
-	end
-end)
-
-local titanToggle
-titanToggle = Groups.Titan:AddToggle("v1_titan", {
-	Text = "Enabled",
-	Tooltip = "Авто-фарм мастери на титанах (обязательно врубать ещё обычный фарм!)",
-	Default = st.titanFarm,
-	Callback = function(on)
-		st.titanFarm = on
-		if on then
-			notify("Titan", "farm started", "check", 2)
-		else
-			notify("Titan", "farm stopped", "info", 2)
-		end
-	end,
-})
-pcall(function()
-	titanToggle:AddKeyPicker("v1_titan_key", {
-		Text = "Бинд",
-		Default = "B",
-		Mode = "Toggle",
-		SyncToggleState = true,
-	})
-end)
-local titanRadiusSlider
-st._titanPresetDropdown = Groups.Titan:AddDropdown("v1_titan_preset", {
-	Text = "Пресет титана",
-	Tooltip = "Скиллы и атаки настроены под него. Реквест одинаковый.",
-	Values = { "Titan TV", "Titan Cameraman", "UTSM (Special)" },
-	Default = st.titanPreset,
-	Callback = function(v)
-		st.titanPreset = v
-		local farm = TITAN_FARM[v]
-		if farm then
-			st.titanShopItem = farm.item
-			st.titanRequestRemote = farm.remote
-			st.titanPrice = farm.price
-			st.titanRequestType = (farm.remote == "SpecialRequest") and "Special Titan Request" or "Titan Request"
-			if farm.radius then
-				st.titanRadius = farm.radius
-				pcall(function()
-					if titanRadiusSlider then
-						titanRadiusSlider:SetValue(farm.radius)
-					end
-				end)
+		godBusy = true
+		task.spawn(function()
+			local okR = respawnNow()
+			if okR and st.astro then
+				astroSnapNext = true
 			end
-			if st._titanRequestDropdown then
-				pcall(function()
-					st._titanRequestDropdown:SetValue(st.titanRequestType)
-				end)
-			end
-		end
-	end,
-})
-Groups.Titan:AddSlider("v1_titan_speed", {
-	Text = "Скорость",
-	Default = st.titanSpeed,
-	Min = 100,
-	Max = 4000,
-	Rounding = 0,
-	Callback = function(v)
-		st.titanSpeed = v
-	end,
-})
-titanRadiusSlider = Groups.Titan:AddSlider("v1_titan_radius", {
-	Text = "Орбита радиус",
-	Default = st.titanRadius,
-	Min = 5,
-	Max = 120,
-	Rounding = 0,
-	Callback = function(v)
-		st.titanRadius = v
-	end,
-})
-Groups.Titan:AddSlider("v1_titan_orbit", {
-	Text = "Орбита спид",
-	Default = st.titanOrbitDeg,
-	Min = 10,
-	Max = 360,
-	Rounding = 0,
-	Callback = function(v)
-		st.titanOrbitDeg = v
-	end,
-})
-Groups.Titan:AddInput("v1_titan_priority", {
-	Text = "По желанию, приоритет",
-	Default = st.titanPriority,
-	Placeholder = "name1, name2",
-	Callback = function(v)
-		st.titanPriority = v
-	end,
-})
-Groups.Titan:AddToggle("v1_titan_m1", {
-	Text = "М1 атака",
-	Default = st.titanM1,
-	Callback = function(v)
-		st.titanM1 = v
+			notify("God", "respawn: " .. (okR and "ok" or "FAIL"), "info", 2)
+			task.wait(1)
+			godBusy = false
+		end)
 	end,
 })
 
-Groups.TitanExtra:AddLabel({ Text = "<b>Abilities</b>", DoesWrap = false })
-Groups.TitanExtra:AddToggle("v1_titan_skills", {
-	Text = "Авто абилки",
-	Default = st.titanSkillsOn,
-	Callback = function(v)
-		st.titanSkillsOn = v
-	end,
-})
-Groups.TitanExtra:AddToggle("v1_titan_orbit_only", {
-	Text = "Скиллы только во время орбиты",
-	Default = st.titanOrbitOnly,
-	Callback = function(v)
-		st.titanOrbitOnly = v
-	end,
-})
-Groups.TitanExtra:AddSlider("v1_titan_skill_delay", {
-	Text = "Интервал спама",
-	Default = st.titanSkillDelay,
-	Min = 0.05,
-	Max = 2,
-	Rounding = 2,
-	Callback = function(v)
-		st.titanSkillDelay = v
-	end,
-})
-
-Groups.TitanExtra:AddSlider("v1_hold_duration", {
-	Text = "Длительность зажима",
-	Tooltip = "Сколько держать Core/Gatling/Laser и хил Clock",
-	Default = st.holdDuration,
-	Min = 0.8,
-	Max = 3,
-	Rounding = 1,
-	Suffix = " s",
-	Callback = function(v)
-		st.holdDuration = v
-	end,
-})
-
-Groups.TitanExtra:AddLabel({ Text = "<b>Request</b>", DoesWrap = false })
-local titanAutoRequestToggle
-titanAutoRequestToggle = Groups.TitanExtra:AddToggle("v1_titan_auto_req", {
-	Text = "Авто-покупка реквеста",
-	Tooltip = "Покупает, когда хватает игровой валюты и вертолёт доступен",
-	Default = st.titanAutoRequest,
-	Callback = function(v)
-		st.titanAutoRequest = v
-		if v then
-			notify("Titan", "auto request armed", "check", 2)
-		end
-	end,
-})
-st._titanRequestDropdown = Groups.TitanExtra:AddDropdown("v1_titan_request_type", {
-	Text = "Тип Titan Request",
-	Values = { "Titan Request", "Special Titan Request" },
-	Default = st.titanRequestType,
-	Searchable = false,
-	Callback = function(v)
-		st.titanRequestType = v
-		if v == "Special Titan Request" then
-			st.titanShopItem = "SpecialTitan-Request"
-			st.titanRequestRemote = "SpecialRequest"
-			st.titanPrice = 7000
-			if st.titanPreset ~= "UTSM (Special)" then
-				st.titanPreset = "UTSM (Special)"
-				st.titanRadius = 45
-				pcall(function()
-					if st._titanPresetDropdown then
-						st._titanPresetDropdown:SetValue("UTSM (Special)")
-					end
-					if titanRadiusSlider then
-						titanRadiusSlider:SetValue(45)
-					end
-				end)
-			end
-		else
-			st.titanShopItem = "Titan-Request"
-			st.titanRequestRemote = "RequestTitan"
-			st.titanPrice = 2200
-			if st.titanPreset == "UTSM (Special)" then
-				st.titanPreset = "Titan TV"
-				st.titanRadius = 40
-				pcall(function()
-					if st._titanPresetDropdown then
-						st._titanPresetDropdown:SetValue("Titan TV")
-					end
-					if titanRadiusSlider then
-						titanRadiusSlider:SetValue(40)
-					end
-				end)
-			end
-		end
-	end,
-})
-Groups.TitanExtra:AddLabel({ Text = "<b>UTSM апгрейд (вертолёт)</b>", DoesWrap = false })
-Groups.TitanExtra:AddDropdown("v1_utsm_mode", {
-	Text = "Апгрейд",
-	Tooltip = "Покупается на вертолёте, как колонны у Titan TV",
-	Values = { "Upgrade", "Core", "SoundBooster", "OverCharge", "Jetpack" },
-	Default = st.utsmMode,
-	Searchable = false,
-	Callback = function(v)
-		st.utsmMode = v
-		st.utsmModeApplied = false
-	end,
-})
-Groups.TitanExtra:AddToggle("v1_utsm_auto", {
-	Text = "Авто-покупка апгрейда",
-	Tooltip = "В UTSM-форме подходит к вертолёту и покупает выбранный апгрейд",
-	Default = st.utsmAuto,
-	Callback = function(v)
-		st.utsmAuto = v
-		st.utsmModeApplied = false
-	end,
-})
-Groups.TitanExtra:AddLabel({
-	Text = "Покупка идёт только у вертолёта и списывает игровую валюту.",
-	DoesWrap = true,
-})
-st._utsmStatus = Groups.TitanExtra:AddLabel({ Text = "UTSM: idle", DoesWrap = true })
-Groups.TitanExtra:AddToggle("v1_utsm_gatling", {
-	Text = "В бою: Galting вместо FifthShot",
-	Default = st.utsmGatling,
-	Callback = function(v)
-		st.utsmGatling = v
-	end,
-})
-Groups.TitanExtra:AddSlider("v1_titan_reset_wave", {
-	Text = "Ресетатся на какой то волне",
-	Tooltip = "0 значит вырублено",
-	Default = st.titanResetWave,
-	Min = 0,
-	Max = 40,
-	Rounding = 0,
-	Callback = function(v)
-		st.titanResetWave = v
-	end,
-})
-
-Groups.Astro:AddLabel({
-	Text = "Сука ставить авто голосование на AstroV2!!!",
-	DoesWrap = true,
-})
-Groups.Astro:AddLabel({
-	Text = "Фармит хоулдаут",
-	DoesWrap = true,
+local AstroSec = ele(AstroTab, "Section", { Title = "Астро токены авто-фап" })
+ele(AstroSec, "Paragraph", {
+	Title = "Сука ставить авто голосование на AstroV2!!!",
+	Desc = "Фармит хоулдаут",
 })
 local astroToggle
-astroToggle = Groups.Astro:AddToggle("v1_astro", {
-	Text = "Включить авто-токены",
-	Default = st.astro,
+astroToggle = ele(AstroSec, "Toggle", {
+	Title = "Включить авто-токены",
+	Value = false,
+	Flag = "astro",
 	Callback = function(on)
 		st.astro = on
 		if on then
@@ -1563,32 +1004,74 @@ astroToggle = Groups.Astro:AddToggle("v1_astro", {
 		end
 	end,
 })
-pcall(function()
-	astroToggle:AddKeyPicker("v1_astro_key", {
-		Text = "Бинд",
-		Default = "K",
-		Mode = "Toggle",
-		SyncToggleState = true,
-	})
-end)
-Groups.Astro:AddSlider("v1_astro_speed", {
-	Text = "Скорость полёта",
-	Default = st.astroSpeed,
-	Min = 100,
-	Max = 2000,
-	Rounding = 0,
+ele(AstroSec, "Keybind", {
+	Title = "Бинд",
+	Value = "K",
+	Callback = function()
+		local nv = not st.astro
+		st.astro = nv
+		setToggle(astroToggle, nv)
+	end,
+})
+ele(AstroSec, "Slider", {
+	Title = "Скорость полёта",
+	Step = 10,
+	Value = { Min = 100, Max = 2000, Default = 600 },
 	Callback = function(v)
 		st.astroSpeed = v
 	end,
 })
-Groups.Astro:AddToggle("v1_astro_heal", {
-	Text = "Только вантуз: авто-хил",
-	Default = st.astroHeal,
+ele(AstroSec, "Toggle", {
+	Title = "Только вантуз: Авто-хил с помощью декларации",
+	Value = true,
 	Callback = function(v)
 		st.astroHeal = v
 	end,
 })
-local astroParagraph = Groups.Astro:AddLabel({ Text = "Astro Tokens: waiting...", DoesWrap = true })
+ele(AstroSec, "Input", {
+	Title = "Не пользуйся этим, я хз зачем добавил",
+	Desc = "Paste Vector3 lines from pos_copier. Leave empty to use default 9 points.",
+	Type = "Textarea",
+	Value = "",
+	Placeholder = "Vector3.new(-646, 276, 453)...",
+	Callback = function(v)
+		st.astroPointsText = v or ""
+	end,
+})
+ele(AstroSec, "Toggle", {
+	Title = "Год мод (я хз вроде норм работает)",
+	Desc = "пизда",
+	Value = false,
+	Callback = function(v)
+		st.god = v
+		setToggle(godToggle, v)
+	end,
+})
+ele(AstroSec, "Slider", {
+	Title = "Год мод слайдер хп",
+	Desc = "Шэрит",
+	Step = 1,
+	Value = { Min = 1, Max = 10000, Default = 100 },
+	Callback = function(v)
+		st.godHP = v
+	end,
+})
+ele(AstroSec, "Toggle", {
+	Title = "Бессмертие не будет работать после 20 секунд",
+	Desc = "Это засейвит твой токен я думаю",
+	Value = true,
+	Callback = function(v)
+		st.godSkipTimer0 = v
+	end,
+})
+ele(AstroSec, "Paragraph", {
+	Title = "Рекомендуемые персонажи",
+	Desc = "Кто лучший?(я): Mini UTCM",
+})
+local astroParagraph = ele(AstroSec, "Paragraph", {
+	Title = "Astro Tokens",
+	Desc = "waiting...",
+})
 
 task.spawn(function()
 	local base = nil
@@ -1609,7 +1092,7 @@ task.spawn(function()
 					local gained = math.floor(val - base)
 					local txt = tostring(val) .. (gained > 0 and (" (+" .. tostring(gained) .. ")") or "")
 					pcall(function()
-						astroParagraph:SetText(txt)
+						astroParagraph:SetDesc(txt)
 					end)
 				end
 			end
@@ -1617,519 +1100,232 @@ task.spawn(function()
 	end
 end)
 
-local godToggle
-godToggle = Groups.God:AddToggle("v1_god", {
-	Text = "Ресет до смерти (бог режим крч)",
-	Tooltip = "Ну типа хазе",
-	Default = st.god,
-	Callback = function(v)
-		st.god = v
-		notify("God", v and "auto reset armed" or "auto reset off", v and "check" or "info", 2)
-	end,
-})
-Groups.God:AddSlider("v1_god_hp", {
-	Text = "На какой шкале хп ресетать",
-	Tooltip = "Хорни кроссточкапнг",
-	Default = st.godHP,
-	Min = 1,
-	Max = 10000,
-	Rounding = 0,
-	Callback = function(v)
-		st.godHP = v
-	end,
-})
-local function doRespawn()
-	if godBusy then
-		return
-	end
-	godBusy = true
-	task.spawn(function()
-		local okR = respawnNow()
-		if okR and st.astro then
-			astroSnapNext = true
+local TitanSec = ele(TitansTab, "Section", { Title = "Titan farm" })
+local titanToggle
+titanToggle = ele(TitanSec, "Toggle", {
+	Title = "Enabled",
+	Desc = "Авто-фарм мастери на титанах (обязательно врубать ещё обычный фарм!)",
+	Value = false,
+	Flag = "titanFarm",
+	Callback = function(on)
+		st.titanFarm = on
+		if on then
+			notify("Titan", "farm started", "check", 2)
+		else
+			notify("Titan", "farm stopped", "info", 2)
 		end
-		notify("God", "respawn: " .. (okR and "ok" or "FAIL"), "info", 2)
-		task.wait(1)
-		godBusy = false
-	end)
-end
-local respawnButton = Groups.God:AddButton({
-	Text = "Респаун",
-	Func = doRespawn,
-})
-pcall(function()
-	respawnButton:AddKeyPicker("v1_respawn_key", {
-		Text = "Респаун",
-		Default = "R",
-		Mode = "Press",
-		Callback = function()
-			doRespawn()
-		end,
-		Clicked = function()
-			doRespawn()
-		end,
-	})
-end)
-Groups.God:AddToggle("v1_god_skip", {
-	Text = "Не ресетать первые 20 сек волны",
-	Tooltip = "Полезно для Astro-токенов",
-	Default = st.godSkipTimer0,
-	Callback = function(v)
-		st.godSkipTimer0 = v
 	end,
 })
-Groups.God:AddLabel({
-	Text = "Рекомендуемые персонажи: Mini UTCM",
-	DoesWrap = true,
+ele(TitanSec, "Keybind", {
+	Title = "Бинд",
+	Value = "B",
+	Callback = function()
+		local nv = not st.titanFarm
+		st.titanFarm = nv
+		setToggle(titanToggle, nv)
+	end,
+})
+ele(TitanSec, "Dropdown", {
+	Title = "Пресет титана",
+	Desc = "Скиллы и атаки настроены под него. Реквест одинаковый.",
+	Values = { "Titan TV", "Titan Cameraman" },
+	Value = st.titanPreset,
+	Callback = function(v)
+		st.titanPreset = v
+		-- same request item for every titan
+		st.titanShopItem = "Titan-Request"
+	end,
+})
+ele(TitanSec, "Slider", {
+	Title = "Скорость",
+	Step = 50,
+	Value = { Min = 100, Max = 4000, Default = 1200 },
+	Callback = function(v)
+		st.titanSpeed = v
+	end,
+})
+ele(TitanSec, "Slider", {
+	Title = "Орбита радиус",
+	Desc = "сирин пидор",
+	Step = 1,
+	Value = { Min = 5, Max = 120, Default = 40 },
+	Callback = function(v)
+		st.titanRadius = v
+	end,
+})
+ele(TitanSec, "Slider", {
+	Title = "Орбита спид",
+	Desc = "шприц",
+	Step = 1,
+	Value = { Min = 10, Max = 360, Default = 180 },
+	Callback = function(v)
+		st.titanOrbitDeg = v
+	end,
+})
+ele(TitanSec, "Slider", {
+	Title = "Это тебе не надо",
+	Desc = "ы",
+	Step = 0.1,
+	Value = { Min = 20, Max = 100, Default = 58.4 },
+	Callback = function(v)
+		st.titanFeetOffset = v
+	end,
+})
+ele(TitanSec, "Input", {
+	Title = "По желанию, приоритет",
+	Value = "",
+	Placeholder = "name1, name2",
+	Callback = function(v)
+		st.titanPriority = v
+	end,
+})
+ele(TitanSec, "Toggle", {
+	Title = "М1 атака",
+	Desc = "ы, я заебался",
+	Value = true,
+	Callback = function(v)
+		st.titanM1 = v
+	end,
 })
 
-Groups.Lobby:AddToggle("v1_vote", {
-	Text = "Авто-голосование",
-	Default = st.vote,
+local TitanSkillSec = ele(TitansTab, "Section", { Title = "Titan abilities" })
+ele(TitanSkillSec, "Toggle", {
+	Title = "Авто абилки",
+	Value = true,
 	Callback = function(v)
-		st.vote = v
+		st.titanSkillsOn = v
 	end,
 })
-local voteModeDropdown
-voteModeDropdown = Groups.Lobby:AddDropdown("v1_vote_mode", {
-	Text = "За какой мод голосовать",
+ele(TitanSkillSec, "Toggle", {
+	Title = "Скиллы только во время орбиты",
+	Desc = "шкуллшутер",
+	Value = true,
+	Callback = function(v)
+		st.titanOrbitOnly = v
+	end,
+})
+ele(TitanSkillSec, "Slider", {
+	Title = "Интервал спама",
+	Step = 0.05,
+	Value = { Min = 0.05, Max = 2, Default = 0.35 },
+	Callback = function(v)
+		st.titanSkillDelay = v
+	end,
+})
+
+local TitanReqSec = ele(TitansTab, "Section", { Title = "Авто-покупка титан реквеста" })
+ele(TitanReqSec, "Toggle", {
+	Title = "Авто-покупка реквеста",
+	Desc = "нахуя нерфить ттв",
+	Value = true,
+	Flag = "titanRequest",
+	Callback = function(v)
+		st.titanAutoRequest = v
+		if v then
+			notify("Titan", "auto request armed", "check", 2)
+		end
+	end,
+})
+ele(TitanReqSec, "Slider", {
+	Title = "На какой волне покупать (не юзать)",
+	Desc = "алах акбар",
+	Step = 1,
+	Value = { Min = 1, Max = 100, Default = 1 },
+	Callback = function(v)
+		st.titanRequestWave = v
+	end,
+})
+ele(TitanReqSec, "Toggle", {
+	Title = "Авто-покупок колонок титану тв",
+	Desc = "абвговно",
+	Value = true,
+	Callback = function(v)
+		st.titanCinema = v
+	end,
+})
+ele(TitanReqSec, "Slider", {
+	Title = "Ресетатся на какой то волне",
+	Desc = "0 значит вырублено",
+	Step = 1,
+	Value = { Min = 0, Max = 40, Default = 10 },
+	Callback = function(v)
+		st.titanResetWave = v
+	end,
+})
+
+local LobbySec = ele(LobbyTab, "Section", { Title = "Auto Lobby" })
+ele(LobbySec, "Toggle", { Title = "Авто-голосование", Value = false, Callback = function(v)
+	st.vote = v
+end })
+ele(LobbySec, "Dropdown", {
+	Title = "За какой мод голосовать",
 	Values = MODES,
-	Default = st.voteMode,
-	Searchable = true,
+	Value = idxOf(MODES, "Astro"),
 	Callback = function(v)
 		st.voteMode = v
 	end,
 })
-Groups.Lobby:AddToggle("v1_ready", {
-	Text = "Авто-рейди",
-	Default = st.ready,
-	Callback = function(v)
-		st.ready = v
-	end,
-})
+ele(LobbySec, "Toggle", { Title = "Авто-рейди", Value = false, Callback = function(v)
+	st.ready = v
+end })
 
-local masteryListInput
+local MasterySec = ele(MasteryTab, "Section", { Title = "Путь мастери" })
 local masteryToggle
-Groups.Path:AddLabel({ Text = "<b>Path</b>", DoesWrap = false })
-Groups.Path:AddLabel({
-	Text = "Качает персонажей по списку и меняет их, когда кап достигнут.",
-	DoesWrap = true,
-})
-st._pathStatus = Groups.Path:AddLabel({ Text = "Path: idle", DoesWrap = true })
-Groups.Path:AddDropdown("v1_path_preset", {
-	Text = "Пресет",
-	Values = PATH_PRESET_ORDER,
-	Default = st.pathPreset,
-	Searchable = false,
-	Callback = function(v)
-		st.pathPreset = v
-		st.pathFallbackActive = false
-		st.pathBoostFarmActive = false
-		st.pathBoostFarmDone = false
-		st.pathBoostFarmResume = nil
-		if st._pathForce then
-			st._pathForce(false)
-		end
-		local p = PATH_PRESETS[v]
-		if p and p.list then
-			st.masteryList = p.list
-			pcall(function()
-				if masteryListInput then
-					masteryListInput:SetValue(p.list)
-				end
-			end)
-		end
-	end,
-})
-masteryToggle = Groups.Path:AddToggle("v1_mastery", {
-	Text = "Запустить Path",
-	Tooltip = "Докачивает персонажей из списка и меняет их по капу",
-	Default = st.mastery,
+masteryToggle = ele(MasterySec, "Toggle", {
+	Title = "Авто поменка перса",
+	Desc = "Как одного персонажа докачает до определенного уровня, перейдёт на другого",
+	Value = false,
 	Callback = function(v)
 		st.mastery = v
-		st.pathFallbackActive = false
-		st.pathBoostFarmActive = false
-		st.pathBoostFarmDone = false
-		st.pathBoostFarmResume = nil
 		table.clear(masterySkipped)
 		if v then
-			notify("Path", "path started", "check", 2)
-		elseif st._pathForce then
-			st._pathForce(false)
+			notify("Mastery", "path started", "check", 2)
 		end
 	end,
 })
-pcall(function()
-	masteryToggle:AddKeyPicker("v1_mastery_key", {
-		Text = "Переключить Path",
-		Default = "P",
-		Mode = "Toggle",
-		SyncToggleState = true,
-	})
-end)
-masteryListInput = Groups.Path:AddInput("v1_mastery_list", {
-	Text = "Список: Персонаж | Кап; ...",
-	Default = toOneLine(st.masteryList),
-	MaxLength = 6000,
-	Placeholder = "Camera man | 30; Tv man | 80",
+ele(MasterySec, "Keybind", {
+	Title = "Переключить путь мастери",
+	Value = "P",
+	Callback = function()
+		local nv = not st.mastery
+		st.mastery = nv
+		table.clear(masterySkipped)
+		setToggle(masteryToggle, nv)
+		notify("Mastery", nv and "path started" or "path stopped", "info", 2)
+	end,
+})
+ele(MasterySec, "Input", {
+	Title = "Не юзай это",
+	Desc = "Бабах",
+	Type = "Textarea",
+	Value = st.masteryList,
 	Callback = function(v)
 		st.masteryList = v
 	end,
 })
-Groups.Path:AddLabel({
-	Text = "Формат: Персонаж | Кап. Без капа берётся “Кап по умолчанию”.",
-	DoesWrap = true,
-})
-Groups.Path:AddSlider("v1_mastery_default", {
-	Text = "Кап по умолчанию",
-	Default = st.masteryDefault,
-	Min = 10,
-	Max = 200,
-	Rounding = 0,
+ele(MasterySec, "Slider", {
+	Title = "Какое мастери обычно таргетить",
+	Step = 5,
+	Value = { Min = 10, Max = 200, Default = 80 },
 	Callback = function(v)
 		st.masteryDefault = v
 	end,
 })
-Groups.Path:AddSlider("v1_mastery_delay", {
-	Text = "Проверять интервал в секунду",
-	Default = st.masteryDelay,
-	Min = 1,
-	Max = 30,
-	Rounding = 0,
+ele(MasterySec, "Slider", {
+	Title = "Проверять интервал в секунду",
+	Step = 1,
+	Value = { Min = 1, Max = 30, Default = 3 },
 	Callback = function(v)
 		st.masteryDelay = v
 	end,
 })
 
-Groups.PathExtra:AddLabel({ Text = "<b>После списка</b>", DoesWrap = false })
-Groups.PathExtra:AddToggle("v1_path_fallback", {
-	Text = "BossRush-фарм после списка",
-	Tooltip = "Когда все из списка готовы — выбрать фармера и голосовать BossRush",
-	Default = st.pathFallbackEnabled,
-	Callback = function(v)
-		st.pathFallbackEnabled = v
-		if not v then
-			st.pathFallbackActive = false
-		end
-	end,
-})
-Groups.PathExtra:AddDropdown("v1_path_fallback_char", {
-	Text = "Кто фармит BossRush",
-	Values = { "Dark Speakerman", "Speaker Strider" },
-	Default = st.pathFallbackChar,
-	Callback = function(v)
-		st.pathFallbackChar = v
-	end,
-})
-
-Groups.PathExtra:AddLabel({ Text = "<b>Cen farm (нет x2 Mastery)</b>", DoesWrap = false })
-Groups.PathExtra:AddToggle("v1_path_boostfarm", {
-	Text = "Включить Cen farm",
-	Tooltip = "Если x2 Mastery бустеров нет и буст не активен — фармить Cen на BossRush",
-	Default = st.pathBoostFarmEnabled,
-	Callback = function(v)
-		st.pathBoostFarmEnabled = v
-		st.pathBoostFarmActive = false
-		st.pathBoostFarmDone = false
-		st.pathBoostFarmResume = nil
-	end,
-})
-Groups.PathExtra:AddDropdown("v1_path_boostfarm_char", {
-	Text = "Кто фармит Cen",
-	Values = { "Dark Speakerman", "Speaker Strider" },
-	Default = st.pathBoostFarmChar,
-	Callback = function(v)
-		st.pathBoostFarmChar = v
-	end,
-})
-Groups.PathExtra:AddSlider("v1_path_boostfarm_target", {
-	Text = "Cen цель BossRush",
-	Default = st.pathBoostFarmTarget,
-	Min = 500,
-	Max = 100000,
-	Rounding = 0,
-	Callback = function(v)
-		st.pathBoostFarmTarget = v
-	end,
-})
-Groups.PathExtra:AddSlider("v1_path_boostfarm_resume", {
-	Text = "Cen порог возврата к Path",
-	Default = st.pathBoostFarmResumeBelow,
-	Min = 0,
-	Max = 10000,
-	Rounding = 0,
-	Callback = function(v)
-		st.pathBoostFarmResumeBelow = v
-	end,
-})
-
-Groups.PathExtra:AddLabel({ Text = "<b>Правило ядер</b>", DoesWrap = false })
-Groups.PathExtra:AddToggle("v1_path_cores", {
-	Text = "3 ядра + Zombie -> Christmas",
-	Tooltip = "Если все три ядра в инвентаре и выбран Zombie — голосовать Christmas",
-	Default = st.pathCoresZombie,
-	Callback = function(v)
-		st.pathCoresZombie = v
-	end,
-})
-
-Party.ui.group:AddDropdown("v1_party_role", {
-	Text = "Роль",
-	Values = { "Main", "Support" },
-	Default = Party.role,
-	Searchable = false,
-	Callback = function(v)
-		Party.role = v
-		Party.saveConfig()
-		Party.updateStatus()
-	end,
-})
-Party.ui.idInput = Party.ui.group:AddInput("v1_party_id", {
-	Text = "Party ID",
-	Default = Party.id,
-	Callback = function(v)
-		Party.id = v
-		Party.saveConfig()
-		Party.updateStatus()
-	end,
-})
-Party.ui.group:AddSlider("v1_party_interval", {
-	Text = "Интервал синхронизации",
-	Default = Party.interval,
-	Min = 0.5,
-	Max = 5,
-	Rounding = 1,
-	Suffix = " s",
-	Callback = function(v)
-		Party.interval = v
-		Party.saveConfig()
-	end,
-})
-Party.ui.group:AddToggle("v1_party_follow_vote", {
-	Text = "Следовать голосованию/re-ready лидера",
-	Default = Party.followVote,
-	Callback = function(v)
-		Party.followVote = v
-		Party.saveConfig()
-	end,
-})
-Party.ui.group:AddToggle("v1_party_follow_char", {
-	Text = "Следовать персонажу лидера",
-	Default = Party.followChar,
-	Callback = function(v)
-		Party.followChar = v
-		Party.saveConfig()
-	end,
-})
-Party.ui.group:AddLabel({ Text = "<b>Помощь</b>", DoesWrap = false })
-Party.ui.group:AddDropdown("v1_party_support_mode", {
-	Text = "Режим помощи",
-	Tooltip = "Assist — бить цель лидера. Healer — хилки по лидеру. X18/Clock Titan — спец-роли.",
-	Values = { "None", "Assist", "Healer", "X18", "Clock Titan" },
-	Default = Party.supportMode,
-	Searchable = false,
-	Callback = function(v)
-		Party.supportMode = v
-		Party.combatRole = (v == "X18" or v == "Clock Titan") and v or "None"
-		if v ~= "Assist" then
-			Party.assistTarget = nil
-		end
-		Party.saveConfig()
-		Party.updateStatus()
-	end,
-})
-Party.ui.group:AddToggle("v1_party_follow_leader", {
-	Text = "Держаться рядом с лидером",
-	Default = Party.followLeader,
-	Callback = function(v)
-		Party.followLeader = v
-		Party.saveConfig()
-	end,
-})
-Party.ui.group:AddSlider("v1_party_follow_distance", {
-	Text = "Дистанция следования",
-	Default = Party.followDistance,
-	Min = 3,
-	Max = 60,
-	Rounding = 0,
-	Callback = function(v)
-		Party.followDistance = v
-		Party.saveConfig()
-	end,
-})
-Party.ui.group:AddSlider("v1_party_heal_below", {
-	Text = "Healer: хп лидера ниже",
-	Default = Party.healBelow,
-	Min = 1,
-	Max = 100,
-	Rounding = 0,
-	Suffix = " %",
-	Callback = function(v)
-		Party.healBelow = v
-		Party.saveConfig()
-	end,
-})
-Party.ui.group:AddInput("v1_party_heal_list", {
-	Text = "Healer: remote-ы",
-	Default = toOneLine(Party.healList),
-	Placeholder = "HealClockTitan | Heal_Cooldown",
-	MaxLength = 2000,
-	Callback = function(v)
-		Party.healList = v
-		Party.saveConfig()
-	end,
-})
-Party.ui.group:AddLabel({ Text = "<b>X18 / Clock Titan</b>", DoesWrap = false })
-Party.ui.x18AnchorInput = Party.ui.group:AddInput("v1_x18_anchor", {
-	Text = "X18 точка (x y z)",
-	Default = Party.x18Anchor
-			and string.format("%.2f %.2f %.2f", Party.x18Anchor.x, Party.x18Anchor.y, Party.x18Anchor.z)
-		or "",
-	Placeholder = "x y z",
-	Callback = function(v)
-		local x, y, z = tostring(v):match("([%-%d%.]+)%s*[ ,;]+([%-%d%.]+)%s*[ ,;]+([%-%d%.]+)")
-		if x and y and z then
-			Party.x18Anchor = { x = tonumber(x), y = tonumber(y), z = tonumber(z) }
-			Party.saveConfig()
-		end
-	end,
-})
-Party.ui.group:AddButton({
-	Text = "X18: взять текущую позицию",
-	Func = function()
-		local ch = lp.Character
-		local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
-		if not hrp then
-			return
-		end
-		local p = hrp.Position
-		Party.x18Anchor = { x = p.X, y = p.Y, z = p.Z }
-		Party.saveConfig()
-		pcall(function()
-			if Party.ui.x18AnchorInput then
-				Party.ui.x18AnchorInput:SetValue(string.format("%.2f %.2f %.2f", p.X, p.Y, p.Z))
-			end
-		end)
-	end,
-})
-Party.ui.group:AddSlider("v1_clock_distance", {
-	Text = "Clock дистанция от X18",
-	Default = Party.clockDistance,
-	Min = 6,
-	Max = 30,
-	Rounding = 0,
-	Callback = function(v)
-		Party.clockDistance = v
-		Party.saveConfig()
-	end,
-})
-Party.ui.group:AddButton({
-	Text = "Синхронизировать сейчас",
-	Func = function()
-		if Party.update then
-			Party.update()
-		end
-	end,
-})
-Party.ui.info:AddLabel({
-	Text = "Main пишет файл, Support читает. Оба клиента должны быть на одном ПК/executor workspace и с одинаковым Party ID.",
-	DoesWrap = true,
-})
-Party.ui.status = Party.ui.info:AddLabel({ Text = "waiting...", DoesWrap = true })
-
-Groups.Shop:AddToggle("v1_shop_buy", {
-	Text = "Авто бай",
-	Tooltip = "Нет блять авто-селл",
-	Default = st.shopBuy,
-	Callback = function(on)
-		st.shopBuy = on
-		if on then
-			notify("Shop", "auto buy on", "check", 2)
-		else
-			notify("Shop", "auto buy off", "info", 2)
-		end
-	end,
-})
-Groups.Shop:AddDropdown("v1_shop_sel", {
-	Text = "Что покупать",
-	Tooltip = "Multi-select. BSX2:30 / BSX2:60 / MasterCard:NormalIII.",
-	Values = SHOP_IDS,
-	Default = toMultiMap(st.shopBuySel),
-	Multi = true,
-	Searchable = true,
-	Callback = function(v)
-		st.shopBuySel = multiNames(v)
-	end,
-})
-Groups.Shop:AddSlider("v1_shop_qty", {
-	Text = "Кол-во за предмет",
-	Default = st.shopBuyQty,
-	Min = 1,
-	Max = 50,
-	Rounding = 0,
-	Callback = function(v)
-		st.shopBuyQty = v
-	end,
-})
-Groups.Shop:AddSlider("v1_shop_interval", {
-	Text = "В раз сколько покупать",
-	Default = st.shopBuyInterval,
-	Min = 5,
-	Max = 60,
-	Rounding = 0,
-	Callback = function(v)
-		st.shopBuyInterval = math.max(5, v)
-	end,
-})
-
-Groups.Shop:AddLabel({ Text = "<b>Boosters</b>", DoesWrap = false })
-Groups.Shop:AddToggle("v1_boost_auto", {
-	Text = "Использовать авто бустер",
-	Default = st.boostAuto,
-	Callback = function(on)
-		st.boostAuto = on
-		if on then
-			notify("Boosts", "auto use on", "check", 2)
-		else
-			notify("Boosts", "auto use off", "info", 2)
-		end
-	end,
-})
-Groups.Shop:AddToggle("v1_boost_economy", {
-	Text = "Экономить",
-	Tooltip = "Экономит по максу (приложение такое)",
-	Default = st.boostEconomy,
-	Callback = function(on)
-		st.boostEconomy = on
-	end,
-})
-Groups.Shop:AddDropdown("v1_boost_sel", {
-	Text = "Бустеры",
-	Tooltip = "Multi-select known boosters",
-	Values = BOOSTER_NAMES,
-	Default = toMultiMap(st.boostSel),
-	Multi = true,
-	Searchable = true,
-	Callback = function(v)
-		st.boostSel = multiNames(v)
-	end,
-})
-Groups.Shop:AddSlider("v1_boost_delay", {
-	Text = "В раз сколько юзать бустер",
-	Default = st.boostDelay,
-	Min = 5,
-	Max = 300,
-	Rounding = 0,
-	Callback = function(v)
-		st.boostDelay = v
-	end,
-})
-local boostActiveInfo = Groups.Shop:AddLabel({ Text = "Boosters: checking...", DoesWrap = true })
-
+local GachaSec = ele(GachaTab, "Section", { Title = "Auto Gacha" })
 local gachaToggle
-gachaToggle = Groups.Gacha:AddToggle("v1_gacha", {
-	Text = "Мистер дэп включить",
-	Default = st.gacha,
+gachaToggle = ele(GachaSec, "Toggle", {
+	Title = "Мистер дэп включить",
+	Value = false,
+	Flag = "gacha",
 	Callback = function(on)
 		st.gacha = on
 		if on then
@@ -2139,24 +1335,22 @@ gachaToggle = Groups.Gacha:AddToggle("v1_gacha", {
 		end
 	end,
 })
-pcall(function()
-	gachaToggle:AddKeyPicker("v1_gacha_key", {
-		Text = "Переключить дэп",
-		Default = "L",
-		Mode = "Toggle",
-		SyncToggleState = true,
-	})
-end)
-Groups.Gacha:AddToggle("v1_gacha_auto", {
-	Text = "Тоже переключить дэп",
-	Default = st.gachaAuto,
-	Callback = function(v)
-		st.gachaAuto = v
+ele(GachaSec, "Keybind", {
+	Title = "Переключить дэп",
+	Value = "L",
+	Callback = function()
+		local nv = not st.gacha
+		st.gacha = nv
+		setToggle(gachaToggle, nv)
 	end,
 })
-Groups.Gacha:AddToggle("v1_gacha_skip", {
-	Text = "Скипать хуйню с открытием",
-	Default = st.gachaSkipCut,
+ele(GachaSec, "Toggle", { Title = "Тоже переключить дэп", Value = false, Callback = function(v)
+	st.gachaAuto = v
+end })
+ele(GachaSec, "Toggle", {
+	Title = "Скипать хуйню с открытием",
+	Desc = "фыв",
+	Value = true,
 	Callback = function(v)
 		st.gachaSkipCut = v
 		if not v then
@@ -2164,14 +1358,11 @@ Groups.Gacha:AddToggle("v1_gacha_skip", {
 		end
 	end,
 })
-Groups.Gacha:AddDropdown("v1_gacha_method", {
-	Text = "Метод скипа",
+ele(GachaSec, "Dropdown", {
+	Title = "Метод скипа",
+	Desc = "сирин не умеет делать шансы",
 	Values = { "Multi (all)", "Click only", "Firesignal only", "Anim break", "Speed hack" },
-	Default = (st.gachaSkipMethod == "click" and "Click only")
-		or (st.gachaSkipMethod == "firesignal" and "Firesignal only")
-		or (st.gachaSkipMethod == "animbreak" and "Anim break")
-		or (st.gachaSkipMethod == "speed" and "Speed hack")
-		or "Multi (all)",
+	Value = 1,
 	Callback = function(v)
 		local map = {
 			["Multi (all)"] = "multi",
@@ -2183,48 +1374,52 @@ Groups.Gacha:AddDropdown("v1_gacha_method", {
 		st.gachaSkipMethod = map[v] or "multi"
 	end,
 })
-Groups.Gacha:AddDropdown("v1_gacha_type", {
-	Text = "Страничка",
+ele(GachaSec, "Dropdown", {
+	Title = "Страничка",
 	Values = { "Characters", "Skins" },
-	Default = (st.gachaType == "GachaSkins") and "Skins" or "Characters",
+	Value = 1,
 	Callback = function(v)
 		st.gachaType = (v == "Skins") and "GachaSkins" or "GachaCharacter"
 	end,
 })
-Groups.Gacha:AddDropdown("v1_gacha_spin", {
-	Text = "Сколько крутить",
+ele(GachaSec, "Dropdown", {
+	Title = "Сколько крутить",
 	Values = { "1Spin", "10Spins", "100Spins", "1SpinLucky", "10SpinLucky" },
-	Default = st.gachaSpin,
+	Value = idxOf({ "1Spin", "10Spins", "100Spins", "1SpinLucky", "10SpinLucky" }, "100Spins"),
 	Callback = function(v)
 		st.gachaSpin = v
 	end,
 })
-Groups.Gacha:AddSlider("v1_gacha_interval", {
-	Text = "Интервал дэпа",
-	Default = st.gachaInterval,
-	Min = 0.05,
-	Max = 5,
-	Rounding = 2,
+ele(GachaSec, "Slider", {
+	Title = "Интервал дэпа",
+	Step = 0.05,
+	Value = { Min = 0.05, Max = 5, Default = 0.5 },
 	Callback = function(v)
 		st.gachaInterval = v
 	end,
 })
-Groups.Gacha:AddSlider("v1_gacha_max", {
-	Text = "Сколько выкрутить (0 значит инф)",
-	Default = st.gachaMax,
-	Min = 0,
-	Max = 1000,
-	Rounding = 0,
+ele(GachaSec, "Slider", {
+	Title = "Сколько выкрутить (0 значит инф)",
+	Step = 1,
+	Value = { Min = 0, Max = 1000, Default = 0 },
 	Callback = function(v)
 		st.gachaMax = v
 	end,
 })
+local SKIN_OPTIONS = {
+	"Jetpacked Double plunger:4 (Mini UTCM) Leg",
+	"Jetpacked Double plunger:2 (Hyper) Myth",
+	"Speaker woman:2 (Exo Speakerwoman) Leg",
+	"Dark Speakerman:2 (Mythical DSM) Myth",
+	"Dark Speakerman:3 (Brawler DSM) Leg",
+	"Scientist TV Man:1 (Betrayer) Myth",
+	"Energized TV:1 (Titan replica) Myth",
+}
 
-Groups.Gacha:AddLabel({ Text = "<b>Skins</b>", DoesWrap = false })
-Groups.Gacha:AddToggle("v1_gacha_skin_mode", {
-	Text = "Дэпать из списка",
-	Tooltip = "Если выбранный скин появляется в стоке, будет депать пока не выбьет его",
-	Default = st.gachaSkinMode,
+ele(GachaSec, "Toggle", {
+	Title = "Дэпать из списка",
+	Desc = "Если выбранный скин повляется в стоке, то будет депать пока не выбьет его",
+	Value = false,
 	Callback = function(v)
 		st.gachaSkinMode = v
 		if v then
@@ -2234,53 +1429,189 @@ Groups.Gacha:AddToggle("v1_gacha_skin_mode", {
 		end
 	end,
 })
-Groups.Gacha:AddDropdown("v1_gacha_skin_sel", {
-	Text = "Какие скины хатите палучить?",
+ele(GachaSec, "Dropdown", {
+	Title = "Какие скины хатите палучить?",
+	Desc = "изи",
 	Values = SKIN_OPTIONS,
+	Value = {},
 	Multi = true,
-	Searchable = true,
 	Callback = function(v)
 		local out = {}
-		for _, x in ipairs(multiNames(v)) do
-			local key = tostring(x):match("^(.-:%d+)")
-			if key then
-				out[#out + 1] = key
+		if type(v) == "table" then
+			for _, x in ipairs(v) do
+				local key = tostring(x):match("^(.-:%d+)")
+				if key then
+					out[#out + 1] = key
+				end
 			end
 		end
 		st.gachaSkinSel = out
 	end,
 })
-local gachaSkinInfo = Groups.Gacha:AddLabel({ Text = "Skins: checking...", DoesWrap = true })
-
-Groups.General:AddLabel({ Text = "<b>Appearance</b>", DoesWrap = false })
-local menuLabel = Groups.General:AddLabel({ Text = "UI toggle key", DoesWrap = false })
-local menuKey = menuLabel:AddKeyPicker("v1_menu_key", {
-	Text = "UI toggle key",
-	Default = "M",
-	Mode = "Toggle",
-	NoUI = true,
+local gachaSkinInfo = ele(GachaSec, "Paragraph", {
+	Title = "Юзлесс надпись",
+	Content = "checking...",
 })
-pcall(function()
-	Library.ToggleKeybind = menuKey
-end)
-Groups.General:AddSlider("v1_scale", {
-	Text = "Scale",
-	Default = 100,
-	Min = 70,
-	Max = 130,
-	Rounding = 0,
+
+local function multiNames(v)
+	if type(v) == "table" then
+		local out = {}
+		for _, x in ipairs(v) do
+			local s = tostring(x)
+			if s ~= "" then
+				out[#out + 1] = s
+			end
+		end
+		return out
+	end
+	if v ~= nil and tostring(v) ~= "" then
+		return { tostring(v) }
+	end
+	return {}
+end
+
+local BOOSTER_NAMES = {
+	"Booster X2 Mastery : 30Min",
+	"Booster X2 Mastery : 1Hour",
+	"Booster X2 Mastery : 6Hour",
+	"Booster X2 Points : 30Min",
+	"Booster X2 Points : 1Hour",
+	"Booster X2 Points : 6Hour",
+}
+
+local SHOP_IDS = {
+	"BSX2:30",
+	"BSX2:60",
+	"MasterCard:NormalIII",
+}
+
+local ShopSec = ele(ShopTab, "Section", { Title = "Хоурли шоп" })
+ele(ShopSec, "Toggle", {
+	Title = "Авто бай",
+	Desc = "Нет блять авто-селл",
+	Value = false,
+	Flag = "shopBuy",
+	Callback = function(on)
+		st.shopBuy = on
+		if on then
+			notify("Shop", "auto buy on", "check", 2)
+		else
+			notify("Shop", "auto buy off", "info", 2)
+		end
+	end,
+})
+ele(ShopSec, "Dropdown", {
+	Title = "Что покупать",
+	Desc = "Multi-select. BSX2:30 = mastery 30min, BSX2:60 = mastery 60min.",
+	Values = SHOP_IDS,
+	Value = multiNames(st.shopBuySel),
+	Multi = true,
+	Callback = function(v)
+		st.shopBuySel = multiNames(v)
+	end,
+})
+ele(ShopSec, "Slider", {
+	Title = "Кол-во за предмет",
+	Step = 1,
+	Value = { Min = 1, Max = 50, Default = 1 },
+	Callback = function(v)
+		st.shopBuyQty = v
+	end,
+})
+ele(ShopSec, "Slider", {
+	Title = "В раз сколько покупать",
+	Desc = "ыыы",
+	Step = 1,
+	Value = { Min = 5, Max = 60, Default = 5 },
+	Callback = function(v)
+		st.shopBuyInterval = math.max(5, v)
+	end,
+})
+local BoostSec = ele(ShopTab, "Section", { Title = "Авто бустер" })
+ele(BoostSec, "Toggle", {
+	Title = "Использовать авто бустер",
+	Desc = "сложна",
+	Value = false,
+	Flag = "boostAuto",
+	Callback = function(on)
+		st.boostAuto = on
+		if on then
+			notify("Boosts", "auto use on", "check", 2)
+		else
+			notify("Boosts", "auto use off", "info", 2)
+		end
+	end,
+})
+ele(BoostSec, "Toggle", {
+	Title = "Экономить",
+	Desc = "Экономит по максу (приложение такое)",
+	Value = true,
+	Flag = "boostEconomy",
+	Callback = function(on)
+		st.boostEconomy = on
+	end,
+})
+ele(BoostSec, "Dropdown", {
+	Title = "Бустеры",
+	Desc = "Multi-select known boosters",
+	Values = BOOSTER_NAMES,
+	Value = multiNames(st.boostSel),
+	Multi = true,
+	Callback = function(v)
+		st.boostSel = multiNames(v)
+	end,
+})
+ele(BoostSec, "Slider", {
+	Title = "В раз сколько юзать бустер",
+	Step = 1,
+	Value = { Min = 5, Max = 300, Default = 30 },
+	Callback = function(v)
+		st.boostDelay = v
+	end,
+})
+local boostActiveInfo = ele(BoostSec, "Paragraph", {
+	Title = "Юзлесс",
+	Content = "checking...",
+})
+
+local SetSec = ele(SettingsTab, "Section", { Title = "Appearance" })
+ele(SetSec, "Keybind", {
+	Title = "UI toggle key",
+	Value = "M",
+	Callback = function(v)
+		local ok = pcall(function()
+			Window:SetToggleKey(Enum.KeyCode[v])
+		end)
+		if not ok then
+			warn("[RATHUB] bad key: " .. tostring(v))
+		end
+	end,
+})
+ele(SetSec, "Slider", {
+	Title = "Scale",
+	Step = 5,
+	Value = { Min = 70, Max = 130, Default = 100 },
 	Callback = function(v)
 		pcall(function()
-			Library:SetDPIScale(v)
+			Window:SetUIScale(v / 100)
+		end)
+	end,
+})
+ele(SetSec, "Toggle", {
+	Title = "Panel background",
+	Value = true,
+	Callback = function(on)
+		pcall(function()
+			Window:SetPanelBackground(on)
 		end)
 	end,
 })
 
-Groups.General:AddLabel({ Text = "<b>Anti-AFK</b>", DoesWrap = false })
-Groups.General:AddToggle("v1_antiafk", {
-	Text = "Anti AFK",
-	Tooltip = "Clears the idle state with VirtualUser",
-	Default = st.antiAfk,
+local AfkSec = ele(SettingsTab, "Section", { Title = "Anti AFK" })
+ele(AfkSec, "Toggle", {
+	Title = "Anti AFK",
+	Desc = "Clears the idle state with VirtualUser (fires on Player.Idled)",
+	Value = true,
 	Callback = function(v)
 		st.antiAfk = v
 		if v then
@@ -2289,11 +1620,11 @@ Groups.General:AddToggle("v1_antiafk", {
 	end,
 })
 
-Groups.Advanced:AddLabel({ Text = "<b>Performance</b>", DoesWrap = false })
-Groups.Advanced:AddToggle("v1_low_gfx", {
-	Text = "Low graphics",
-	Tooltip = "Sets QualityLevel to 1",
-	Default = st.lowGfx,
+local OptSec = ele(SettingsTab, "Section", { Title = "Performance" })
+ele(OptSec, "Toggle", {
+	Title = "Low graphics",
+	Desc = "Sets QualityLevel to 1 (minimum). Big FPS boost on weak GPUs.",
+	Value = false,
 	Callback = function(on)
 		st.lowGfx = on
 		pcall(function()
@@ -2302,9 +1633,10 @@ Groups.Advanced:AddToggle("v1_low_gfx", {
 		notify("Perf", on and "low graphics ON" or "low graphics OFF", "info", 2)
 	end,
 })
-Groups.Advanced:AddToggle("v1_no_shadow", {
-	Text = "No shadows",
-	Default = st.noShadow,
+ele(OptSec, "Toggle", {
+	Title = "No shadows",
+	Desc = "Disables global shadows (Lighting.GlobalShadows)",
+	Value = false,
 	Callback = function(on)
 		st.noShadow = on
 		pcall(function()
@@ -2313,9 +1645,10 @@ Groups.Advanced:AddToggle("v1_no_shadow", {
 		notify("Perf", on and "shadows OFF" or "shadows ON", "info", 2)
 	end,
 })
-Groups.Advanced:AddToggle("v1_no_fog", {
-	Text = "No fog",
-	Default = st.noFog,
+ele(OptSec, "Toggle", {
+	Title = "No fog",
+	Desc = "Removes fog rendering (FogEnd = huge)",
+	Value = false,
 	Callback = function(on)
 		st.noFog = on
 		pcall(function()
@@ -2331,9 +1664,10 @@ Groups.Advanced:AddToggle("v1_no_fog", {
 		notify("Perf", on and "fog OFF" or "fog ON", "info", 2)
 	end,
 })
-Groups.Advanced:AddToggle("v1_no_particles", {
-	Text = "Strip particles",
-	Default = st.noParticles,
+ele(OptSec, "Toggle", {
+	Title = "Strip particles",
+	Desc = "Hides ParticleEmitters and Beams in Workspace (visual only)",
+	Value = false,
 	Callback = function(on)
 		st.noParticles = on
 		task.spawn(function()
@@ -2354,9 +1688,10 @@ Groups.Advanced:AddToggle("v1_no_particles", {
 		end)
 	end,
 })
-Groups.Advanced:AddToggle("v1_fps_unlock", {
-	Text = "FPS unlock",
-	Default = st.fpsUnlock,
+ele(OptSec, "Toggle", {
+	Title = "FPS unlock",
+	Desc = "Removes frame rate cap via Rendering quality settings",
+	Value = false,
 	Callback = function(on)
 		st.fpsUnlock = on
 		pcall(function()
@@ -2370,19 +1705,20 @@ Groups.Advanced:AddToggle("v1_fps_unlock", {
 	end,
 })
 
-Groups.Advanced:AddLabel({ Text = "<b>Webhook</b>", DoesWrap = false })
-Groups.Advanced:AddInput("v1_webhook_url", {
-	Text = "Webhook URL",
-	Tooltip = "https://discord.com/api/webhooks/...",
-	Default = st.webhookUrl,
+local HookSec = ele(SettingsTab, "Section", { Title = "Webhook (Discord)" })
+ele(HookSec, "Input", {
+	Title = "Webhook URL",
+	Desc = "https://discord.com/api/webhooks/...",
+	Value = st.webhookUrl,
 	Callback = function(v)
 		st.webhookUrl = v
 		saveWebhookCfg()
 	end,
 })
-Groups.Advanced:AddToggle("v1_webhook", {
-	Text = "Send status periodically",
-	Default = st.webhook,
+ele(HookSec, "Toggle", {
+	Title = "Send status periodically",
+	Desc = "Character, wave, HP, money and inventory",
+	Value = st.webhook,
 	Callback = function(v)
 		st.webhook = v
 		saveWebhookCfg()
@@ -2391,20 +1727,19 @@ Groups.Advanced:AddToggle("v1_webhook", {
 		end
 	end,
 })
-Groups.Advanced:AddSlider("v1_webhook_interval", {
-	Text = "Interval (sec)",
-	Default = st.webhookDelay,
-	Min = 10,
-	Max = 600,
-	Rounding = 0,
+ele(HookSec, "Slider", {
+	Title = "Interval (sec)",
+	Step = 5,
+	Value = { Min = 10, Max = 600, Default = st.webhookDelay },
 	Callback = function(v)
 		st.webhookDelay = v
 		saveWebhookCfg()
 	end,
 })
-Groups.Advanced:AddButton({
-	Text = "Send now",
-	Func = function()
+ele(HookSec, "Button", {
+	Title = "Send now",
+	Color = Color3.fromHex("#4f8cff"),
+	Callback = function()
 		task.spawn(function()
 			if sendWebhook then
 				sendWebhook(false)
@@ -2413,35 +1748,21 @@ Groups.Advanced:AddButton({
 	end,
 })
 
-Groups.Advanced:AddLabel({ Text = "<b>Actions</b>", DoesWrap = false })
-Groups.Advanced:AddButton({
-	Text = "Destroy UI",
-	Func = function()
+local actionsSec = ele(SettingsTab, "Section", { Title = "Actions" })
+ele(actionsSec, "Button", {
+	Title = "Destroy UI",
+	Color = Color3.fromHex("#ff4830"),
+	Callback = function()
 		if _G.__RATHUB_REG and _G.__RATHUB_REG.stop then
 			pcall(_G.__RATHUB_REG.stop)
 		end
 	end,
 })
 
-if SaveManager then
-	pcall(function()
-		SaveManager:SetLibrary(Library)
-		SaveManager:IgnoreThemeSettings()
-		SaveManager:SetIgnoreIndexes({ "MenuKeybind" })
-		SaveManager:SetFolder("RATHUB-V2")
-		SaveManager:BuildConfigSection(SettingsTab)
-		SaveManager:LoadAutoloadConfig()
-	end)
-else
-	SettingsTab:AddGroupbox({ Side = "Right", Name = "Configs", IconName = "folder" }):AddLabel({
-		Text = "SaveManager не загрузился. Настройки не сохраняются.",
-		DoesWrap = true,
-	})
-end
-
 pcall(function()
 	Window:SelectTab(1)
 end)
+
 local VOTE_PAGES = {
 	{ "Normal", "Hard", "VeryHard", "Insane", "Nightmare" },
 	{ "BossRush", "ThunderStorm", "Zombie", "Christmas", "Hell" },
@@ -2562,11 +1883,10 @@ task.spawn(function()
 	local READY_VOTE_DELAY = 10
 	local voteSentAt = 0
 	local votedConfirmedAt = 0
-	local lastCoresRule = 0
 
 	while alive() do
 		task.wait(0.4)
-		if st.vote or st.ready or st.pathCoresZombie then
+		if st.vote or st.ready then
 			local t = now()
 			local ok, err = pcall(function()
 				local votingNow = ws:FindFirstChild("Voteing") and ws.Voteing.Value == true
@@ -2575,16 +1895,6 @@ task.spawn(function()
 				local wave = ws:FindFirstChild("Wave") and ws.Wave.Value or 0
 
 				if voteActive then
-					if st.pathCoresZombie and t - lastCoresRule > 5 and getCoreCount() >= 3 then
-						if st.voteMode == "Zombie" then
-							lastCoresRule = t
-							st.voteMode = "Christmas"
-							st.vote = true
-							if fireVote("Christmas") then
-								notify("Path", "3 cores + Zombie -> Christmas", "check", 3)
-							end
-						end
-					end
 					if phaseStart == 0 then
 						phaseStart = t
 					end
@@ -2667,40 +1977,7 @@ local function shopRemote()
 	return ShopRem
 end
 
-local HEAL_POS = Vector3.new(39.84444046020508, 2.7063474655151367, -24.393577575683594)
-
-local function healButton()
-	local pgui = lp:FindFirstChild("PlayerGui")
-	local inv = pgui and pgui:FindFirstChild("003-A")
-	local main = inv and inv:FindFirstChild("Main")
-	return main and main:FindFirstChild("Heal")
-end
-
-local function clickHealButton()
-	local btn = healButton()
-	if not btn then
-		return false
-	end
-	local fired = false
-	pcall(function()
-		if type(firesignal) == "function" then
-			firesignal(btn.MouseButton1Up)
-			fired = true
-		end
-	end)
-	if not fired then
-		pcall(function()
-			btn:Click()
-			fired = true
-		end)
-	end
-	return fired
-end
-
-local function buyFillHP(viaButton)
-	if viaButton and clickHealButton() then
-		return true
-	end
+local function buyFillHP()
 	local rem = shopRemote()
 	if not rem then
 		return false
@@ -2716,47 +1993,20 @@ local function hpNow()
 	return hum and hum.Health or 0
 end
 
-local function goToShop()
-	if not canUseShop() then
-		return false
-	end
-	local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
-	if not hrp then
-		return false
-	end
-	hrp.CFrame = CFrame.new(HEAL_POS.X, HEAL_POS.Y, HEAL_POS.Z)
-	hrp.AssemblyLinearVelocity = Vector3.zero
-	hrp.AssemblyAngularVelocity = Vector3.zero
-	task.wait(0.2)
-	return canUseShop()
-end
-
 local function doHeal()
 	if not shopRemote() then
 		print("[rathub-heal] ReplicatedStorage.ShopSystem missing")
 		return false
 	end
-	if not canUseShop() then
-		return false
-	end
 	local before = hpNow()
 	local t0 = now()
 	local shots = 0
-	local limit = math.min(math.max(tonumber(st.healTry) or 6, 3), 6)
-	if not goToShop() then
-		print("[rathub-heal] shop disappeared before heal")
-		return false
-	end
+	local limit = math.max(tonumber(st.healTry) or 12, 3)
 	while alive() and now() - t0 < limit do
-		if not canUseShop() then
-			print("[rathub-heal] shop disappeared during heal")
-			return false
-		end
-		local viaButton = shots < 3
-		if buyFillHP(viaButton) then
+		if buyFillHP() then
 			shots = shots + 1
 		end
-		task.wait(0.22)
+		task.wait(0.18)
 		local hp = hpNow()
 		if hp > before + 1 then
 			print(string.format("[rathub-heal] healed %d -> %d (%d shots, %.1fs)", before, hp, shots, now() - t0))
@@ -2770,194 +2020,29 @@ end
 task.spawn(function()
 	while alive() do
 		task.wait(0.5)
-		local wave = ws:FindFirstChild("Wave") and ws.Wave.Value or 0
-		local living = ws:FindFirstChild("Living")
-		local inGame = wave > 0 or (lp.Character and living and lp.Character.Parent == living)
-		if st.heal and inGame and not st.astro and not isTitanForm() and now() >= transformQuietUntil then
+		if st.heal and st.farm and now() >= transformQuietUntil then
 			local t = now()
 			local hum = lp.Character and lp.Character:FindFirstChild("Humanoid")
 			if hum then
 				local hp, mx = hum.Health, hum.MaxHealth
 				local needHeal = healRequested or (mx > 0 and hp / mx * 100 < st.healHP)
 				if needHeal and not isHealing and t - lastHealT > 4 then
-					if canUseShop() then
-						isHealing = true
-						healBusy = true
-						local okH = doHeal()
-						healBusy = false
-						isHealing = false
-						healRequested = false
-						if okH then
-							lastHealT = now()
-							notify("Farm", "healed at shop", "check", 2)
-						else
-							lastHealT = now() + 6
-							print("[rathub-heal] failed, cooldown 6s")
-						end
+					isHealing = true
+					local okH = doHeal()
+					isHealing = false
+					healRequested = false
+					if okH then
+						lastHealT = now()
+						notify("Farm", "healed at shop", "check", 2)
+					else
+						lastHealT = now() + 15
+						print("[rathub-heal] failed, cooldown 15s")
 					end
 				end
 			end
 		end
 	end
 end)
-
-local BOT_BRIDGE
-local AIM_OVERRIDE_FORCED = false
-
-local function getBotBridge()
-	if BOT_BRIDGE and type(BOT_BRIDGE) == "table" and BOT_BRIDGE.GetAimPosition then
-		return BOT_BRIDGE
-	end
-	local mod = rs:FindFirstChild("BotBridge")
-	if not mod then
-		return nil
-	end
-	local ok, bb = pcall(require, mod)
-	if ok and type(bb) == "table" then
-		BOT_BRIDGE = bb
-		return bb
-	end
-	return nil
-end
-
-local function clearAimOverride()
-	local bb = getBotBridge()
-	if bb and AIM_OVERRIDE_FORCED then
-		pcall(function()
-			bb.AimPosition = nil
-			bb.Enabled = false
-		end)
-	end
-	AIM_OVERRIDE_FORCED = false
-end
-st._clearAim = clearAimOverride
-
--- The game already wraps MouseStream through BotBridge: when Enabled +
--- AimPosition are set, every stream packet (the client's own heartbeat too)
--- is redirected to that point. This is the only reliable silent aim, because
--- extra MouseStream packets get overwritten by the game's own packets.
-local function setAimTarget(pos)
-	local bb = getBotBridge()
-	if not bb then
-		return false
-	end
-	if not pos then
-		clearAimOverride()
-		return false
-	end
-	if not bb.Enabled then
-		AIM_OVERRIDE_FORCED = true
-	end
-	pcall(function()
-		bb.Enabled = true
-		bb.AimPosition = pos
-	end)
-	return true
-end
-
-local function mouseHitLook()
-	local bb = getBotBridge()
-	local cam = workspace.CurrentCamera
-	if bb and bb.Enabled and bb.AimPosition then
-		local dir = bb.AimPosition - cam.CFrame.Position
-		return bb.AimPosition, (dir.Magnitude > 0 and dir.Unit or cam.CFrame.LookVector)
-	end
-	local mouse = lp:GetMouse()
-	local hit = mouse and mouse.Hit
-	return hit and hit.Position or nil, cam and cam.CFrame.LookVector or nil
-end
-
--- Held abilities (UTSM Galting/Core, X18 Core/Laser, ...) only work when the
--- server gets a matching HoldStateSync pair. Firing the skill remote alone
--- starts a cast but never keeps/releases it correctly.
-local function holdSkillRemote(skillRemoteName, holdName, duration)
-	local rem = rs:FindFirstChild(skillRemoteName)
-	local hs = rs:FindFirstChild("HoldStateSync")
-	local fired = false
-	if hs and holdName and holdName ~= "" then
-		pcall(function()
-			hs:FireServer(holdName, true)
-		end)
-		fired = true
-	end
-	if rem then
-		pcall(function()
-			rem:FireServer()
-		end)
-		fired = true
-	end
-	if not fired then
-		return false
-	end
-	if _G.SendMouseNow then
-		pcall(function()
-			_G.SendMouseNow()
-		end)
-	end
-	local dur = math.max(tonumber(duration) or 1.5, 0.2)
-	task.delay(dur, function()
-		if hs and holdName and holdName ~= "" then
-			pcall(function()
-				hs:FireServer(holdName, false)
-			end)
-		end
-	end)
-	return true
-end
-
-local function holdSkillActivate(skillId, displayName, duration)
-	local sa = rs:FindFirstChild("SkillActivate")
-	if not sa then
-		return holdSkillRemote(skillId, nil, duration)
-	end
-	local pos, look = mouseHitLook()
-	pcall(function()
-		sa:FireServer(skillId, pos, look, "press", displayName or skillId)
-	end)
-	if _G.SendMouseNow then
-		pcall(function()
-			_G.SendMouseNow()
-		end)
-	end
-	local dur = math.max(tonumber(duration) or 1.5, 0.2)
-	task.delay(dur, function()
-		local p2, l2 = mouseHitLook()
-		pcall(function()
-			sa:FireServer(skillId, p2, l2, "release", displayName or skillId)
-		end)
-	end)
-	return true
-end
-
-local function sendSilentAim(target, hrp)
-	if not target or not hrp then
-		return
-	end
-	local aimPart = target.mob and target.mob:FindFirstChild("Head") or target.root
-	local pos = aimPart and aimPart.Position or target.pos
-	if not pos then
-		return
-	end
-	if setAimTarget(pos) then
-		pcall(function()
-			if _G.SendMouseNow then
-				_G.SendMouseNow()
-			end
-		end)
-		return
-	end
-	local ms = rs:FindFirstChild("MouseStream")
-	if not ms then
-		return
-	end
-	local dir = pos - hrp.Position
-	if dir.Magnitude < 0.01 then
-		return
-	end
-	pcall(function()
-		ms:FireServer(pos, dir.Unit, false)
-	end)
-end
 
 local function fireLMB()
 	pcall(function()
@@ -2968,7 +2053,7 @@ end
 task.spawn(function()
 	while alive() do
 		task.wait(0.05)
-		if st.m1Spam and farmOn() and not healBusy and now() >= transformQuietUntil then
+		if st.m1Spam and farmOn() and now() >= transformQuietUntil then
 			fireLMB()
 		end
 	end
@@ -2978,7 +2063,7 @@ task.spawn(function()
 	local lastErr = 0
 	while alive() do
 		task.wait(st.skillDelay)
-		if farmOn() and (st.skills or st.titanFarm) and not healBusy and now() >= transformQuietUntil then
+		if farmOn() and (st.skills or st.titanFarm) and now() >= transformQuietUntil then
 			local t = now()
 			local ok, err = pcall(function()
 				if st.skillOrbitOnly and not isOrbiting then
@@ -3136,7 +2221,11 @@ task.spawn(function()
 						txt = "Waiting for banner... | missing: " .. preview .. " | banner: " .. bannerTxt
 					end
 					pcall(function()
-						gachaSkinInfo:SetText(txt)
+						if gachaSkinInfo.Set then
+							gachaSkinInfo:Set(txt)
+						else
+							gachaSkinInfo.Content = txt
+						end
 					end)
 				end
 				if target then
@@ -3206,13 +2295,7 @@ local function scanMobs(hrp)
 		return {}
 	end
 	for _, v in ipairs(children) do
-		if v.ClassName == "Model"
-			and v ~= lp.Character
-			and not Players:GetPlayerFromCharacter(v)
-			and not isPlayer(v)
-			and not v:FindFirstChild("GoodAI")
-			and not isAllyName(v.Name)
-		then
+		if v.ClassName == "Model" and not isPlayer(v) and not v:FindFirstChild("GoodAI") and not isAllyName(v.Name) then
 			local hum = v:FindFirstChildOfClass("Humanoid")
 			local mhrp = v:FindFirstChild("HumanoidRootPart") or v:FindFirstChild("RootPart") or v:FindFirstChildWhichIsA("BasePart")
 			local hp, mx = 0, 1
@@ -3275,13 +2358,6 @@ end
 local function pickTarget(list)
 	if #list == 0 then
 		return nil
-	end
-	if Party.role == "Support" and Party.assistTarget and Party.assistTarget.name then
-		for _, m in ipairs(list) do
-			if m.name == Party.assistTarget.name then
-				return m
-			end
-		end
 	end
 	local prio = splitList(st.priority)
 	if #prio > 0 then
@@ -3752,7 +2828,11 @@ task.spawn(function()
 		if txt ~= lastText then
 			lastText = txt
 			pcall(function()
-				boostActiveInfo:SetText(txt)
+				if boostActiveInfo.Set then
+					boostActiveInfo:Set(txt)
+				else
+					boostActiveInfo.Content = txt
+				end
 			end)
 		end
 	end
@@ -4160,7 +3240,7 @@ end
 local SHOP_POS = Vector3.new(39.84444046020508, 2.7063474655151367, -24.393577575683594)
 local shopHold = false
 
-local FS = { namesT = 0, scanT = 0, lmbT = 0, errT = 0, aimT = 0 }
+local FS = { namesT = 0, scanT = 0, lmbT = 0, errT = 0 }
 
 RunService.Heartbeat:Connect(function(dt)
 	if not alive() or not (st.farm or st.loot) then
@@ -4192,10 +3272,6 @@ RunService.Heartbeat:Connect(function(dt)
 		end
 
 		if godBusy then
-			return
-		end
-
-		if healBusy then
 			return
 		end
 
@@ -4238,9 +3314,6 @@ RunService.Heartbeat:Connect(function(dt)
 		if not target then
 			currentTarget = nil
 			isOrbiting = false
-			if st._clearAim and st.silentAim then
-				st._clearAim()
-			end
 			if lootStep(hrp, dt) then
 			elseif zoneGoal then
 				if moveToward(hrp, zoneGoal, zoneGoal, dt) then
@@ -4257,11 +3330,6 @@ RunService.Heartbeat:Connect(function(dt)
 			if isPriorityName(target.name) then
 				notify("Farm", "target: " .. target.name, "crosshair", 2)
 			end
-		end
-
-		if st.silentAim and t - FS.aimT >= (tonumber(st.silentAimRate) or 0.05) then
-			FS.aimT = t
-			sendSilentAim(target, hrp)
 		end
 
 		if (st.m1 or st.titanFarm) and t - FS.lmbT >= 0.1 then
@@ -4508,19 +3576,11 @@ task.spawn(function()
 	end
 end)
 
-local TS = { scan = 0, lmb = 0, mobs = {}, err = 0, hint = false, angle = 0, angleInit = false, buy = 0, use = 0, reqFired = 0, wasForm = false, wIdx = 1, sIdx = 1, target = nil, orbiting = false, lastY = nil, resetDone = false, cinemaLast = 0, cinemaTries = 0, castUntil = 0, aimT = 0, utsmIdx = 0, holdUntil = 0 }
-_G.__RATHUB_TS = TS
+local TS = { scan = 0, lmb = 0, mobs = {}, err = 0, hint = false, angle = 0, angleInit = false, buy = 0, use = 0, reqFired = 0, wasForm = false, wIdx = 1, sIdx = 1, target = nil, orbiting = false, lastY = nil, resetDone = false, cinemaLast = 0, cinemaTries = 0 }
 
 local function titanPickTarget(list)
 	if #list == 0 then
 		return nil
-	end
-	if Party.role == "Support" and Party.assistTarget and Party.assistTarget.name then
-		for _, m in ipairs(list) do
-			if m.name == Party.assistTarget.name then
-				return m
-			end
-		end
 	end
 	local prioSrc = (st.titanPriority and st.titanPriority ~= "") and st.titanPriority or st.priority
 	local prio = splitList(prioSrc)
@@ -4585,25 +3645,13 @@ local TITAN_PRESETS = {
 		strong = parseSkillList("StompTitanTV | Stomp_Cooldown\nStabTitanTV | Stab_Cooldown\nTackle | Tackle_Cooldown\nRadiantTitanTV | Radiant_Cooldown"),
 	},
 	["Titan Cameraman"] = {
-		weak = parseSkillList(
-			"KickTitanCamera | Kick_Cooldown; JumpSlamTitanCam | JumpSlam_Cooldown; StompTitanCamera | Stomp_Cooldown; CoreFlameTitanCamera | CoreFlame_Cooldown"
-		),
-		strong = parseSkillList(
-			"KickTitanCamera | Kick_Cooldown; JumpSlamTitanCam | JumpSlam_Cooldown; StompTitanCamera | Stomp_Cooldown; TackleTitanCam | Tackle_Cooldown; CoreFlameTitanCamera | CoreFlame_Cooldown"
-		),
-	},
-	["UTSM (Special)"] = {
-		long = parseSkillList("UpgradedTitanSpeakerShoot; UpgradedTitanSpeakerFifthShot; UpgradedTitanSpeakerCore"),
-		longGatling = parseSkillList("UpgradedTitanSpeakerShoot; UpgradedTitanSpeakerGalting; UpgradedTitanSpeakerCore"),
-		melee = parseSkillList("UpgradedTitanSpeakerSoundWave; UpgradedTitanSpeakerKick"),
+		weak = parseSkillList("KickTitanCamera\nJumpSlamTitanCam\nStompTitanCamera\nCoreFlameTitanCamera"),
+		strong = parseSkillList("KickTitanCamera\nJumpSlamTitanCam\nStompTitanCamera\nTackleTitanCam\nCoreFlameTitanCamera"),
 	},
 }
 
 local function titanPresetLists()
-	local p = TITAN_PRESETS[st.titanPreset]
-	if not p then
-		return nil, nil
-	end
+	local p = TITAN_PRESETS[st.titanPreset] or TITAN_PRESETS["Titan TV"]
 	return p.weak, p.strong
 end
 
@@ -4682,6 +3730,13 @@ task.spawn(function()
 			titanRequestUsed = false
 			continue
 		end
+		if wave < st.titanRequestWave then
+			-- a new round is running: waves restarted below the threshold,
+			-- so the previous round's "used" flag must not block this one
+			-- (wave==0 may never be observed between rounds)
+			titanRequestUsed = false
+			continue
+		end
 
 		if not titanHasItem() then
 			-- the ShopSystem remote always works here: fire it whenever the
@@ -4691,11 +3746,6 @@ task.spawn(function()
 				continue
 			end
 			if not canUseShop() then
-				continue
-			end
-			local sandboxMode = rs:FindFirstChild("SandboxMode")
-			local sandboxOn = sandboxMode and sandboxMode.Value == true
-			if not sandboxOn and titanMoney() < (tonumber(st.titanPrice) or 2200) then
 				continue
 			end
 			TS.buy = t
@@ -4814,7 +3864,7 @@ task.spawn(function()
 			-- clicks mid-transform bug the titan
 			transformQuietUntil = now() + 30
 			pcall(function()
-				rs:WaitForChild(st.titanRequestRemote or "RequestTitan"):FireServer()
+				rs:WaitForChild("RequestTitan"):FireServer()
 			end)
 			TS.reqFired = now()
 			-- wait for the form WITHOUT touching anything; only if the
@@ -4894,7 +3944,7 @@ end)
 task.spawn(function()
 	while alive() do
 		task.wait(1)
-		if not st.titanFarm or Party.combatRole ~= "None" or st.titanPreset ~= "Titan TV" then
+		if not (st.titanFarm and st.titanCinema) then
 			TS.cinemaTries = 0
 			continue
 		end
@@ -4945,91 +3995,16 @@ task.spawn(function()
 	end
 end)
 
--- UTSM upgrades are bought at the helicopter pad, exactly like Titan TV's
--- cinema columns: stand on the shop spot, wait for CanUseShop, then fire
--- ChangeUpgradedTitanSpeaker. Firing it anywhere else silently does nothing.
-task.spawn(function()
-	local last = 0
-	while alive() do
-		task.wait(1)
-		if not (st.titanFarm and st.titanPreset == "UTSM (Special)" and st.utsmAuto) then
-			if st._utsmStatus then
-				st._utsmStatus:SetText("UTSM: авто-апгрейд выключен")
-			end
-			st.utsmModeApplied = false
-			continue
-		end
-		if not isTitanForm() or now() < transformQuietUntil then
-			if st._utsmStatus then
-				st._utsmStatus:SetText("UTSM: ждёт форму")
-			end
-			continue
-		end
-		if st.utsmModeApplied then
-			if st._utsmStatus then
-				st._utsmStatus:SetText("UTSM: апгрейд " .. tostring(st.utsmMode) .. " применён")
-			end
-			continue
-		end
-		if not canUseShop() then
-			if st._utsmStatus then
-				st._utsmStatus:SetText("UTSM: нужен вертолёт")
-			end
-			continue
-		end
-		local t = now()
-		if t - last < 3 then
-			continue
-		end
-		last = t
-		local rem = rs:FindFirstChild("ChangeUpgradedTitanSpeaker")
-		if not rem then
-			if st._utsmStatus then
-				st._utsmStatus:SetText("UTSM: нет ChangeUpgradedTitanSpeaker")
-			end
-			continue
-		end
-		if st._utsmStatus then
-			st._utsmStatus:SetText("UTSM: покупаю " .. tostring(st.utsmMode) .. "...")
-		end
-		shopHold = true
-		pcall(function()
-			local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
-			if hrp then
-				hrp.CFrame = CFrame.new(SHOP_POS.X, SHOP_POS.Y, SHOP_POS.Z)
-				hrp.AssemblyLinearVelocity = Vector3.zero
-			end
-		end)
-		task.wait(0.4)
-		pcall(function()
-			rem:FireServer(st.utsmMode)
-		end)
-		task.wait(1)
-		shopHold = false
-		st.utsmModeApplied = true
-		if st._utsmStatus then
-			st._utsmStatus:SetText("UTSM: отправлен " .. tostring(st.utsmMode))
-		end
-		print("[rathub-utsm] upgrade purchase sent: " .. tostring(st.utsmMode))
-	end
-end)
-
-local titanSkillDebugAt = 0
 task.spawn(function()
 	while alive() do
 		task.wait(st.titanSkillDelay)
-		if st.titanFarm and st.titanSkillsOn and isTitanForm() and Party.combatRole == "None" then
+		if st.titanFarm and st.titanSkillsOn and isTitanForm() then
 			local t = now()
-			if shopHold then
-				continue
-			end
 			if t < transformQuietUntil then
 				continue
 			end
-			if t < (TS.castUntil or 0) then
-				continue
-			end
 			local ok, err = pcall(function()
+				-- abilities only while orbiting the target
 				if st.titanOrbitOnly and not TS.orbiting then
 					return
 				end
@@ -5037,218 +4012,23 @@ task.spawn(function()
 				if not tgt then
 					return
 				end
+				-- helicopters / jetpack toilets: M1 only
+				if titanIsFlyer(tgt.name) then
+					return
+				end
 				local char = lp.Character
 				local cdf = char and char:FindFirstChild("CooldownFolder")
-				local am1 = cdf and cdf:FindFirstChild("ActiveM1")
-				if am1 and am1.Value == true then
-					TS.castUntil = t + 0.4
-					return
-				end
+				-- wait only while a skill itself is casting (not M1), so the
+				-- M1 spam cannot starve abilities
+				local busy = false
 				local ask = cdf and cdf:FindFirstChild("ActiveSkill")
 				if ask and ask.Value == true then
-					TS.castUntil = t + 0.2
-					return
+					busy = true
 				end
-				if st.titanPreset == "UTSM (Special)" then
-					local preset = TITAN_PRESETS["UTSM (Special)"]
-					local hrp = char and char:FindFirstChild("HumanoidRootPart")
-					local targetPos = tgt.pos
-					if not targetPos then
-						for _, m in ipairs(TS.mobs or {}) do
-							if m.name == tgt.name and m.root then
-								targetPos = m.root.Position
-								break
-							end
-						end
-					end
-					local dist = (targetPos and hrp) and (targetPos - hrp.Position).Magnitude or 999
-					if TS.holdUntil and t < TS.holdUntil then
-						return
-					end
-					local fired = false
-					local listSize = 0
-					local pickName = nil
-					if dist > 22 then
-						local function cdReady(name)
-							local v = cdf and cdf:FindFirstChild(name)
-							return not (v and v.Value == true)
-						end
-						local options = {}
-						if cdReady("Shoot_Cooldown") then
-							options[#options + 1] = "Shoot"
-						end
-						if st.utsmGatling then
-							if cdReady("Galting_Cooldown") then
-								options[#options + 1] = "Galting"
-							end
-						elseif cdReady("FifthShot_Cooldown") then
-							options[#options + 1] = "FifthShot"
-						end
-						if cdReady("Core_Cooldown") then
-							options[#options + 1] = "Core"
-						end
-						listSize = #options
-						if #options > 0 then
-							TS.utsmIdx = (TS.utsmIdx % #options) + 1
-							local pick = options[TS.utsmIdx]
-							pickName = pick
-							if pick == "Shoot" then
-								local rem = rs:FindFirstChild("UpgradedTitanSpeakerShoot")
-								if rem then
-									pcall(function()
-										rem:FireServer()
-									end)
-								end
-								TS.castUntil = t + 0.9
-								fired = true
-							elseif pick == "FifthShot" then
-								local rem = rs:FindFirstChild("UpgradedTitanSpeakerFifthShot")
-								if rem then
-									pcall(function()
-										rem:FireServer()
-									end)
-								end
-								TS.castUntil = t + 0.9
-								fired = true
-							else
-								local dur = tonumber(st.holdDuration) or 1.8
-								if holdSkillRemote("UpgradedTitanSpeaker" .. pick, pick, dur) then
-									TS.holdUntil = t + dur
-									TS.castUntil = t + dur + 0.3
-									fired = true
-								end
-							end
-						end
-					else
-						local list = preset.melee
-						listSize = #list
-						local nextIdx, okFired, skill = runSkillNext(list, char, cdf, false, TS.sIdx)
-						TS.sIdx = nextIdx
-						if okFired then
-							TS.castUntil = t + 0.9
-							fired = true
-							pickName = skill and skill.remote
-						end
-					end
-					if t - titanSkillDebugAt > 10 then
-						titanSkillDebugAt = t
-						print(string.format(
-							"[rathub-titan-skill] preset=UTSM dist=%.1f list=%d fired=%s pick=%s mode=%s gatling=%s",
-							dist,
-							listSize,
-							tostring(fired),
-							tostring(pickName),
-							tostring(st.utsmMode),
-							tostring(st.utsmGatling)
-						))
-					end
-				else
+				-- presets: weak (<300 max HP) / strong (300+)
 				local weakL, strongL = titanPresetLists()
-				local list = weakL and (((tgt.mx or 0) < 300) and weakL or strongL) or nil
-				local fired = false
-				if list then
-					if t - titanSkillDebugAt > 10 then
-						titanSkillDebugAt = t
-						local missing = {}
-						for _, s in ipairs(list) do
-							if not resolveRemote(s.remote) then
-								missing[#missing + 1] = s.remote
-							end
-						end
-						print(string.format(
-							"[rathub-titan-skill] preset=%s target=%s mx=%s orbiting=%s list=%d activeM1=%s missing=%s",
-							tostring(st.titanPreset),
-							tostring(tgt.name),
-							tostring(tgt.mx),
-							tostring(TS.orbiting),
-							#list,
-							tostring(am1 and am1.Value),
-							table.concat(missing, ",")
-						))
-					end
-					local nextIdx, okFired = runSkillNext(list, char, cdf, false, TS.sIdx)
-					TS.sIdx = nextIdx
-					fired = okFired
-				else
-					if not st._botBridge then
-						local bm = rs:FindFirstChild("BotBridge")
-						if bm then
-							local okB, resB = pcall(require, bm)
-							if okB then
-								st._botBridge = resB
-							end
-						end
-					end
-					local profile = st._botBridge and st._botBridge.GetProfile()
-					local actions = profile and profile.Actions
-					local hrp = char and char:FindFirstChild("HumanoidRootPart")
-					local targetPos = tgt.pos
-					if not targetPos then
-						for _, m in ipairs(TS.mobs or {}) do
-							if m.name == tgt.name and m.root then
-								targetPos = m.root.Position
-								break
-							end
-						end
-					end
-					local dist = (targetPos and hrp) and (targetPos - hrp.Position).Magnitude or 999
-					if actions then
-						for _, action in ipairs(actions) do
-							local range = action.Range or { 0, 100 }
-							local minR = range[1] or 0
-							local maxR = range[2] or 100
-							if action.Fn and dist >= minR and dist <= maxR then
-								local ready = true
-								if action.Cooldown and cdf then
-									local cd = cdf:FindFirstChild(action.Cooldown .. "_Cooldown")
-									if cd and cd.Value == true then
-										ready = false
-									end
-								end
-								if ready and action.Ready then
-									local okR, resR = pcall(action.Ready)
-									if not okR or not resR then
-										ready = false
-									end
-								end
-								if ready then
-									if action.Hold then
-										local hold = action.HoldTime or 2
-										TS.castUntil = t + hold + 0.3
-										task.spawn(function()
-											pcall(action.Fn)
-											task.wait(hold)
-											if action.Release then
-												pcall(action.Release)
-											end
-										end)
-									else
-										TS.castUntil = t + 0.9
-										pcall(action.Fn)
-									end
-									fired = true
-									break
-								end
-							end
-						end
-					end
-					if t - titanSkillDebugAt > 10 then
-						titanSkillDebugAt = t
-						print(string.format(
-							"[rathub-titan-skill] preset=%s profile=%s actions=%d target=%s dist=%.1f fired=%s",
-							tostring(st.titanPreset),
-							tostring(profile and profile.Name),
-							actions and #actions or 0,
-							tostring(tgt.name),
-							dist,
-							tostring(fired)
-						))
-					end
-				end
-				if fired then
-					TS.castUntil = t + 0.9
-				end
-				end
+				local list = ((tgt.mx or 0) < 300) and weakL or strongL
+				TS.sIdx = runSkillNext(list, char, cdf, busy, TS.sIdx)
 			end)
 			if not ok and t - TS.err > 5 then
 				TS.err = t
@@ -5262,9 +4042,6 @@ RunService.Heartbeat:Connect(function(dt)
 	if not alive() or not st.titanFarm then
 		return
 	end
-	if shopHold then
-		return
-	end
 	if not isTitanForm() then
 		if TS.wasForm then
 			-- the form was active and is now gone (died / round ended):
@@ -5272,19 +4049,6 @@ RunService.Heartbeat:Connect(function(dt)
 			TS.wasForm = false
 			transformQuietUntil = 0
 			titanRequestUsed = false
-			TS.castUntil = 0
-			st.utsmModeApplied = false
-			TS.holdUntil = 0
-			Party.x18Holding = false
-			Party.x18Key = nil
-			Party.clockHealing = false
-			pcall(function()
-				local vim = game:GetService("VirtualInputManager")
-				vim:SendKeyEvent(false, Enum.KeyCode.X, false, game)
-				vim:SendKeyEvent(false, Enum.KeyCode.Y, false, game)
-				vim:SendKeyEvent(false, Enum.KeyCode.G, false, game)
-				vim:SendKeyEvent(false, Enum.KeyCode.F, false, game)
-			end)
 		end
 		if st.titanFarm and not TS.hint then
 			TS.hint = true
@@ -5294,9 +4058,6 @@ RunService.Heartbeat:Connect(function(dt)
 	end
 	TS.hint = false
 	TS.wasForm = true
-	if Party.combatRole == "X18" or Party.combatRole == "Clock Titan" then
-		return
-	end
 	local t = now()
 	local ok, err = pcall(function()
 		local char = lp.Character
@@ -5304,7 +4065,6 @@ RunService.Heartbeat:Connect(function(dt)
 		if not hrp then
 			return
 		end
-		local keep = st.titanRadius
 		local wave = ws:FindFirstChild("Wave") and ws.Wave.Value or 0
 		-- reset wave (titan side, the normal farm heartbeat returns here)
 		if st.titanResetWave and st.titanResetWave > 0 then
@@ -5318,7 +4078,7 @@ RunService.Heartbeat:Connect(function(dt)
 			end
 		end
 		-- M1 spams all the time, together with abilities
-		if st.titanM1 and t - TS.lmb >= 0.1 and t >= (TS.castUntil or 0) then
+		if st.titanM1 and t - TS.lmb >= 0.1 then
 			TS.lmb = t
 			local cdf = char:FindFirstChild("CooldownFolder")
 			local am1 = cdf and cdf:FindFirstChild("ActiveM1")
@@ -5340,12 +4100,9 @@ RunService.Heartbeat:Connect(function(dt)
 			TS.target = nil
 			TS.orbiting = false
 			TS.angleInit = false
-			if st._clearAim and st.silentAim then
-				st._clearAim()
-			end
 			return
 		end
-		TS.target = { name = target.name, mx = target.mx, pos = tpos }
+		TS.target = { name = target.name, mx = target.mx }
 		local tpos
 		pcall(function()
 			tpos = target.root.Position
@@ -5354,15 +4111,11 @@ RunService.Heartbeat:Connect(function(dt)
 			tpos = target.pos
 		end
 		target.pos = tpos
-		if st.silentAim and t - TS.aimT >= (tonumber(st.silentAimRate) or 0.05) then
-			TS.aimT = t
-			sendSilentAim(target, hrp)
-		end
 		local ppos = hrp.Position
 		local flatT = Vector3.new(tpos.X, ppos.Y, tpos.Z)
 		local dist = (flatT - ppos).Magnitude
 
-		if dist > keep + 3 then
+		if dist > st.titanRadius + 3 then
 			-- approach: stay at orbit radius, feet on the ground
 			TS.angleInit = false
 			TS.orbiting = false
@@ -5371,8 +4124,8 @@ RunService.Heartbeat:Connect(function(dt)
 				dir = Vector3.new(0, 0, 1)
 			end
 			dir = dir.Unit
-			local goal = flatT + dir * keep
-			local step = math.min(st.titanSpeed * dt, math.max(dist - keep, 0))
+			local goal = flatT + dir * st.titanRadius
+			local step = math.min(st.titanSpeed * dt, math.max(dist - st.titanRadius, 0))
 			local flat = Vector3.new(goal.X, ppos.Y, goal.Z)
 			local toGoal = flat - ppos
 			local np = ppos + (toGoal.Magnitude > 0.01 and toGoal.Unit * math.min(step, toGoal.Magnitude) or Vector3.new(0, 0, 0))
@@ -5389,7 +4142,7 @@ RunService.Heartbeat:Connect(function(dt)
 				TS.angleInit = true
 			end
 			TS.angle = TS.angle + math.rad(st.titanOrbitDeg) * dt
-			local orb = tpos + Vector3.new(math.cos(TS.angle) * keep, 0, math.sin(TS.angle) * keep)
+			local orb = tpos + Vector3.new(math.cos(TS.angle) * st.titanRadius, 0, math.sin(TS.angle) * st.titanRadius)
 			local gy = titanGroundY(char, orb.X, orb.Z, ppos.Y)
 			local y = (gy or TS.lastY or ppos.Y) + st.titanFeetOffset
 			TS.lastY = y
@@ -5404,7 +4157,7 @@ end)
 
 local function parseMasteryList(text)
 	local out = {}
-	for line in (text or ""):gmatch("[^\r\n;]+") do
+	for line in (text or ""):gmatch("[^\r\n]+") do
 		line = line:gsub("^%s+", ""):gsub("%s+$", "")
 		if line ~= "" and line:sub(1, 1) ~= "#" then
 			local name, cap = line:match("^(.-)%s*|%s*(%d+)%s*$")
@@ -5478,436 +4231,6 @@ local function switchCharacter(name)
 	return false
 end
 
-function Party.update()
-	local wave = ws:FindFirstChild("Wave") and ws.Wave.Value or 0
-	local living = ws:FindFirstChild("Living")
-	local inArena = lp.Character and living and lp.Character.Parent == living
-	local pv = lp:FindFirstChild("PlayerValues")
-	local cv = pv and pv:FindFirstChild("Character")
-	local charName = cv and cv.Value or ""
-	local voting = ws:FindFirstChild("Voteing") and ws.Voteing.Value == true
-	local phase = if (wave > 0 or inArena) then "game" elseif voting then "vote" else "ready"
-	local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
-	local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
-	local pos = hrp and { x = hrp.Position.X, y = hrp.Position.Y, z = hrp.Position.Z } or nil
-	local tgt = nil
-	if Party.role == "Main" then
-		local src = (isTitanForm() and TS and TS.target) or currentTarget
-		if src and src.name then
-			local tp = src.pos
-			if not tp and src.root then
-				pcall(function()
-					tp = src.root.Position
-				end)
-			end
-			tgt = {
-				name = tostring(src.name),
-				x = tp and tp.X or nil,
-				y = tp and tp.Y or nil,
-				z = tp and tp.Z or nil,
-			}
-		end
-	end
-	local data = {
-		mode = st.voteMode,
-		wantVote = st.vote,
-		wantReady = st.ready,
-		supportMode = Party.supportMode,
-		char = charName,
-		wave = wave,
-		cen = getCen(),
-		phase = phase,
-		path = st.pathPreset,
-		hp = hum and hum.Health or 0,
-		maxhp = hum and hum.MaxHealth or 0,
-		pos = pos,
-		target = tgt,
-		look = hrp and { x = hrp.CFrame.LookVector.X, y = hrp.CFrame.LookVector.Y, z = hrp.CFrame.LookVector.Z } or nil,
-	}
-	if Party.role == "Main" then
-		data.wantVote = st.vote or st._pathForced or st.pathBoostFarmActive or st.pathFallbackActive
-		Party.write("main", data)
-		local support = Party.read("support")
-		Party.partner = Party.fresh(support) and support or nil
-	else
-		Party.write("support", data)
-		local main = Party.read("main")
-		Party.partner = Party.fresh(main) and main or nil
-		if Party.partner and Party.followVote then
-			st.voteMode = Party.partner.mode or st.voteMode
-			st.vote = Party.partner.wantVote == true
-			st.ready = Party.partner.wantReady == true
-		end
-		if Party.supportMode == "Assist" and Party.partner and Party.partner.target then
-			Party.assistTarget = Party.partner.target
-		else
-			Party.assistTarget = nil
-		end
-		if Party.followChar and Party.partner and Party.partner.char and Party.partner.char ~= "" and wave == 0 and not inArena then
-			if charName ~= Party.partner.char and os.time() - (Party.lastCharAttempt or 0) >= 3 then
-				Party.lastCharAttempt = os.time()
-				switchCharacter(Party.partner.char)
-			end
-		end
-	end
-	Party.updateStatus()
-end
-
-task.spawn(function()
-	while alive() do
-		task.wait(0.2)
-		if Party.role == "Support" and Party.followLeader and Party.partner and Party.partner.pos then
-			local wave = ws:FindFirstChild("Wave") and ws.Wave.Value or 0
-			local living = ws:FindFirstChild("Living")
-			local inArena = lp.Character and living and lp.Character.Parent == living
-			if (wave > 0 or inArena) and not godBusy and not healBusy and now() >= transformQuietUntil then
-				local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
-				if hrp then
-					local p = Party.partner
-					local targetPos = Vector3.new(p.pos.x, p.pos.y, p.pos.z)
-					local lx, lz = 0, 1
-					if p.look then
-						lx = tonumber(p.look.x) or 0
-						lz = tonumber(p.look.z) or 0
-						local lm = math.sqrt(lx * lx + lz * lz)
-						if lm > 0.01 then
-							lx, lz = lx / lm, lz / lm
-						else
-							lx, lz = 0, 1
-						end
-					end
-					local dist = tonumber(Party.followDistance) or 12
-					local goal = targetPos - Vector3.new(lx, 0, lz) * dist
-					if (hrp.Position - goal).Magnitude > 4 then
-						pcall(function()
-							hrp.CFrame = CFrame.new(goal)
-							hrp.AssemblyLinearVelocity = Vector3.zero
-							hrp.AssemblyAngularVelocity = Vector3.zero
-						end)
-					end
-				end
-			end
-		end
-	end
-end)
-
-task.spawn(function()
-	while alive() do
-		task.wait(0.5)
-		if Party.role == "Support" and Party.supportMode == "Healer" and Party.partner then
-			local p = Party.partner
-			local hp = tonumber(p.hp) or 0
-			local maxhp = tonumber(p.maxhp) or 0
-			local below = tonumber(Party.healBelow) or 50
-			if maxhp > 0 and hp > 0 and hp / maxhp * 100 <= below and now() - (Party.healAt or 0) > 1 then
-				Party.healAt = now()
-				local list = parseSkillList(Party.healList)
-				local fired = 0
-				for _, s in ipairs(list) do
-					local rem = resolveRemote(s.remote)
-					if rem then
-						pcall(function()
-							local low = tostring(s.remote):lower()
-							if (low:find("clock", 1, true) or low:find("friend", 1, true)) and p.pos then
-								rem:FireServer(Vector3.new(p.pos.x, (p.pos.y or 0) + 4, p.pos.z))
-							elseif #s.args > 0 then
-								rem:FireServer(table.unpack(s.args))
-							else
-								rem:FireServer()
-							end
-						end)
-						fired = fired + 1
-					end
-				end
-				if fired > 0 then
-					print("[rathub-party] healer fired " .. fired .. " remote(s) for " .. tostring(p.name))
-				end
-			end
-		end
-	end
-end)
-
-task.spawn(function()
-	while alive() do
-		task.wait(math.max(0.5, tonumber(Party.interval) or 1))
-		pcall(Party.update)
-	end
-end)
-
-task.spawn(function()
-	while alive() do
-		task.wait(0.1)
-		if Party.combatRole == "X18" and isTitanForm() then
-			local ch = lp.Character
-			local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
-			if hrp then
-				if not Party.x18Anchor then
-					Party.x18Anchor = { x = hrp.Position.X, y = hrp.Position.Y, z = hrp.Position.Z }
-				end
-				local anchor = Vector3.new(Party.x18Anchor.x, Party.x18Anchor.y, Party.x18Anchor.z)
-				if (hrp.Position - anchor).Magnitude > 2 then
-					hrp.CFrame = CFrame.new(anchor)
-					hrp.AssemblyLinearVelocity = Vector3.zero
-				end
-				local mobs = scanMobs(hrp)
-				local best = nil
-				for _, m in ipairs(mobs) do
-					if not best or m.dist < best.dist then
-						best = m
-					end
-				end
-				if best and st.silentAim then
-					local aimPart = best.mob and best.mob:FindFirstChild("Head") or best.root
-					local aimPos = aimPart and aimPart.Position or best.pos
-					local dir = aimPos and (aimPos - hrp.Position)
-					if dir and dir.Magnitude > 0.01 then
-						sendSilentAim(best, hrp)
-					end
-				end
-				local cdf = ch:FindFirstChild("CooldownFolder")
-				local now = os.clock()
-				local hs = rs:FindFirstChild("HoldStateSync")
-				local setRem = rs:FindFirstChild("G-Toilet18SkillsSet")
-				if Party.x18Holding then
-					if now >= (Party.x18HoldUntil or 0) then
-						if hs and Party.x18Key then
-							pcall(function()
-								hs:FireServer(Party.x18Key, false)
-							end)
-						end
-						if _G.SetSkillActive then
-							pcall(function()
-								_G.SetSkillActive(false)
-							end)
-						end
-						Party.x18Holding = false
-						Party.x18Key = nil
-					end
-				elseif best then
-					local coreReady = cdf and cdf.Core_Cooldown and cdf.Core_Cooldown.Value == false
-					local laserReady = cdf and cdf.EyeLaser_Cooldown and cdf.EyeLaser_Cooldown.Value == false
-					local pick = nil
-					if (Party.x18Next or "Core") == "Core" then
-						if coreReady then
-							pick = "Core"
-						elseif laserReady then
-							pick = "Laser"
-						end
-					else
-						if laserReady then
-							pick = "Laser"
-						elseif coreReady then
-							pick = "Core"
-						end
-					end
-					if pick then
-						if _G.SetSkillActive then
-							pcall(function()
-								_G.SetSkillActive(true)
-							end)
-						end
-						if _G.SendMouseNow then
-							pcall(function()
-								_G.SendMouseNow()
-							end)
-						end
-						if hs then
-							pcall(function()
-								hs:FireServer(pick, true)
-							end)
-						end
-						if setRem then
-							pcall(function()
-								setRem:FireServer({ Skill = (pick == "Core") and "Core" or "EyeLaser" })
-							end)
-						end
-						Party.x18Holding = true
-						Party.x18Key = pick
-						Party.x18HoldUntil = now + (tonumber(st.holdDuration) or 1.8)
-						Party.x18Next = (pick == "Core") and "Laser" or "Core"
-					end
-				end
-			end
-		elseif Party.x18Holding then
-			local hs = rs:FindFirstChild("HoldStateSync")
-			if hs and Party.x18Key then
-				pcall(function()
-					hs:FireServer(Party.x18Key, false)
-				end)
-			end
-			if _G.SetSkillActive then
-				pcall(function()
-					_G.SetSkillActive(false)
-				end)
-			end
-			Party.x18Holding = false
-			Party.x18Key = nil
-		end
-	end
-end)
-
-task.spawn(function()
-	while alive() do
-		task.wait(0.2)
-		if Party.combatRole == "Clock Titan" and isTitanForm() then
-			local ch = lp.Character
-			local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
-			local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-			local vf = ch and ch:FindFirstChild("ValuesFolder")
-			local cdf = ch and ch:FindFirstChild("CooldownFolder")
-			local partner = Party.partner
-			if partner and partner.pos and hrp then
-				local followDist = tonumber(Party.clockDistance) or 12
-				local lx, lz = 0, 1
-				if partner.look then
-					lx = tonumber(partner.look.x) or 0
-					lz = tonumber(partner.look.z) or 0
-					local lm = math.sqrt(lx * lx + lz * lz)
-					if lm > 0.01 then
-						lx, lz = lx / lm, lz / lm
-					else
-						lx, lz = 1, 0
-					end
-				end
-				local target = Vector3.new(
-					partner.pos.x - lx * followDist,
-					partner.pos.y + 8,
-					partner.pos.z - lz * followDist
-				)
-				if not Party.clockHealing and (hrp.Position - target).Magnitude > 4 then
-					hrp.CFrame = CFrame.new(target)
-					hrp.AssemblyLinearVelocity = Vector3.zero
-				end
-			end
-			local now = os.clock()
-			local selfhp = hum and hum.Health or 0
-			local x18hp = tonumber(partner and partner.hp) or 0
-			local x18max = tonumber(partner and partner.maxhp) or 0
-			local bar = 0
-			if vf then
-				local bv = vf:FindFirstChild("TimeStopEnegry")
-				bar = tonumber(bv and bv.Value) or 0
-			end
-			if cdf then
-				if selfhp < 7000 and cdf.SelfHeal_Cooldown and cdf.SelfHeal_Cooldown.Value == false then
-					local rem = rs:FindFirstChild("SelfHealTitanClockMan")
-					if rem then
-						pcall(function()
-							rem:FireServer()
-						end)
-					end
-				end
-				if bar < 50 and cdf.Regen_Cooldown and cdf.Regen_Cooldown.Value == false then
-					local rem = rs:FindFirstChild("RegenBarClockTitan")
-					if rem then
-						pcall(function()
-							rem:FireServer(Vector3.new(-21.22949981689453, -0.23972901701927185, -101.62884521484375))
-						end)
-					end
-				end
-				if x18max > 0
-					and x18hp > 0
-					and x18hp < x18max * 0.5
-					and cdf.FriendHeal_Cooldown
-					and cdf.FriendHeal_Cooldown.Value == false
-					and bar >= 80
-				then
-					local rem = rs:FindFirstChild("HealFriendTitanClockMan")
-					if rem then
-						pcall(function()
-							rem:FireServer()
-						end)
-					end
-				end
-			end
-			local healReady = cdf and cdf.Heal_Cooldown and cdf.Heal_Cooldown.Value == false
-			local needHeal = healReady and x18max > 0 and x18hp > 0 and x18hp < x18max * 0.98
-			local vim = game:GetService("VirtualInputManager")
-			if needHeal then
-				if not Party.clockHealing then
-					pcall(function()
-						vim:SendKeyEvent(true, Enum.KeyCode.F, false, game)
-					end)
-					Party.clockHealing = true
-					Party.clockHealUntil = now + (tonumber(st.holdDuration) or 1.8)
-					Party.clockHealAt = now
-					local rem = rs:FindFirstChild("HealClockTitan")
-					if rem and partner and partner.pos then
-						pcall(function()
-							rem:FireServer(Vector3.new(partner.pos.x, partner.pos.y + 4, partner.pos.z))
-						end)
-					end
-				elseif now >= (Party.clockHealUntil or 0) then
-					pcall(function()
-						vim:SendKeyEvent(false, Enum.KeyCode.F, false, game)
-					end)
-					Party.clockHealing = false
-					Party.clockHealAt = 0
-				elseif now - (Party.clockHealAt or 0) >= 0.4 then
-					Party.clockHealAt = now
-					local rem = rs:FindFirstChild("HealClockTitan")
-					if rem and partner and partner.pos then
-						pcall(function()
-							rem:FireServer(Vector3.new(partner.pos.x, partner.pos.y + 4, partner.pos.z))
-						end)
-					end
-				end
-			elseif Party.clockHealing then
-				pcall(function()
-					vim:SendKeyEvent(false, Enum.KeyCode.F, false, game)
-				end)
-				Party.clockHealing = false
-			end
-		elseif Party.clockHealing then
-			local vim = game:GetService("VirtualInputManager")
-			pcall(function()
-				vim:SendKeyEvent(false, Enum.KeyCode.F, false, game)
-			end)
-			Party.clockHealing = false
-		end
-	end
-end)
-
-function st._pathForce(active)
-	if active then
-		if not st._pathForced then
-			st._pathForced = true
-			st._pathSaved = {
-				titanFarm = st.titanFarm,
-				titanAuto = st.titanAutoRequest,
-				vote = st.vote,
-				voteMode = st.voteMode,
-			}
-		end
-		st.titanFarm = true
-		st.titanAutoRequest = true
-		st.vote = true
-		st.voteMode = "Hard"
-		pcall(function()
-			setToggle(titanToggle, true)
-		end)
-		if titanAutoRequestToggle then
-			pcall(function()
-				setToggle(titanAutoRequestToggle, true)
-			end)
-		end
-	elseif st._pathForced then
-		st._pathForced = false
-		st.titanFarm = st._pathSaved.titanFarm or false
-		st.titanAutoRequest = st._pathSaved.titanAuto or false
-		st.vote = st._pathSaved.vote or false
-		st.voteMode = st._pathSaved.voteMode or st.voteMode
-		pcall(function()
-			setToggle(titanToggle, st.titanFarm)
-		end)
-		if titanAutoRequestToggle then
-			pcall(function()
-				setToggle(titanAutoRequestToggle, st.titanAutoRequest)
-			end)
-		end
-	end
-end
-
 task.spawn(function()
 	local lastErr = 0
 	local lastSwitch = 0
@@ -5926,12 +4249,6 @@ task.spawn(function()
 					return
 				end
 				local cur = cv.Value
-				local waveNow = ws:FindFirstChild("Wave") and ws.Wave.Value or 0
-				local livingNow = ws:FindFirstChild("Living")
-				local canSwitch = waveNow == 0
-					and not (lp.Character and livingNow and lp.Character.Parent == livingNow)
-				local preset = PATH_PRESETS[st.pathPreset]
-				local special = preset and preset.special or false
 				local items = {}
 				local curIdx = 0
 				local todo, unknown = 0, 0
@@ -5956,139 +4273,12 @@ task.spawn(function()
 					end
 				end
 
-				local uttvActive = special and cur == "Upgraded Titan TV"
-				st._pathForce(uttvActive)
-				if st._pathStatus then
-					local curTxt = "?"
-					if curIdx > 0 and items[curIdx] then
-						curTxt = tostring(items[curIdx].m or "?") .. "/" .. tostring(items[curIdx].target or "?")
-					end
-					st._pathStatus:SetText(string.format(
-						"Path: %s (%s) | todo %d%s",
-						tostring(cur ~= "" and cur or "?"),
-						curTxt,
-						todo,
-						unknown > 0 and (" | unknown " .. unknown) or ""
-					))
-				end
-
-				if st.pathBoostFarmEnabled then
-					local cen = getCen()
-					local itemsForBoost = lp:FindFirstChild("_Data") and lp._Data:FindFirstChild("Items")
-					local boosters = 0
-					if itemsForBoost then
-						for _, c in ipairs(itemsForBoost:GetChildren()) do
-							if c.Name:find("Booster X2 Mastery", 1, true) then
-								boosters = boosters + (tonumber(c.Value) or 0)
-							end
-						end
-					end
-					local boostsData = lp:FindFirstChild("BoostsData")
-					local boostSec = 0
-					if boostsData then
-						local bv = boostsData:FindFirstChild("BoostMastery")
-						boostSec = tonumber(bv and bv.Value) or 0
-					end
-					if st.pathBoostFarmActive then
-						if cen >= st.pathBoostFarmTarget then
-							st.pathBoostFarmActive = false
-							st.pathBoostFarmDone = true
-							notify("Path", "boost farm done: " .. tostring(cen) .. " Cen", "check", 5)
-						else
-							st._pathForce(false)
-							st.vote = true
-							st.voteMode = "BossRush"
-							st.farm = true
-							st.titanFarm = false
-							pcall(function()
-								setToggle(farmToggle, true)
-								setToggle(titanToggle, false)
-							end)
-							if canSwitch and cur ~= st.pathBoostFarmChar and t - lastSwitch >= 3 then
-								lastSwitch = t
-								switchCharacter(st.pathBoostFarmChar)
-							end
-							return
-						end
-					elseif not st.pathBoostFarmDone then
-						if cen >= st.pathBoostFarmTarget then
-							st.pathBoostFarmDone = true
-						elseif boosters <= 0 and boostSec <= 0 then
-							st.pathBoostFarmActive = true
-							st.pathBoostFarmResume = curIdx > 0 and cur or nil
-							st._pathForce(false)
-							st.vote = true
-							st.voteMode = "BossRush"
-							st.farm = true
-							st.titanFarm = false
-							pcall(function()
-								setToggle(farmToggle, true)
-								setToggle(titanToggle, false)
-							end)
-							if canSwitch and cur ~= st.pathBoostFarmChar and t - lastSwitch >= 3 then
-								lastSwitch = t
-								switchCharacter(st.pathBoostFarmChar)
-							end
-							notify("Path", "no x2 Mastery -> BossRush Cen farm", "check", 5)
-							return
-						end
-					elseif cen < st.pathBoostFarmResumeBelow then
-						st.pathBoostFarmDone = false
-					end
-					if not st.pathBoostFarmActive and st.pathBoostFarmResume and canSwitch and cur ~= st.pathBoostFarmResume and t - lastSwitch >= 3 then
-						lastSwitch = t
-						if switchCharacter(st.pathBoostFarmResume) then
-							st.pathBoostFarmResume = nil
-						end
-						return
-					end
-				end
-
-				if st.pathFallbackActive then
-					st._pathForce(false)
-					st.vote = true
-					st.voteMode = "BossRush"
-					st.farm = true
-					st.titanFarm = false
-					pcall(function()
-						setToggle(farmToggle, true)
-						setToggle(titanToggle, false)
-					end)
-						if canSwitch and cur ~= st.pathFallbackChar and t - lastSwitch >= 3 then
-						lastSwitch = t
-						local okc = switchCharacter(st.pathFallbackChar)
-						if not okc then
-							notify("Path", "fallback switch failed: " .. st.pathFallbackChar, "triangle-alert", 4)
-						end
-					end
-					return
-				end
-
 				if todo == 0 and unknown == 0 then
-					if st.pathFallbackEnabled then
-						st._pathForce(false)
-						st.pathFallbackActive = true
-						st.vote = true
-						st.voteMode = "BossRush"
-						st.farm = true
-						st.titanFarm = false
-						pcall(function()
-							setToggle(farmToggle, true)
-							setToggle(titanToggle, false)
-						end)
-					if canSwitch and cur ~= st.pathFallbackChar and t - lastSwitch >= 3 then
-							lastSwitch = t
-							switchCharacter(st.pathFallbackChar)
-						end
-						notify("Path", "list complete -> BossRush fallback", "check", 5)
-						return
-					end
 					st.mastery = false
-					st._pathForce(false)
 					pcall(function()
 						setToggle(masteryToggle, false)
 					end)
-					notify("Path", "path complete: all characters reached target", "check", 6)
+					notify("Mastery", "path complete: all characters reached target", "check", 6)
 					return
 				end
 				if todo == 0 then
@@ -6117,12 +4307,12 @@ task.spawn(function()
 						end
 					end
 				end
-				if not pick or t - lastSwitch < 3 or not canSwitch then
+				if not pick or t - lastSwitch < 3 then
 					return
 				end
 
 				notify(
-					"Path",
+					"Mastery",
 					(cur ~= "" and (cur .. " " .. tostring(curItem and curItem.m or "?") .. "/" .. tostring(curItem and curItem.target or "?") .. " -> ") or "")
 						.. pick.name,
 					"info",
@@ -6132,16 +4322,12 @@ task.spawn(function()
 				lastSwitch = now()
 				if not switched then
 					masterySkipped[pick.name] = true
-					notify("Path", "could not switch to " .. pick.name, "triangle-alert", 4)
-				elseif pick.name == "Upgraded Titan TV" and special then
-					st._pathForce(true)
-				elseif cur == "Upgraded Titan TV" then
-					st._pathForce(false)
+					notify("Mastery", "could not switch to " .. pick.name, "triangle-alert", 4)
 				end
 			end)
 			if not ok and t - lastErr > 5 then
 				lastErr = t
-				notify("Path", "error: " .. tostring(err):sub(1, 140), "triangle-alert", 5)
+				notify("Mastery", "error: " .. tostring(err):sub(1, 140), "triangle-alert", 5)
 			end
 		end
 	end
@@ -6152,7 +4338,7 @@ local lastErrGod = 0
 task.spawn(function()
 	while alive() do
 		task.wait(0.25)
-		if st.god and not godBusy and not healBusy and not isTitanForm() and now() >= transformQuietUntil then
+		if st.god and not godBusy and now() >= transformQuietUntil then
 			local t = now()
 			local ok, err = pcall(function()
 				local char = lp.Character
@@ -6164,8 +4350,8 @@ task.spawn(function()
 				if mx <= 0 then
 					return
 				end
-				local limit = math.min(st.godHP, mx)
-				if not (hp <= limit and hp < mx) then
+				local limit = st.godHP >= mx and (mx * 0.5) or st.godHP
+				if not (hp < limit and hp < mx) then
 					return
 				end
 				local tw = ws:FindFirstChild("TimerWave")
@@ -6325,16 +4511,6 @@ end)
 _G.__RATHUB_REG = {
 	stop = function()
 		ALIVE = false
-		st.mastery = false
-		if st._clearAim then
-			pcall(st._clearAim)
-		end
-		if st._pathForce then
-			pcall(st._pathForce, false)
-		end
-		pcall(function()
-			Library:Unload()
-		end)
 		pcall(function()
 			if Window then
 				Window:Destroy()
@@ -6343,7 +4519,7 @@ _G.__RATHUB_REG = {
 	end,
 }
 
-print("[RATHUB] Blockade loaded (Obsidian, remote-only)")
+print("[RATHUB] Blockade loaded (WindUI, remote-only)")
 bootOk()
 
 end
